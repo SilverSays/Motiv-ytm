@@ -1,0 +1,4 @@
+# Solo PySide6-Essentials: el metapaquete "PySide6" arrastra Addons, que
+# incluye QtWebEngine (Chromium). NO instalar "PySide6" ni "PySide6-Addons".
+PySide6-Essentials>=6.7
+ytmusicapi>=1.10
