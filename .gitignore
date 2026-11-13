@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Datos de la app: viven en %LOCALAPPDATA%\YTMusicNativo, pero por si acaso
+# alguien los copia aquí. Nunca deben subirse.
+browser.json
+cookies.txt
+credenciales/
+*.sqlite3
+*.sqlite3-*
+*.log
+fase0/
+bin/
+
+# Notas de desarrollo que no se publican
+notas-locales/
+
+# Editores y sistema
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
