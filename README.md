@@ -25,8 +25,12 @@ interfaz propia, clara y fría, con el color de cada lista sacado de su carátul
   propia cualquier lista o álbum que encuentres.
 - **Búsqueda sin iniciar sesión**: canciones, listas de la comunidad y
   artistas, con sugerencias mientras escribes y búsquedas recientes.
-- **Inicio**: tus listas más escuchadas y recomendaciones de listas parecidas a
-  tu música.
+- **Inicio**: tus listas más escuchadas, lo que has escuchado hace poco y
+  recomendaciones de listas parecidas a tu música.
+- **Historial de escucha**: cada canción que oyes al menos medio minuto queda
+  anotada, solo en tu equipo. Enseña lo último, lo más escuchado del mes y lo
+  más escuchado de siempre, y sirve para recomendarte música aunque no tengas
+  cuenta. Se puede desactivar o borrar cuando quieras.
 - **Página de artista**: canciones populares, álbumes, sencillos, listas,
   artistas parecidos y su biografía.
 - **«Ahora suena»**: la carátula en grande, información del artista y música
@@ -163,6 +167,7 @@ instalar.bat, iniciar.bat Instalación y arranque en Windows
 | :--- | :--- |
 | `extractor.py` | El *fetcher* del audio: lanza `yt-dlp` para obtener la dirección de cada canción, guarda una caché de direcciones y actualiza `yt-dlp` con vuelta atrás si la versión nueva falla. |
 | `mpv_ipc.py` | Lanza `mpv` como proceso aparte y lo controla por su tubería IPC. |
+| `history.py` | Decide cuándo una canción cuenta como escuchada y la anota en el historial. |
 | `player.py` | El reproductor: cola, aleatorio, repetir, radio, precarga y recuperación de errores. |
 | `bootstrap.py` | Descarga e instala `yt-dlp`, `deno` y `mpv`. |
 

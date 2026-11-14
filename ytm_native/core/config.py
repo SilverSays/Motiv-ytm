@@ -134,6 +134,13 @@ ARTIST_PAGE_TTL_S = 86400
 ARTIST_TOP_SONGS = 10
 ARTIST_SIMILAR_TRACKS = 12
 ARTIST_MAX_CARDS = 12
+# Historial de escucha. Una canción cuenta cuando ha sonado esto (o la mitad,
+# si es más corta): saltarla a los pocos segundos no deja rastro.
+HISTORY_MIN_LISTEN_S = 30
+HISTORY_VIEW_LIMIT = 200              # filas de la vista «Historial»
+HISTORY_HOME_CARDS = 12               # «Escuchado hace poco» en el inicio
+# Lo escuchado en este tiempo también cuenta al elegir recomendaciones.
+HISTORY_TASTE_DAYS = 90
 
 # --- Letras (LRCLIB) y radio ------------------------------------------------
 LRCLIB_BASE = "https://lrclib.net/api"

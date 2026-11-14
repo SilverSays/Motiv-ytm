@@ -35,6 +35,7 @@ from ytm_native.services.discover import ArtistCard, ArtistPage, PlaylistCard, R
 from ytm_native.services.lyrics import Lyrics, current_line_index, fetch_lyrics
 from ytm_native.core.db import Database, Track, is_local_playlist
 from ytm_native.playback.extractor import ExtractorManager, ExtractorState, UpdateResult, UpdateStatus
+from ytm_native.playback.history import PlayTracker
 from ytm_native.playback.mpv_ipc import MpvPlayer
 from ytm_native.playback.player import LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE, PlaybackController
 from ytm_native.services.sync import LibrarySync, SyncReport, SyncState, looks_device_bound, search_tracks
@@ -75,7 +76,15 @@ log = logging.getLogger("ytmn.ui")
 HOME_KEY = "__inicio__"
 SEARCH_KEY = "__buscar__"
 QUEUE_KEY = "__cola__"
-FIXED_KEYS = (HOME_KEY, SEARCH_KEY, QUEUE_KEY)
+HISTORY_KEY = "__historial__"
+FIXED_KEYS = (HOME_KEY, SEARCH_KEY, QUEUE_KEY, HISTORY_KEY)
+# Pestañas del historial: lo último, lo más escuchado en 30 días y desde siempre.
+HEARD_RECENT, HEARD_MONTH, HEARD_ALL = "recientes", "mes", "siempre"
+HEARD_LABELS = (
+    (HEARD_RECENT, "Recientes"),
+    (HEARD_MONTH, "Lo más escuchado del mes"),
+    (HEARD_ALL, "Lo más escuchado"),
+)
 # Fila de la barra lateral que no es una vista: abre el diálogo de lista nueva.
 NEW_LIST_KEY = "__nueva_lista__"
 # Vista de una lista ajena a la biblioteca (una recomendación abierta).
@@ -210,6 +219,10 @@ class MainWindow(QMainWindow):
         self._versions = ""
         self._was_blocked = False
         self._pre_mute = 0
+        # Historial de escucha: anota en la base local cada canción que se oye de verdad.
+        self.tracker = PlayTracker(db, player, self)
+        self._heard_scope = HEARD_RECENT
+        self._recent_tracks: list[Track] = []
 
         self.setWindowTitle("YT Music Nativo")
         self.resize(1180, 760)
@@ -256,6 +269,11 @@ class MainWindow(QMainWindow):
         self._add_action(menu, "Sincronizar ahora", lambda: self._start_sync(), "F5")
         self._add_action(menu, "Forzar sincronización completa", lambda: self._start_sync(force_all=True))
         menu.addSeparator()
+        self.history_action = QAction("Guardar el historial de escucha", self)
+        self.history_action.setCheckable(True)
+        self.history_action.setChecked(self.tracker.enabled)
+        self.history_action.toggled.connect(self._set_history_enabled)
+        menu.addAction(show_check(self.history_action, self.devicePixelRatioF()))
         self.autoplay_action = QAction("Radio automática al terminar la cola", self)
         self.autoplay_action.setCheckable(True)
         self.autoplay_action.setChecked(self.player.autoplay)
@@ -392,6 +410,10 @@ class MainWindow(QMainWindow):
         self.scope_bar = ScopeBar()
         self.scope_bar.hide()
         body.addWidget(self.scope_bar)
+        # Solo en el historial: lo último o lo más escuchado.
+        self.heard_bar = ScopeBar(labels=HEARD_LABELS)
+        self.heard_bar.hide()
+        body.addWidget(self.heard_bar)
         self.artist_strip = ArtistStrip(self.art)
         self.artist_strip.hide()
         body.addWidget(self.artist_strip)
@@ -577,6 +599,9 @@ class MainWindow(QMainWindow):
         self.now_panel.similar_menu.connect(lambda track, pos: self._track_menu(track).exec(pos))
         self.now_panel.open_artist.connect(self._open_artist_from_now)
         self.scope_bar.changed.connect(self._set_search_scope)
+        self.heard_bar.changed.connect(self._set_heard_scope)
+        self.tracker.logged.connect(self._on_play_logged)
+        self.home.play_recent.connect(self._play_recent)
         self.artist_strip.opened.connect(self._open_artist)
         self.search_cards.open_playlist.connect(self._open_remote)
         self.search_cards.play_playlist.connect(self._play_remote)
@@ -738,6 +763,7 @@ class MainWindow(QMainWindow):
         add(glyph_icon("home"), "Inicio", HOME_KEY)
         add(glyph_icon("search"), "Buscar", SEARCH_KEY)
         add(glyph_icon("queue"), "Cola de reproducción", QUEUE_KEY)
+        add(glyph_icon("history"), "Historial", HISTORY_KEY)
         heading = QListWidgetItem("" if collapsed else "Tus listas")
         heading.setFlags(Qt.ItemFlag.NoItemFlags)
         if collapsed:
@@ -1071,6 +1097,8 @@ class MainWindow(QMainWindow):
                 self._create_local_playlist(tuple(data.tracks), suggested=data.title)
         elif is_artist(key):
             self._play_artist_mix(shuffle=False)
+        elif key == HISTORY_KEY:
+            self._clear_history()
 
     # ------------------------------------------------------- carátulas y tinta
     def _row_art_url(self, track: Track) -> str:
@@ -1143,6 +1171,7 @@ class MainWindow(QMainWindow):
         self.artist_view.setVisible(artist)
         self.home.setVisible(home)
         self.scope_bar.setVisible(key == SEARCH_KEY)
+        self.heard_bar.setVisible(key == HISTORY_KEY)
         if key != SEARCH_KEY:
             self.artist_strip.hide()
             self.search_cards.hide()
@@ -1168,6 +1197,8 @@ class MainWindow(QMainWindow):
             )
             self._set_empty("" if tracks else "La cola está vacía", "Reproduce una lista o una búsqueda.",
                             glyph="queue")
+        elif key == HISTORY_KEY:
+            self._fill_history()
         elif key == SEARCH_KEY:
             # La búsqueda se conserva al salir y volver: texto, resultados y nota.
             self.model.set_tracks(self._search_tracks)
@@ -1305,7 +1336,112 @@ class MainWindow(QMainWindow):
         else:
             empty_text = "Tu biblioteca aún no se ha sincronizado. Pulsa F5 para traer tus listas."
         self.home.set_library(specs, facts, empty_text)
+        self._refresh_recent()
         self._load_recommendations()
+
+    # --------------------------------------------------------------- historial
+    def _refresh_recent(self) -> None:
+        """«Escuchado hace poco» del inicio: lo último del historial, cada canción una vez."""
+        self._recent_tracks = [row[0] for row in self.db.recent_plays(config.HISTORY_HOME_CARDS)]
+        self.home.set_recent([
+            (t.title, t.artists, track_art_url(t.video_id, t.thumb_url, 400), t)
+            for t in self._recent_tracks
+        ])
+
+    def _play_recent(self, track: Track) -> None:
+        take_launch()                 # la tarjeta no abre una vista: no hay carátula que vuele
+        if self._missing_binaries_notice():
+            return
+        ids = [t.video_id for t in self._recent_tracks]
+        if track.video_id in ids:
+            self.player.play_tracks(self._recent_tracks, ids.index(track.video_id))
+        else:
+            self.player.play_tracks([track], 0)
+
+    def _fill_history(self) -> None:
+        """Vista «Historial»: la tabla con una nota por pista en lugar del álbum."""
+        scope, limit = self._heard_scope, config.HISTORY_VIEW_LIMIT
+        month_ago = time.time() - 30 * 86400
+        if scope == HEARD_RECENT:
+            rows = self.db.recent_plays(limit)
+            notes = {t.video_id: format_ago(at).capitalize() for t, at, _n in rows}
+            header = "Última vez"
+        else:
+            rows = self.db.top_plays(month_ago if scope == HEARD_MONTH else 0.0, limit)
+            notes = {t.video_id: plural(n, "vez", "veces") for t, _at, n in rows}
+            header = "Escuchas"
+        tracks = [row[0] for row in rows]
+        self.model.set_tracks(tracks, notes, header)
+        total, songs = self.db.play_stats()
+        plays, heard = self.db.play_stats(month_ago) if scope == HEARD_MONTH else (total, songs)
+        facts = []
+        if plays:
+            # El plazo va en la primera nota: si la banda es estrecha, las
+            # que no caben se ocultan empezando por el final.
+            period = " en 30 días" if scope == HEARD_MONTH else ""
+            facts = [plural(plays, "escucha", "escuchas") + period,
+                     plural(heard, "canción distinta", "canciones distintas")]
+        latest = self.db.recent_plays(1)
+        self._band_art = (track_art_url(latest[0][0].video_id, latest[0][0].thumb_url, 400)
+                          if latest else "")
+        self.band.set_content(
+            "Historial",
+            "Lo que has escuchado en esta app. Se guarda solo en este equipo.",
+            facts, self._band_art, show_sync=False, show_cover=bool(latest),
+            extra=("Borrar historial", "close") if total else None,
+        )
+        self.heard_bar.setVisible(total > 0)
+        if tracks:
+            self._set_empty("")
+        elif total:
+            self._set_empty("Nada escuchado en los últimos 30 días",
+                            "Lo anterior sigue en las otras dos pestañas.", glyph="history")
+        elif self.tracker.enabled:
+            self._set_empty("Aún no hay nada en el historial",
+                            "Aquí aparecerá cada canción que escuches al menos medio minuto.",
+                            glyph="history")
+        else:
+            self._set_empty("El historial está desactivado",
+                            "Actívalo en el menú (⋯): «Guardar el historial de escucha».",
+                            glyph="history")
+
+    def _set_heard_scope(self, scope: str) -> None:
+        if scope == self._heard_scope:
+            return
+        self._heard_scope = scope
+        self.heard_bar.set_scope(scope)
+        if self._view_key == HISTORY_KEY:
+            self._show_view(HISTORY_KEY, force=True)
+
+    def _on_play_logged(self, _video_id: str) -> None:
+        if self._view_key == HISTORY_KEY:
+            # La tabla se rehace con la escucha nueva sin perder por dónde se iba leyendo.
+            bar = self.table.verticalScrollBar()
+            where = bar.value()
+            self._show_view(HISTORY_KEY, force=True)
+            bar.setValue(where)
+        elif self._view_key == HOME_KEY:
+            self._refresh_recent()
+
+    def _set_history_enabled(self, enabled: bool) -> None:
+        self.tracker.set_enabled(enabled)
+        if self._view_key == HISTORY_KEY:
+            self._show_view(HISTORY_KEY, force=True)
+
+    def _clear_history(self) -> None:
+        plays, _songs = self.db.play_stats()
+        if not plays or not self._confirm(
+            "Borrar historial",
+            f"Se borrarán {plural(plays, 'escucha', 'escuchas')} de este equipo. "
+            "Tus listas no cambian. No se puede deshacer.",
+            "Borrar",
+        ):
+            return
+        self.db.clear_history()
+        self._refresh_recent()
+        if self._view_key == HISTORY_KEY:
+            self._show_view(HISTORY_KEY, force=True)
+        self._notice("Historial borrado.")
 
     def _load_recommendations(self, force: bool = False) -> None:
         cached = discover.load_shelves(self.db)

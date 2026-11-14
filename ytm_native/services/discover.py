@@ -10,7 +10,10 @@ de la comunidad, de dos maneras:
 * por cada artista favorito, lo mismo a partir de una canción suya y, si no
   hay nada relacionado, las listas de la comunidad que lo nombran en el título.
 
-Sin biblioteca todavía se enseñan las listas generales de la portada.
+También cuenta lo que se ha escuchado hace poco en la app (el historial
+local), esté o no en una lista: así hay recomendaciones propias sin cuenta.
+
+Sin biblioteca ni historial se enseñan las listas generales de la portada.
 
 No depende de Qt: se prueba con clientes falsos.
 """
@@ -70,7 +73,9 @@ class RemotePlaylist:
 
 @dataclass(frozen=True)
 class Taste:
-    """Qué artistas pesan más en la biblioteca: (nombre, nº de canciones)."""
+    """Qué artistas pesan más: (nombre, nº de canciones suyas en la biblioteca).
+
+    Un artista que solo sale del historial de escucha lleva 0 canciones."""
 
     artists: tuple[tuple[str, int], ...] = ()
 
@@ -138,11 +143,13 @@ def split_artists(artists: str) -> list[str]:
     return names
 
 
-def taste(db: Database, limit: int = 8) -> Taste:
+def taste(db: Database, limit: int = 8, now: Optional[float] = None) -> Taste:
     """Artistas que más pesan: cuántas canciones tienen y en qué listas están.
 
     El primer artista de cada pista pesa entero y los invitados la mitad; las
     listas que se reproducen más desde la app multiplican el peso de lo suyo.
+    Lo escuchado en los últimos meses suma por su cuenta: media canción por
+    cada escucha (con tope), aunque el artista no esté en ninguna lista.
     """
     weight: Counter = Counter()
     songs: Counter = Counter()
@@ -154,6 +161,13 @@ def taste(db: Database, limit: int = 8) -> Taste:
             label.setdefault(key, name)
             weight[key] += boost * (1.0 if position == 0 else 0.5)
             songs[key] += 1
+    since = (time.time() if now is None else now) - config.HISTORY_TASTE_DAYS * 86400
+    for artists, times in db.played_artist_rows(since):
+        heard = min(times, 12) * 0.5
+        for position, name in enumerate(split_artists(artists)):
+            key = name.casefold()
+            label.setdefault(key, name)
+            weight[key] += heard * (1.0 if position == 0 else 0.5)
     ranked = sorted(weight, key=lambda k: (-weight[k], label[k]))
     return Taste(tuple((label[k], songs[k]) for k in ranked[:limit]))
 
@@ -263,17 +277,21 @@ def _seed_track(tracks: list[Track], rng: random.Random) -> Optional[Track]:
 
 
 def _artist_seed(db: Database, name: str, rng: random.Random) -> Optional[Track]:
-    """Una canción de la biblioteca de ese artista, mejor si es el principal."""
+    """Una canción de ese artista, mejor si es el principal: de la biblioteca
+    y, si allí no hay ninguna, de lo escuchado."""
     key = name.casefold()
-    lead, featured = [], []
-    for track in db.library_tracks_mentioning(name):
-        names = [n.casefold() for n in split_artists(track.artists)]
-        if names[:1] == [key]:
-            lead.append(track)
-        elif key in names:
-            featured.append(track)
-    pool = lead or featured
-    return rng.choice(pool) if pool else None
+    for source in (db.library_tracks_mentioning, db.played_tracks_mentioning):
+        lead, featured = [], []
+        for track in source(name):
+            names = [n.casefold() for n in split_artists(track.artists)]
+            if names[:1] == [key]:
+                lead.append(track)
+            elif key in names:
+                featured.append(track)
+        pool = lead or featured
+        if pool:
+            return rng.choice(pool)
+    return None
 
 
 _AFTER_NAME = re.compile(
@@ -358,7 +376,7 @@ def build_recommendations(
 
     for name, songs in _pick_artists(taste(db).artists, config.HOME_SEED_ARTISTS, rng):
         count = "una canción" if songs == 1 else f"{songs} canciones"
-        note = f"Está en {count} de tus listas"
+        note = f"Está en {count} de tus listas" if songs else "Lo has escuchado hace poco"
         before = len(shelves)
         try:
             # Primero lo relacionado con una canción suya: sirve para descubrir
@@ -419,8 +437,14 @@ def shelves_stale(
     now = time.time() if now is None else now
     if now - fetched_at >= config.HOME_RECS_TTL_S:
         return True
+    if kind != "general":
+        return False
     # Se guardó la portada general y ya hay biblioteca: toca personalizar.
-    return kind == "general" and any(p.stored_tracks for p in db.playlists())
+    if any(p.stored_tracks for p in db.playlists()):
+        return True
+    # Sin biblioteca pero ya con algo escuchado: también (como mucho cada hora,
+    # por si de ese historial no sale ninguna fila).
+    return now - fetched_at >= 3600 and db.play_stats()[0] >= 5
 
 
 # ---------------------------------------------------------------------------
