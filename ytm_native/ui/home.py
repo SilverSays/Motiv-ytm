@@ -375,9 +375,10 @@ class ShelfSection(QWidget):
 
 
 class HomePage(QScrollArea):
-    """Inicio: primero tus listas (las más reproducidas delante), después las
-    recomendaciones, que van llegando de una en una."""
+    """Inicio: primero tus listas (las más reproducidas delante), luego lo
+    escuchado hace poco y después las recomendaciones, que llegan de una en una."""
 
+    play_recent = Signal(object)      # Track de «Escuchado hace poco»
     open_library = Signal(str)
     play_library = Signal(str)
     open_remote = Signal(object)      # PlaylistCard
@@ -433,6 +434,18 @@ class HomePage(QScrollArea):
         self.library_empty.hide()
         lay.addWidget(self.library_empty)
 
+        # Lo último que sonó: un clic (o el disco) vuelve a ponerlo.
+        self._recent_gap = QWidget()
+        self._recent_gap.setFixedHeight(28)
+        self._recent_gap.hide()
+        lay.addWidget(self._recent_gap)
+        self.recent = ShelfSection(loader)
+        self.recent.set_head("Escuchado hace poco")
+        self.recent.grid.opened.connect(self.play_recent)
+        self.recent.grid.play_requested.connect(self.play_recent)
+        self.recent.hide()
+        lay.addWidget(self.recent)
+
         self._shelves = QVBoxLayout()
         self._shelves.setContentsMargins(0, 0, 0, 0)
         self._shelves.setSpacing(28)
@@ -479,6 +492,13 @@ class HomePage(QScrollArea):
             "Las que más escuchas van primero. El resto sigue en la barra lateral."
             if shown < total else "",
         )
+
+    # -- escuchado hace poco ------------------------------------------------
+    def set_recent(self, specs: list[CardSpec]) -> None:
+        """Tarjetas de canciones (su carga es la ``Track``); sin ninguna, la fila no existe."""
+        self.recent.grid.set_cards(specs)
+        self.recent.setVisible(bool(specs))
+        self._recent_gap.setVisible(bool(specs))
 
     # -- recomendaciones ----------------------------------------------------
     @staticmethod

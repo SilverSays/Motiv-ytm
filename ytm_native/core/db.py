@@ -81,6 +81,15 @@ CREATE TABLE IF NOT EXISTS discover_cache (
     fetched_at REAL NOT NULL,
     payload    TEXT NOT NULL
 );
+-- Historial de escucha: una fila por cada vez que una canción se oyó de
+-- verdad (no las que se saltan a los pocos segundos). Es local: no se envía.
+CREATE TABLE IF NOT EXISTS plays (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id  TEXT NOT NULL,
+    played_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plays_at ON plays (played_at);
+CREATE INDEX IF NOT EXISTS idx_plays_video ON plays (video_id);
 """
 
 
@@ -578,6 +587,73 @@ class Database:
                 "INSERT OR REPLACE INTO lyrics (video_id, fetched_at, payload) VALUES (?, ?, ?)",
                 (video_id, time.time(), payload),
             )
+
+    # -- historial de escucha ----------------------------------------------
+    def log_play(self, video_id: str, now: Optional[float] = None) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO plays (video_id, played_at) VALUES (?, ?)",
+                (video_id, time.time() if now is None else now),
+            )
+
+    def play_stats(self, since: float = 0.0) -> tuple[int, int]:
+        """(escuchas, canciones distintas) desde ``since``."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS plays, COUNT(DISTINCT video_id) AS songs "
+                "FROM plays WHERE played_at >= ?",
+                (since,),
+            ).fetchone()
+        return row["plays"], row["songs"]
+
+    def recent_plays(self, limit: int = 100) -> list[tuple[Track, float, int]]:
+        """Lo último escuchado, cada canción una vez: (pista, última vez, veces)."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT t.*, MAX(p.played_at) AS last_at, COUNT(*) AS times "
+                "FROM plays p JOIN tracks t ON t.video_id = p.video_id "
+                "GROUP BY p.video_id ORDER BY last_at DESC, MAX(p.id) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(self._track(r), r["last_at"], r["times"]) for r in rows]
+
+    def top_plays(self, since: float = 0.0, limit: int = 100) -> list[tuple[Track, float, int]]:
+        """Lo más escuchado desde ``since``: (pista, última vez, veces)."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT t.*, MAX(p.played_at) AS last_at, COUNT(*) AS times "
+                "FROM plays p JOIN tracks t ON t.video_id = p.video_id "
+                "WHERE p.played_at >= ? "
+                "GROUP BY p.video_id ORDER BY times DESC, last_at DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+        return [(self._track(r), r["last_at"], r["times"]) for r in rows]
+
+    def played_artist_rows(self, since: float = 0.0) -> list[tuple[str, int]]:
+        """(artistas de la pista, veces que se escuchó) desde ``since``."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT t.artists AS artists, COUNT(*) AS times "
+                "FROM plays p JOIN tracks t ON t.video_id = p.video_id "
+                "WHERE p.played_at >= ? AND t.artists != '' GROUP BY p.video_id",
+                (since,),
+            ).fetchall()
+        return [(r["artists"], r["times"]) for r in rows]
+
+    def played_tracks_mentioning(self, artist: str, limit: int = 60) -> list[Track]:
+        """Pistas del historial cuyo campo de artistas contiene ``artist``."""
+        pattern = "%" + artist.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT DISTINCT t.* FROM plays p JOIN tracks t ON t.video_id = p.video_id "
+                "WHERE t.artists LIKE ? ESCAPE '\\' AND t.unavailable_since IS NULL LIMIT ?",
+                (pattern, limit),
+            ).fetchall()
+        return [self._track(r) for r in rows]
+
+    def clear_history(self) -> int:
+        with self._tx() as c:
+            return c.execute("DELETE FROM plays").rowcount
 
     # -- caché de recomendaciones -------------------------------------------
     def get_discover_entry(self, key: str) -> Optional[tuple[float, str]]:

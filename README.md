@@ -27,6 +27,10 @@ interface, with each playlist's color pulled from its cover art. The app's inter
   suggestions as you type and recent searches.
 - **Home**: your most-played playlists and recommendations of playlists similar to
   your music.
+- **Listening history**: every song you play for at least 30 seconds is saved
+  locally on your device. It shows recent plays, most-played this month and
+  all-time most-played tracks, and powers recommendations even without an account.
+  You can disable it or clear it at any time.
 - **Artist page**: popular songs, albums, singles, playlists, similar artists and
   their bio.
 - **"Now playing"** («Ahora suena»): large cover art, artist info and music similar
@@ -158,6 +162,7 @@ instalar.bat, iniciar.bat Install and launch on Windows
 | :--- | :--- |
 | `extractor.py` | The audio *fetcher*: runs `yt-dlp` to get each song's URL, keeps a URL cache and updates `yt-dlp` with rollback if the new version fails. |
 | `mpv_ipc.py` | Launches `mpv` as a separate process and controls it through its IPC pipe. |
+| `history.py` | Decides when a song counts as listened and records it in listening history. |
 | `player.py` | The player: queue, shuffle, repeat, radio, preloading and error recovery. |
 | `bootstrap.py` | Downloads and installs `yt-dlp`, `deno` and `mpv`. |
 
