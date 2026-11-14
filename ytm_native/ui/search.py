@@ -27,12 +27,17 @@ SONGS, PLAYLISTS, ARTISTS = "canciones", "listas", "artistas"
 
 
 class ScopeBar(QWidget):
+    """Pestañas de una vista: una sola marcada. Por defecto, las de la búsqueda."""
+
     changed = Signal(str)
 
     LABELS = ((SONGS, "Canciones"), (PLAYLISTS, "Listas de la comunidad"), (ARTISTS, "Artistas"))
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None,
+                 labels: Optional[tuple[tuple[str, str], ...]] = None):
         super().__init__(parent)
+        if labels is not None:
+            self.LABELS = labels
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
@@ -48,7 +53,7 @@ class ScopeBar(QWidget):
             self.buttons[key] = button
             lay.addWidget(button)
         lay.addStretch(1)
-        self.buttons[SONGS].setChecked(True)
+        self.buttons[self.LABELS[0][0]].setChecked(True)
 
     def set_scope(self, key: str) -> None:
         self.buttons[key].setChecked(True)

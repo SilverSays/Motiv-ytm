@@ -102,7 +102,10 @@ def format_ago(ts: Optional[float]) -> str:
 # ---------------------------------------------------------------------------
 class TrackModel(QAbstractTableModel):
     """Pistas de la vista. La primera columna la pinta ``TrackDelegate``
-    (carátula, título y artista); las otras dos son álbum y duración."""
+    (carátula, título y artista); las otras dos son álbum y duración.
+
+    Una vista puede cambiar el álbum por una nota suya por pista (el historial
+    pone cuándo se escuchó o cuántas veces), con su propio título de columna."""
 
     HEADERS = ("Título", "Álbum", "Duración")
 
@@ -110,11 +113,21 @@ class TrackModel(QAbstractTableModel):
         super().__init__(parent)
         self._tracks: list[Track] = []
         self._current_id: Optional[str] = None
+        self._notes: Optional[dict[str, str]] = None
+        self._note_header = ""
 
-    def set_tracks(self, tracks: list[Track]) -> None:
+    def set_tracks(self, tracks: list[Track], notes: Optional[dict[str, str]] = None,
+                   note_header: str = "") -> None:
+        """``notes``: texto por ``videoId`` que ocupa la columna del álbum."""
+        header = note_header if notes is not None else ""
+        changed = header != self._note_header
         self.beginResetModel()
         self._tracks = list(tracks)
+        self._notes = notes
+        self._note_header = header
         self.endResetModel()
+        if changed:
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, 1, 1)
 
     def tracks(self) -> list[Track]:
         return list(self._tracks)
@@ -151,7 +164,7 @@ class TrackModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
         if orientation == Qt.Orientation.Horizontal:
             if role == Qt.ItemDataRole.DisplayRole:
-                return self.HEADERS[section]
+                return self._note_header if section == 1 and self._note_header else self.HEADERS[section]
             if role == Qt.ItemDataRole.TextAlignmentRole:
                 right = section == 2
                 return int((Qt.AlignmentFlag.AlignRight if right else Qt.AlignmentFlag.AlignLeft)
@@ -167,7 +180,7 @@ class TrackModel(QAbstractTableModel):
             if col == 0:
                 return track.title
             if col == 1:
-                return track.album
+                return track.album if self._notes is None else self._notes.get(track.video_id, "")
             return format_time(track.duration_s) if track.duration_s else ""
         if role == Qt.ItemDataRole.ToolTipRole:
             if track.unavailable_since is not None:
