@@ -23,12 +23,25 @@ COOKIES_STICKY_S = 6 * 3600
 UNAVAILABLE_RECHECK_S = 7 * 86400
 # Varios "no disponible"/fallos seguidos huelen a bloqueo, no a pistas borradas.
 MAX_CONSECUTIVE_FAILURES = 3
+# La racha de fallos solo se olvida cuando una pista suena de verdad este
+# tiempo (resolver la URL no basta: mpv puede no poder reproducir ninguna).
+# Avances de posición mayores que el paso máximo son saltos, no reproducción.
+HEALTHY_PLAY_S = 5.0
+HEALTHY_PLAY_MAX_STEP_S = 3.0
 
 # --- Actualización (Fase 2) ------------------------------------------------
 PROACTIVE_UPDATE_COOLDOWN_S = 24 * 3600
 REACTIVE_UPDATE_COOLDOWN_S = 6 * 3600
 UPDATE_DRAIN_TIMEOUT_S = 20  # espera a la resolución en curso antes de matarla
 UPDATE_TIMEOUT_S = 300
+# Esperas entre intentos al restaurar yt-dlp.bak (el antivirus puede tener el
+# .exe abierto un momento).
+RESTORE_RETRY_DELAYS_S = (0.3, 0.6, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+# Lo que se espera a los hilos que leen la salida de yt-dlp una vez que ha
+# terminado; si un nieto sigue con la tubería abierta, se cancela la lectura.
+PIPE_DRAIN_TIMEOUT_S = 3.0
+# Al cerrar la app: lo más que se espera a que acaben los yt-dlp en marcha.
+EXTRACTOR_SHUTDOWN_WAIT_S = 3.0
 NIGHTLY_RELEASE_API = "https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases/latest"
 
 # --- Sincronización (Fase 3) -----------------------------------------------
@@ -64,6 +77,12 @@ LOAD_RETRY_DELAYS_MS = (600, 900, 1500, 2500)
 # se espera a que la URL tenga esta edad antes del primer intento, lo que
 # ahorra dos peticiones rechazadas por pista sin tardar más en sonar.
 FIRST_LOAD_MIN_URL_AGE_S = 1.6
+# Seguir donde se dejó: mientras suena, el segundo por el que va se guarda
+# cada tanto (un cierre brusco pierde como mucho esto). La cola, que puede ser
+# grande, solo se escribe cuando cambia, tras una pausa corta que junta varias
+# altas seguidas en una sola escritura.
+SESSION_SAVE_INTERVAL_MS = 5000
+SESSION_QUEUE_SAVE_DELAY_MS = 400
 
 # --- Rapidez al pulsar reproducir (medido el 12-nov-2026) -------------------
 # Reparto de una resolución en frío con los clientes por defecto de yt-dlp
@@ -149,6 +168,9 @@ LYRICS_MAX_DURATION_DELTA_S = 2
 LYRICS_NEGATIVE_CACHE_S = 7 * 86400   # "sin letra" se vuelve a consultar pasada una semana
 RADIO_LIMIT = 25
 MPV_MAX_RESTARTS_PER_MIN = 3
+# Controles multimedia de Windows: cada cuánto se le dice por dónde va la pista
+# (un salto en la barra se le dice al momento).
+MEDIA_TIMELINE_INTERVAL_S = 5.0
 # Límite de tasa local: el prefetch se suspende al superarlo (no es una
 # garantía de parecer "humano", solo acota el volumen).
 MAX_RESOLVES_PER_HOUR = 60

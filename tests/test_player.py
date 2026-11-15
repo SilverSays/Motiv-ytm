@@ -558,3 +558,98 @@ def test_media_keys_drive_the_queue(env):
     assert env.player.current_track().video_id == "v1"
     env.mpv.media_key.emit("prev")
     assert env.player.current_track().video_id == "v0"
+
+
+def _mpv_never_plays(env, monkeypatch):
+    """mpv recibe cada URL y falla al abrirla (403 continuo, sin tarjeta de
+    sonido...), aunque yt-dlp resuelva todo bien."""
+    from PySide6.QtCore import QTimer
+
+    monkeypatch.setattr(config, "LOAD_RETRY_DELAYS_MS", ())
+    real_load = env.mpv.load
+
+    def load(url, user_agent=""):
+        real_load(url, user_agent)
+
+        def fail():
+            env.mpv.entry += 1
+            env.mpv.file_started.emit(env.mpv.entry)
+            env.mpv.file_ended.emit(env.mpv.entry, "error", "HTTP error 403 Forbidden")
+
+        QTimer.singleShot(0, fail)
+
+    monkeypatch.setattr(env.mpv, "load", load)
+
+
+def test_resolving_fine_but_never_sounding_stops_the_queue(env, monkeypatch):
+    _mpv_never_plays(env, monkeypatch)
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: env.player.state == STOPPED)
+    settle(env.qapp, 0.3)
+    tried = {vid for vid, _ in env.ex.calls}
+    assert tried == {f"v{i}" for i in range(config.MAX_CONSECUTIVE_FAILURES)}
+    assert env.player.current_track().video_id == f"v{config.MAX_CONSECUTIVE_FAILURES - 1}"
+    calls = len(env.ex.calls)
+    settle(env.qapp, 0.3)
+    assert len(env.ex.calls) == calls                          # no sigue pidiendo URL
+    assert env.player.state == STOPPED
+    assert any("La cola quedó en pausa" in n for n in env.notices)
+
+
+def test_a_track_that_really_plays_forgets_the_failure_streak(env, monkeypatch):
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    env.player._consecutive_failures = config.MAX_CONSECUTIVE_FAILURES - 1
+    env.mpv.begin()
+    env.mpv.at(1.0)
+    env.mpv.at(40.0)                                           # un salto no cuenta como sonar
+    assert env.player._consecutive_failures == config.MAX_CONSECUTIVE_FAILURES - 1
+    for pos in (40.5, 41.5, 42.5, 43.5, 44.5, 45.5):
+        env.mpv.at(pos)
+    assert env.player._consecutive_failures == 0
+
+
+def test_a_successful_resolution_alone_does_not_reset_the_streak(env):
+    env.player.play_tracks(env.tracks, 0)
+    env.player._consecutive_failures = 2
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    env.mpv.begin()                                            # carga, pero aún no suena
+    assert env.player._consecutive_failures == 2
+
+
+def test_manual_skip_starts_a_new_streak(env, monkeypatch):
+    _mpv_never_plays(env, monkeypatch)
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: env.player.state == STOPPED)
+    settle(env.qapp, 0.1)
+    before = len({vid for vid, _ in env.ex.calls})
+    env.player.next_track()                                    # el usuario lo vuelve a intentar
+    assert wait_until(env.qapp, lambda: len({v for v, _ in env.ex.calls}) > before, timeout=3)
+    assert wait_until(env.qapp, lambda: env.player.state == STOPPED, timeout=5)
+    settle(env.qapp, 0.3)
+    assert env.player.state == STOPPED                         # y se vuelve a parar, acotado
+
+
+def test_a_short_track_that_ends_naturally_forgets_the_failure_streak(env):
+    """Una intro de 2 s nunca llega a HEALTHY_PLAY_S, pero si termina por su
+    final normal sí sonó: la racha de fallos se corta."""
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    env.player._consecutive_failures = 2
+    entry = env.mpv.begin(duration=2.0)
+    env.mpv.at(1.0)
+    env.mpv.at(2.0)
+    assert env.player._consecutive_failures == 2               # aún no llegó a 5 s
+    env.mpv.file_ended.emit(entry, "eof", "")
+    assert env.player._consecutive_failures == 0
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)   # y sigue la cola
+
+
+def test_an_end_cut_short_keeps_the_failure_streak(env):
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    env.player._consecutive_failures = 1
+    entry = env.mpv.begin(duration=100.0)
+    env.mpv.at(2.0)
+    env.mpv.file_ended.emit(entry, "eof", "")                  # "eof" a los 2 s de 100
+    assert env.player._consecutive_failures >= 1

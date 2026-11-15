@@ -39,7 +39,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
-from ytm_native.core import config, paths
+from ytm_native.core import config, paths, proc_guard
 from ytm_native.core.db import Database
 from ytm_native.core.errors import MESSAGES_ES, ErrorKind, classify, cookies_look_invalid, summarize
 
@@ -183,7 +183,7 @@ def _remove_onefile_leftovers(pid: int) -> None:
 
 
 def _spawn(args: list[str], stdin) -> subprocess.Popen:
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -193,6 +193,9 @@ def _spawn(args: list[str], stdin) -> subprocess.Popen:
         errors="replace",
         creationflags=_NO_WINDOW,
     )
+    # Si la app muere de golpe, yt-dlp (y el deno que lance) muere con ella.
+    proc_guard.adopt(proc.pid)
+    return proc
 
 
 def run_process(
@@ -243,13 +246,43 @@ def _collect(
     )
 
 
-def _close_pipes(proc: subprocess.Popen) -> None:
-    for pipe in (proc.stdout, proc.stderr):
-        try:
-            if pipe is not None:
+def _close_pipes(
+    proc: subprocess.Popen,
+    readers: tuple[threading.Thread, ...] = (),
+    timeout: Optional[float] = None,
+) -> None:
+    """Cierra la salida de ``proc`` sin quedarse colgado.
+
+    Los hilos ``readers`` tienen hasta ``timeout`` para acabar solos. Si alguno
+    sigue leyendo es que un nieto (``deno``) heredó la tubería y no la suelta:
+    se le cancela la lectura. Si ni así termina, el cierre se deja a otro
+    hilo, porque ``close()`` espera a que el lector suelte la tubería.
+    """
+    limit = config.PIPE_DRAIN_TIMEOUT_S if timeout is None else timeout
+    deadline = time.monotonic() + limit
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
+    for reader in readers:
+        for _ in range(10):
+            if not reader.is_alive():
+                break
+            # Entre dos lecturas la cancelación no tiene efecto: se repite.
+            proc_guard.cancel_blocking_read(reader)
+            reader.join(0.1)
+    pipes = [pipe for pipe in (proc.stdout, proc.stderr) if pipe is not None]
+
+    def close_all() -> None:
+        for pipe in pipes:
+            try:
                 pipe.close()
-        except (OSError, ValueError):
-            pass
+            except (OSError, ValueError):
+                pass
+
+    if not any(reader.is_alive() for reader in readers):
+        close_all()
+        return
+    log.warning("un proceso hijo de yt-dlp no suelta su salida: se deja de esperarlo")
+    threading.Thread(target=close_all, name="yt-dlp-cierre", daemon=True).start()
 
 
 def _collect_early(
@@ -294,8 +327,7 @@ def _collect_early(
     timed_out = stopped = False
     while not got_json.wait(0.05):
         if proc.poll() is not None:
-            readers[0].join(5)       # terminó: lo que quede en la tubería ya está leído
-            break
+            break                    # terminó: ``finish`` recoge lo que quede en la tubería
         if should_stop is not None and should_stop():
             stopped = True
         elif time.monotonic() - start > timeout:
@@ -310,9 +342,7 @@ def _collect_early(
             proc.wait(timeout=limit)
         except subprocess.TimeoutExpired:
             kill_tree(proc)
-        for reader in readers:
-            reader.join(5)
-        _close_pipes(proc)
+        _close_pipes(proc, tuple(readers))
 
     elapsed = time.monotonic() - start
     if got_json.is_set() and not (stopped or timed_out):
@@ -465,6 +495,9 @@ class ExtractorManager:
         self.cookies = Path(cookies) if cookies else paths.cookies_txt()
         self.cache = Path(cache) if cache else paths.cache_dir() / "yt-dlp"
         self.bak = self.ytdlp.with_name("yt-dlp.bak")
+        # Existe mientras dura ``yt-dlp -U``: si sigue ahí al arrancar, la
+        # actualización se cortó y el .exe puede estar a medio escribir.
+        self.marker = self.ytdlp.with_name("yt-dlp.updating")
         self._runner = runner
         self._latest_tag = latest_tag_fetcher
         self._clock = clock
@@ -489,7 +522,9 @@ class ExtractorManager:
         self._warm_hold = 0         # >0: no lanzar yt-dlp en espera (se va a reemplazar)
         self._reapers: list[threading.Thread] = []   # yt-dlp que ya respondieron y están saliendo
         self._fast_misses = 0       # fallos seguidos del cliente rápido que el modo por defecto resolvió
+        self._discards: list[threading.Thread] = []  # yt-dlp en espera que se están cerrando
         self._closed = False
+        self.recover_interrupted_update()
 
     # -- utilidades ---------------------------------------------------------
     def _set_state(self, state: ExtractorState) -> None:
@@ -620,9 +655,11 @@ class ExtractorManager:
         self._discard_async(warm)
         return None
 
-    @staticmethod
-    def _discard_async(warm: WarmProcess) -> None:
-        threading.Thread(target=warm.discard, name="yt-dlp-descartado", daemon=True).start()
+    def _discard_async(self, warm: WarmProcess) -> None:
+        thread = threading.Thread(target=warm.discard, name="yt-dlp-descartado", daemon=True)
+        with self._warm_lock:
+            self._discards = [t for t in self._discards if t.is_alive()] + [thread]
+        thread.start()
 
     def _hold_warm(self) -> None:
         """Antes de reemplazar el binario: ningún yt-dlp nuestro debe tenerlo
@@ -641,12 +678,40 @@ class ExtractorManager:
             self._warm_hold -= 1
 
     def shutdown(self) -> None:
-        """Al cerrar la app: el yt-dlp en espera termina solo al cerrarle stdin."""
+        """Al cerrar la app: no se lanza ningún yt-dlp más, el que espera la URL
+        termina solo al cerrarle stdin y las resoluciones en curso se cancelan
+        (matando su proceso). Espera como mucho ``EXTRACTOR_SHUTDOWN_WAIT_S``;
+        lo que quede lo termina el Job Object al salir la app.
+
+        Una actualización en marcha no se corta: matar ``yt-dlp -U`` a mitad
+        es justo lo que deja el .exe roto. Si la app sale antes, el marcador
+        hace que el próximo arranque restaure el respaldo."""
+        deadline = time.monotonic() + config.EXTRACTOR_SHUTDOWN_WAIT_S
+
+        def left() -> float:
+            return max(0.0, deadline - time.monotonic())
+
         self._closed = True
+        with self._cond:
+            if self._active:
+                self._kill.set()
+            self._cond.notify_all()
         with self._warm_lock:
+            self._warm_hold += 1          # ni el relevo de una resolución arranca otro
             warm, self._warm = self._warm, None
+            reapers, self._reapers = self._reapers, []
+            discards, self._discards = self._discards, []
         if warm is not None:
-            warm.discard(2.0)
+            warm.discard(min(2.0, left()))
+        with self._cond:
+            while self._active and left() > 0:
+                self._cond.wait(min(0.05, left()))
+            busy = self._active
+        for thread in (*reapers, *discards):
+            thread.join(left())
+        pending = busy + sum(t.is_alive() for t in (*reapers, *discards))
+        if pending:
+            log.warning("al cerrar quedaron %d yt-dlp sin terminar", pending)
 
     # -- línea de comandos --------------------------------------------------
     def base_args(self, use_cookies: bool, tier: str = "default") -> list[str]:
@@ -768,6 +833,8 @@ class ExtractorManager:
     ) -> ResolveResult:
         """Resuelve ``video_id`` (bloqueante; llamar desde un hilo de trabajo)."""
         cancel = cancel or threading.Event()
+        if self._closed:
+            return self._fail(video_id, ErrorKind.CANCELLED)
         if not self.ytdlp.is_file():
             return self._fail(video_id, ErrorKind.BINARY_MISSING)
         now = self._clock()
@@ -783,7 +850,7 @@ class ExtractorManager:
         play = purpose == "play"
         result = self._fail(video_id, ErrorKind.CANCELLED)
         for _ in range(3):
-            if not self._enter_extract(cancel.is_set, play):
+            if not self._enter_extract(lambda: cancel.is_set() or self._closed, play):
                 return self._fail(video_id, ErrorKind.CANCELLED)
             try:
                 self._set_state(ExtractorState.EXTRACTING)
@@ -843,7 +910,7 @@ class ExtractorManager:
         )
 
     def _stopped_result(self, video_id: str, cancel: threading.Event) -> ResolveResult:
-        if self._kill.is_set() and not cancel.is_set():
+        if self._kill.is_set() and not cancel.is_set() and not self._closed:
             return self._fail(video_id, ErrorKind.PREEMPTED)
         return self._fail(video_id, ErrorKind.CANCELLED)
 
@@ -1085,7 +1152,12 @@ class ExtractorManager:
             )
             if self._clock() - self.db.get_float("last_update_timestamp") < cooldown:
                 return UpdateResult(UpdateStatus.SKIPPED_COOLDOWN)
+        if self._closed:
+            return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
         self._enter_update(config.UPDATE_DRAIN_TIMEOUT_S)
+        if self._closed:
+            self._leave_update()
+            return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
         self._hold_warm()
         try:
             self._set_state(ExtractorState.UPDATING)
@@ -1118,6 +1190,7 @@ class ExtractorManager:
         unverified = self.db.get_setting("update_unverified") or ""
         if unverified and self.bak.is_file():
             if self._restore_backup():
+                self._clear_updating()
                 self.db.add_bad_version(unverified, "falló tras una actualización sin verificar")
                 self.db.set_setting("update_unverified", "")
                 self._notice(f"yt-dlp {unverified} falla: se restauró la versión anterior.")
@@ -1128,7 +1201,80 @@ class ExtractorManager:
         result = self._update_locked("reactive")
         return result.status in (UpdateStatus.UPDATED, UpdateStatus.UPDATED_UNVERIFIED)
 
+    # -- actualización interrumpida -------------------------------------------
+    def recover_interrupted_update(self) -> bool:
+        """Si la app se cerró a mitad de ``yt-dlp -U`` (o no pudo deshacer una
+        actualización fallida), el .exe puede estar roto: se vuelve al respaldo
+        antes de usarlo. Devuelve True si se restauró."""
+        if not self.marker.is_file():
+            return False
+        if not self.bak.is_file():
+            log.warning("actualización de yt-dlp interrumpida y sin respaldo: se deja como está")
+            self._clear_updating()
+            return False
+        if not self._restore_backup():
+            log.error("actualización de yt-dlp interrumpida: no se pudo restaurar el respaldo")
+            return False
+        log.warning("la última actualización de yt-dlp quedó a medias: se restauró el respaldo")
+        self._clear_updating()
+        self.db.set_setting("update_unverified", "")
+        return True
+
+    def _mark_updating(self, old_version: str) -> None:
+        tmp = self.marker.with_name(self.marker.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"old_version": old_version, "started_at": self._clock()}), encoding="utf-8"
+        )
+        os.replace(tmp, self.marker)
+
+    def _clear_updating(self) -> None:
+        try:
+            self.marker.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("no se pudo borrar %s: %s", self.marker.name, exc)
+
+    def _make_backup(self, old_version: str) -> Optional[str]:
+        """Guarda el binario actual en .bak, salvo que el .bak que ya hay sea
+        mejor que él: si la versión actual no está verificada o no arranca, el
+        .bak es la última que funcionó y no se pisa. Devuelve el error, si hubo."""
+        if self.bak.is_file():
+            if self.db.get_setting("update_unverified"):
+                log.info("se conserva %s: la versión actual aún no está verificada", self.bak.name)
+                return None
+            if not old_version:
+                log.info("se conserva %s: el binario actual no arranca", self.bak.name)
+                return None
+        tmp = self.bak.with_name(self.bak.name + ".tmp")
+        try:
+            shutil.copy2(self.ytdlp, tmp)
+            os.replace(tmp, self.bak)       # un .bak a medio copiar nunca sustituye al bueno
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return str(exc)
+        self.db.set_setting("ytdlp_bak_version", old_version)
+        return None
+
+    def _undo_update(self) -> bool:
+        """Vuelve al respaldo. Si no se puede, el marcador se queda y el
+        próximo arranque (o la próxima actualización) lo vuelve a intentar."""
+        if self._restore_backup():
+            self._clear_updating()
+            return True
+        self._notice(
+            "No se pudo restaurar yt-dlp tras una actualización fallida; se reintentará al abrir la app."
+        )
+        return False
+
     def _update_locked(self, reason: str) -> UpdateResult:
+        if self.marker.is_file() and not self.recover_interrupted_update():
+            # Con una restauración pendiente no se pisa el respaldo bueno.
+            return UpdateResult(
+                UpdateStatus.FAILED,
+                message="Hay una actualización anterior sin deshacer y el respaldo no se pudo restaurar.",
+            )
         old_version = self.ytdlp_version()
         self.db.set_setting("last_update_timestamp", self._clock())
 
@@ -1143,74 +1289,126 @@ class ExtractorManager:
             if latest == old_version:
                 return UpdateResult(UpdateStatus.UP_TO_DATE, old_version, old_version)
 
+        error = self._make_backup(old_version)
+        if error:
+            return UpdateResult(UpdateStatus.FAILED, old_version, message=f"No se pudo crear el respaldo: {error}")
+        restored = self.db.get_setting("ytdlp_bak_version") or "la versión anterior"
         try:
-            shutil.copy2(self.ytdlp, self.bak)
+            self._mark_updating(old_version)
         except OSError as exc:
-            return UpdateResult(UpdateStatus.FAILED, old_version, message=f"No se pudo crear el respaldo: {exc}")
+            return UpdateResult(
+                UpdateStatus.FAILED, old_version, message=f"No se pudo preparar la actualización: {exc}"
+            )
 
         run = self._runner([str(self.ytdlp), "--ignore-config", "-U"], config.UPDATE_TIMEOUT_S, None)
         if run.returncode not in (0, 100):
-            self._restore_backup()
+            detail = summarize(run.stderr) or run.returncode
+            if self._undo_update():
+                return UpdateResult(UpdateStatus.FAILED, old_version, message=f"yt-dlp -U falló: {detail}")
             return UpdateResult(
                 UpdateStatus.FAILED, old_version,
-                message=f"yt-dlp -U falló: {summarize(run.stderr) or run.returncode}",
+                message=f"yt-dlp -U falló ({detail}) y no se pudo restaurar el respaldo.",
             )
 
         new_version = self.ytdlp_version()
         if not new_version:
-            self._restore_backup()
-            return UpdateResult(UpdateStatus.ROLLED_BACK, old_version, message="El binario nuevo no arranca.")
+            if self._undo_update():
+                return UpdateResult(UpdateStatus.ROLLED_BACK, old_version, message="El binario nuevo no arranca.")
+            return UpdateResult(
+                UpdateStatus.FAILED, old_version,
+                message="El binario nuevo no arranca y no se pudo restaurar el respaldo.",
+            )
         if new_version == old_version:
+            self._clear_updating()
             return UpdateResult(UpdateStatus.UP_TO_DATE, old_version, new_version)
         if self.db.is_bad_version(new_version):
-            self._restore_backup()
-            return UpdateResult(UpdateStatus.SKIPPED_BAD_VERSION, old_version, new_version)
+            if self._undo_update():
+                return UpdateResult(UpdateStatus.SKIPPED_BAD_VERSION, old_version, new_version)
+            return UpdateResult(
+                UpdateStatus.FAILED, old_version, new_version,
+                f"Se instaló {new_version}, ya descartada, y no se pudo restaurar el respaldo.",
+            )
 
-        # Smoke test. Solo un fallo de EXTRACCIÓN justifica el rollback: un
-        # bloqueo anti-bot o un fallo de red no dicen nada del binario.
+        # Smoke test con el vídeo de control. Solo un fallo de EXTRACCIÓN culpa
+        # al binario: un bloqueo, la red, o que el vídeo de control no esté
+        # disponible o pida sesión (región, cambios de YouTube) no dicen nada
+        # de esta versión, y descartarla para siempre sería un error.
         smoke = self._extract_once(config.CONTROL_VIDEO_ID, self._default_use_cookies(), None)
         if smoke.ok:
+            self._clear_updating()
             self.db.set_setting("update_unverified", "")
             self._notice(f"yt-dlp actualizado a {new_version}.")
             return UpdateResult(UpdateStatus.UPDATED, old_version, new_version)
 
         skind = smoke.kind or ErrorKind.UNKNOWN
-        if skind in (ErrorKind.BOT_BLOCK, ErrorKind.NETWORK):
+        if skind not in (ErrorKind.EXTRACTION, ErrorKind.RUNTIME_MISSING):
             # No concluyente: se conserva el binario nuevo y el .bak. Si la
             # próxima resolución real falla por extracción, se hace rollback.
+            self._clear_updating()
             self.db.set_setting("update_unverified", new_version)
+            log.warning(
+                "smoke test de yt-dlp %s no concluyente (%s): %s",
+                new_version, skind.value, summarize(smoke.stderr),
+            )
             return UpdateResult(
                 UpdateStatus.UPDATED_UNVERIFIED, old_version, new_version,
-                f"Actualizado a {new_version}; la verificación quedó pendiente ({MESSAGES_ES[skind]}).",
+                f"Actualizado a {new_version}; la verificación quedó pendiente "
+                f"({MESSAGES_ES.get(skind, skind.value)}).",
             )
 
-        self._restore_backup()
+        undone = self._undo_update()
         if skind is ErrorKind.RUNTIME_MISSING:
             # No es culpa de la versión: puede necesitar un deno más nuevo.
+            if not undone:
+                return UpdateResult(
+                    UpdateStatus.FAILED, old_version, new_version,
+                    "La versión nueva no encontró un runtime JS compatible y no se pudo restaurar el respaldo.",
+                )
             return UpdateResult(
                 UpdateStatus.ROLLED_BACK, old_version, new_version,
                 "La versión nueva no encontró un runtime JS compatible; revisa deno.",
             )
         self.db.add_bad_version(new_version, f"smoke test: {summarize(smoke.stderr)}")
-        self._notice(f"yt-dlp {new_version} no pasó la prueba: se restauró {old_version}.")
+        if not undone:
+            # Sigue instalada la rota: que la próxima resolución intente volver atrás.
+            self.db.set_setting("update_unverified", new_version)
+            return UpdateResult(
+                UpdateStatus.FAILED, old_version, new_version,
+                f"La versión {new_version} no pasó el smoke test y no se pudo restaurar el respaldo.",
+            )
+        self._notice(f"yt-dlp {new_version} no pasó la prueba: se restauró {restored}.")
         return UpdateResult(
             UpdateStatus.ROLLED_BACK, old_version, new_version,
-            f"La versión {new_version} no pasó el smoke test; se restauró {old_version}.",
+            f"La versión {new_version} no pasó el smoke test; se restauró {restored}.",
         )
 
     def _restore_backup(self) -> bool:
+        """Vuelve a ``yt-dlp.bak``. Se copia a un temporal que luego sustituye
+        al .exe de una vez (``os.replace``): un corte a mitad nunca deja un .exe
+        truncado. Reintenta si el .exe sigue bloqueado (antivirus, un proceso
+        que aún sale). Devuelve si quedó restaurado."""
         if not self.bak.is_file():
+            log.error("no hay %s para restaurar", self.bak.name)
             return False
         tmp = self.ytdlp.with_name(self.ytdlp.name + ".restore")
-        for attempt in range(10):
+        delays = config.RESTORE_RETRY_DELAYS_S
+        error: Optional[OSError] = None
+        for attempt in range(len(delays) + 1):
             try:
                 shutil.copy2(self.bak, tmp)
+                if tmp.stat().st_size != self.bak.stat().st_size:
+                    raise OSError(f"copia incompleta de {self.bak.name}")
                 os.replace(tmp, self.ytdlp)
                 return True
-            except OSError:
-                # El .exe puede seguir bloqueado un instante (antivirus, cierre).
-                time.sleep(0.3 * (attempt + 1) if attempt < 3 else 1.0)
-        log.error("no se pudo restaurar %s", self.bak)
+            except OSError as exc:
+                error = exc
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log.error("no se pudo restaurar %s: %s", self.bak, error)
         return False
 
 

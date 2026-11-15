@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ class FakeYtdlp:
         self.calls = []                   # (video_id, cookies)
         self.next_version = next_version
         self.update_rc = 0
+        self.update_writes = None         # lo que deja -U en el .exe (None: la versión nueva)
         self.updates = 0
         self.by_version = {}              # versión -> {video_id: resultado}
 
@@ -41,10 +43,15 @@ class FakeYtdlp:
         if "--version" in args:
             if args[0].endswith("deno.exe") or "deno" in args[0]:
                 return RunResult(0, stdout="deno 2.9.8 (stable)\n")
-            return RunResult(0, stdout=self.exe.read_text() + "\n")
+            text = self.exe.read_text() if self.exe.is_file() else ""
+            if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", text):
+                return RunResult(1, stderr="no es una aplicación Win32 válida")    # .exe truncado
+            return RunResult(0, stdout=text + "\n")
         if "-U" in args:
             self.updates += 1
-            if self.update_rc == 0:
+            if self.update_writes is not None:
+                self.exe.write_text(self.update_writes)
+            elif self.update_rc == 0:
                 self.exe.write_text(self.next_version)
             return RunResult(self.update_rc, stderr="" if self.update_rc == 0 else "ERROR: update failed")
         video_id = args[-1].split("v=")[-1]
@@ -730,3 +737,383 @@ def test_shutdown_closes_the_warm_process_and_stops_respawning(warm_env):
     assert FakeWarm.instances[0].discarded
     mgr.prewarm()
     assert len(FakeWarm.instances) == 1
+
+
+# -- actualización atómica y restauración del respaldo (Fase 2) ---------------
+
+
+@pytest.fixture
+def fast_restore(monkeypatch):
+    monkeypatch.setattr(config, "RESTORE_RETRY_DELAYS_S", (0.0, 0.0))
+
+
+def deny_restore(monkeypatch, bak):
+    """El antivirus (o un permiso) impide leer el respaldo."""
+    import shutil
+
+    real_copy = shutil.copy2
+
+    def copy2(src, dst, *args, **kwargs):
+        if str(src) == str(bak):
+            raise PermissionError(13, "Acceso denegado", str(src))
+        return real_copy(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", copy2)
+
+
+def reopen(env):
+    """La app vuelve a abrirse con la misma carpeta bin y la misma base."""
+    return ExtractorManager(
+        env.db, ytdlp=env.exe, deno=env.exe.with_name("deno.exe"), cookies=env.cookies,
+        cache=env.exe.parent / "cache", runner=env.fake, latest_tag_fetcher=lambda: None,
+        clock=env.clock, wait=lambda seconds, stop: True,
+    )
+
+
+def test_update_that_leaves_a_truncated_exe_restores_the_original(env, fast_restore):
+    env.fake.update_rc = 1
+    env.fake.update_writes = "MZ\x00\x00"                       # -U cortado a mitad de escribir
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.FAILED
+    assert env.exe.read_text() == "2026.01.01"                  # el original, intacto
+    assert not env.mgr.marker.exists()
+    assert not env.exe.with_name("yt-dlp.exe.restore").exists()
+
+
+def test_update_that_exits_fine_but_leaves_a_broken_exe_rolls_back(env, fast_restore):
+    env.fake.update_writes = "MZ\x00\x00"
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.ROLLED_BACK
+    assert env.exe.read_text() == "2026.01.01"
+    assert not env.mgr.marker.exists()
+
+
+def test_failed_restore_is_not_reported_as_rolled_back(env, fast_restore, monkeypatch):
+    env.fake.by_version = {"2026.02.02": {CONTROL: NSIG}}
+    deny_restore(monkeypatch, env.mgr.bak)
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.FAILED                 # y no ROLLED_BACK
+    assert "no se pudo restaurar" in result.message
+    assert not any("se restauró" in n for n in env.notices)
+    assert env.exe.read_text() == "2026.02.02"                  # sigue la rota...
+    assert env.db.is_bad_version("2026.02.02")
+    assert env.db.get_setting("update_unverified") == "2026.02.02"
+    assert env.mgr.marker.exists()                              # ...y queda pendiente de deshacer
+    # Mientras no se restaure, otra actualización no pisa el respaldo bueno.
+    assert env.mgr.update("manual").status is UpdateStatus.FAILED
+    assert env.mgr.bak.read_text() == "2026.01.01"
+    monkeypatch.undo()
+    reopen(env)                                                 # al volver a abrir la app
+    assert env.exe.read_text() == "2026.01.01"
+    assert not env.mgr.marker.exists()
+
+
+def test_failed_restore_after_update_command_failure_is_reported(env, fast_restore, monkeypatch):
+    env.fake.update_rc = 1
+    env.fake.update_writes = "MZ\x00\x00"
+    deny_restore(monkeypatch, env.mgr.bak)
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.FAILED
+    assert "no se pudo restaurar" in result.message
+    assert env.mgr.marker.exists()
+
+
+def test_crash_in_the_middle_of_an_update_is_undone_on_next_start(env):
+    def crash(args, timeout, should_stop=None):
+        if "-U" in args:
+            env.exe.write_text("MZ\x00")                         # el .exe a medio escribir...
+            raise SystemExit("la app se cerró")                 # ...cuando la app se cae
+        return env.fake(args, timeout, should_stop)
+
+    env.mgr._runner = crash
+    with pytest.raises(SystemExit):
+        env.mgr.update("manual")
+    assert env.mgr.marker.exists()
+    again = reopen(env)
+    assert env.exe.read_text() == "2026.01.01"
+    assert not again.marker.exists()
+    assert again.resolve("abc").ok
+
+
+def test_marker_without_backup_is_dropped(env):
+    env.mgr.marker.write_text("{}")
+    assert not env.mgr.bak.exists()
+    reopen(env)
+    assert env.exe.read_text() == "2026.01.01" and not env.mgr.marker.exists()
+
+
+def test_backup_of_the_last_verified_version_survives_an_unverified_one(env, fast_restore):
+    env.fake.by_version = {"2026.02.02": {CONTROL: BOT}, "2026.03.03": {CONTROL: NSIG}}
+    assert env.mgr.update("manual").status is UpdateStatus.UPDATED_UNVERIFIED
+    env.fake.next_version = "2026.03.03"
+    result = env.mgr.update("manual")
+    assert env.mgr.bak.read_text() == "2026.01.01"              # no se pisó con la sin verificar
+    assert result.status is UpdateStatus.ROLLED_BACK
+    assert env.exe.read_text() == "2026.01.01"
+    assert "2026.01.01" in result.message
+
+
+def test_broken_current_binary_does_not_overwrite_the_backup(env, fast_restore):
+    env.mgr.bak.write_text("2026.01.01")
+    env.exe.write_text("MZ\x00")                                # el actual no arranca
+    env.fake.by_version = {"2026.02.02": {CONTROL: NSIG}}
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.ROLLED_BACK
+    assert env.mgr.bak.read_text() == "2026.01.01"
+    assert env.exe.read_text() == "2026.01.01"
+
+
+# -- smoke test: qué culpa al binario -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "control_error", [UNAVAILABLE, AGE, "ERROR: mensaje nuevo que no conocemos"],
+    ids=["no-disponible", "pide-sesion", "desconocido"],
+)
+def test_control_video_problems_do_not_discard_the_version(env, control_error):
+    env.fake.by_version = {"2026.02.02": {CONTROL: control_error}}
+    result = env.mgr.update("manual")
+    assert result.status is UpdateStatus.UPDATED_UNVERIFIED
+    assert not env.db.is_bad_version("2026.02.02")
+    assert env.exe.read_text() == "2026.02.02"
+    assert env.db.get_setting("update_unverified") == "2026.02.02"
+    assert env.mgr.bak.read_text() == "2026.01.01"              # el rollback sigue posible
+    assert not env.mgr.marker.exists()
+
+
+# -- tuberías y cierre ----------------------------------------------------------
+
+
+_PARENT_WITH_GRANDCHILD = (
+    "import subprocess, sys\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+    "                         stdout=sys.stdout, stderr=sys.stderr)\n"
+    "open(sys.argv[1], 'w').write(str(child.pid))\n"
+    "print('ERROR: algo salio mal', file=sys.stderr, flush=True)\n"
+    "sys.exit(1)\n"
+)
+
+
+def test_a_grandchild_holding_the_pipe_does_not_hang_the_caller(tmp_path, monkeypatch):
+    """yt-dlp sale, pero un nieto (deno) heredó su salida y sigue vivo."""
+    import os
+    import signal
+    import subprocess
+
+    from ytm_native.playback import extractor
+
+    monkeypatch.setattr(config, "PIPE_DRAIN_TIMEOUT_S", 0.5)
+    pid_file = tmp_path / "nieto.pid"
+    proc = extractor._spawn([sys.executable, "-c", _PARENT_WITH_GRANDCHILD, str(pid_file)], subprocess.DEVNULL)
+    try:
+        t, out = in_thread(lambda: extractor._collect_early(proc, time.monotonic(), 30))
+        t.join(15)
+        assert not t.is_alive(), "se quedó esperando la tubería del nieto"
+        run, reaper = out["res"]
+        assert run.returncode == 1 and "algo salio mal" in run.stderr and reaper is None
+        if sys.platform == "win32":
+            # La lectura se canceló y las tuberías quedaron cerradas de verdad.
+            assert proc.stdout.closed and proc.stderr.closed
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except OSError:
+                pass
+
+
+class StoppableRunner:
+    """Un yt-dlp que no termina hasta que lo mandan parar."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.calls = []
+
+    def __call__(self, args, timeout, should_stop=None):
+        self.calls.append(args)
+        if "--version" in args:
+            return RunResult(0, stdout="2026.01.01\n")
+        self.started.set()
+        while not (should_stop and should_stop()):
+            time.sleep(0.01)
+        return RunResult(-1, stopped=True)
+
+
+def test_shutdown_cancels_resolutions_in_flight_and_returns_quickly(env):
+    runner = StoppableRunner()
+    env.mgr._runner = runner
+    t, out = in_thread(lambda: env.mgr.resolve("abc", purpose="play"))
+    assert runner.started.wait(5)
+    t0 = time.monotonic()
+    env.mgr.shutdown()
+    assert time.monotonic() - t0 < config.EXTRACTOR_SHUTDOWN_WAIT_S
+    t.join(5)
+    assert out["res"].kind is ErrorKind.CANCELLED
+    assert env.mgr.state is ExtractorState.IDLE
+    # Cerrada, no lanza nada más.
+    calls = len(runner.calls)
+    assert env.mgr.resolve("def").kind is ErrorKind.CANCELLED
+    assert env.mgr.update("manual").status is UpdateStatus.FAILED
+    assert len(runner.calls) == calls
+
+
+def test_shutdown_wait_is_bounded_by_stuck_workers(env, monkeypatch):
+    monkeypatch.setattr(config, "EXTRACTOR_SHUTDOWN_WAIT_S", 0.3)
+    never = threading.Event()
+    stuck = threading.Thread(target=never.wait, daemon=True)
+    stuck.start()
+    env.mgr._reapers = [stuck]
+    t0 = time.monotonic()
+    env.mgr.shutdown()
+    assert time.monotonic() - t0 < 2
+    never.set()
+
+
+def test_shutdown_waits_for_a_warm_process_being_discarded(warm_env):
+    mgr = warm_env.mgr
+    mgr.prewarm()
+    released = threading.Event()
+    stale = FakeWarm([], (False, "x"))
+
+    def slow_discard(wait=5.0):
+        time.sleep(0.2)
+        stale.discarded = True
+        released.set()
+
+    stale.discard = slow_discard
+    mgr._discard_async(stale)
+    mgr.shutdown()
+    assert released.is_set() and stale.discarded               # se esperó a que terminara
+    assert FakeWarm.instances[0].discarded
+
+
+# -- descargas de bootstrap ----------------------------------------------------
+
+
+class CutServer:
+    """Servidor HTTP local que anuncia el tamaño completo y, en cada petición,
+    envía solo la fracción indicada antes de cortar la conexión."""
+
+    def __init__(self, payload, fractions):
+        import http.server
+
+        self.payload = payload
+        self.fractions = list(fractions)
+        self.requests = 0
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                n = server.requests
+                server.requests += 1
+                frac = server.fractions[min(n, len(server.fractions) - 1)]
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(server.payload)))
+                self.end_headers()
+                self.wfile.write(server.payload[: int(len(server.payload) * frac)])
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/yt-dlp.exe"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def no_retry_wait(monkeypatch):
+    from ytm_native.playback import bootstrap
+
+    monkeypatch.setattr(bootstrap, "RETRY_DELAY_S", 0.0)
+    return bootstrap
+
+
+def test_download_cut_at_20_percent_is_retried(tmp_path, no_retry_wait):
+    payload = bytes(range(256)) * 400
+    server = CutServer(payload, [0.2, 1.0])
+    dest = tmp_path / "bin" / "yt-dlp.exe"
+    try:
+        no_retry_wait._download(server.url, dest, lambda msg: None, "yt-dlp")
+    finally:
+        server.close()
+    assert server.requests == 2
+    assert dest.read_bytes() == payload
+    assert not dest.with_name(dest.name + ".part").exists()
+
+
+def test_download_that_keeps_getting_cut_never_replaces_the_file(tmp_path, no_retry_wait):
+    payload = bytes(range(256)) * 400
+    server = CutServer(payload, [0.2])
+    dest = tmp_path / "bin" / "yt-dlp.exe"
+    dest.parent.mkdir()
+    dest.write_bytes(b"version anterior")
+    messages = []
+    try:
+        with pytest.raises(OSError, match="incompleta"):
+            no_retry_wait._download(server.url, dest, messages.append, "yt-dlp")
+    finally:
+        server.close()
+    assert server.requests == 3
+    assert dest.read_bytes() == b"version anterior"
+    assert not dest.with_name(dest.name + ".part").exists()
+    assert sum("reintento" in m for m in messages) == 2
+
+
+def _deno_zip(path, data, corrupt=False):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("deno-x86_64/deno.exe", data)
+    if corrupt:
+        raw = bytearray(path.read_bytes())
+        at = raw.find(data[:64]) + len(data) // 2
+        raw[at:at + 16] = b"\xff" * 16
+        path.write_bytes(bytes(raw))
+
+
+@pytest.fixture
+def fake_deno_download(monkeypatch, tmp_path, no_retry_wait):
+    monkeypatch.delenv("YTMN_BIN_DIR", raising=False)
+    monkeypatch.setattr(no_retry_wait, "_fetch_text", lambda url: None)
+    source = tmp_path / "origen.zip"
+
+    def download(url, dest, progress, label, attempts=3):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(source.read_bytes())
+
+    monkeypatch.setattr(no_retry_wait, "_download", download)
+    return no_retry_wait, source
+
+
+def test_install_deno_creates_the_bin_folder_and_leaves_no_temporaries(fake_deno_download):
+    from ytm_native.core import paths
+
+    bootstrap, source = fake_deno_download
+    data = b"deno" * 5000
+    _deno_zip(source, data)
+    assert not paths.bin_dir().exists()
+    bootstrap.install_deno(lambda msg: None)
+    assert paths.deno_exe().read_bytes() == data
+    assert not paths.deno_exe().with_name("deno.exe.part").exists()
+    assert not any((paths.app_home() / "descargas").glob("*"))
+
+
+def test_install_deno_with_a_damaged_zip_keeps_the_previous_binary(fake_deno_download):
+    from ytm_native.core import paths
+
+    bootstrap, source = fake_deno_download
+    _deno_zip(source, b"deno" * 5000, corrupt=True)
+    paths.bin_dir().mkdir(parents=True)
+    paths.deno_exe().write_bytes(b"deno anterior")
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap.install_deno(lambda msg: None)
+    assert paths.deno_exe().read_bytes() == b"deno anterior"
+    assert not paths.deno_exe().with_name("deno.exe.part").exists()
+    assert not any((paths.app_home() / "descargas").glob("*"))

@@ -12,7 +12,9 @@ Uso: ``python -m ytm_native.playback.bootstrap [--force]``
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -34,6 +36,7 @@ MPV_RELEASE_API = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/rel
 _MPV_ASSET_RE = re.compile(r"^mpv-x86_64-\d{8}-git-[0-9a-f]+\.7z$")
 _UA = {"User-Agent": "ytmn-bootstrap"}
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+RETRY_DELAY_S = 2.0         # espera antes del 2.º intento; el 3.º espera el doble
 
 
 class BootstrapError(RuntimeError):
@@ -54,29 +57,56 @@ def _download(url: str, dest: Path, progress: Progress, label: str, attempts: in
             if attempt == attempts:
                 raise
             progress(f"La descarga de {label} se cortó ({exc}); reintento {attempt + 1} de {attempts}…")
-            time.sleep(2 * attempt)
+            time.sleep(RETRY_DELAY_S * attempt)
 
 
 def _download_once(url: str, dest: Path, progress: Progress, label: str) -> None:
+    """Descarga a ``.part`` y solo si llegó entera la pone en ``dest``."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
     req = urllib.request.Request(url, headers=_UA)
-    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as fh:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done = 0
-        last_pct = -10
-        while True:
-            chunk = resp.read(256 * 1024)
-            if not chunk:
-                break
-            fh.write(chunk)
-            done += len(chunk)
-            if total:
-                pct = done * 100 // total
-                if pct >= last_pct + 10:
-                    last_pct = pct
-                    progress(f"Descargando {label}… {pct} %")
-    tmp.replace(dest)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as fh:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            last_pct = -10
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = done * 100 // total
+                    if pct >= last_pct + 10:
+                        last_pct = pct
+                        progress(f"Descargando {label}… {pct} %")
+        # Si el servidor corta antes de tiempo, ``read`` devuelve vacío como
+        # al final: solo la longitud anunciada distingue un archivo truncado.
+        if total and done != total:
+            raise OSError(f"Descarga incompleta: {done} de {total} bytes")
+        os.replace(tmp, dest)
+    except http.client.HTTPException as exc:
+        # IncompleteRead y compañía no son OSError: así también se reintentan.
+        raise OSError(f"Descarga interrumpida: {exc!r}") from exc
+    finally:
+        _remove(tmp)
+
+
+def _remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _replace_checked(tmp: Path, dest: Path, expected_size: int) -> None:
+    """Pone ``tmp`` en ``dest`` de una vez, si tiene el tamaño esperado: el
+    ejecutable final nunca queda a medio escribir."""
+    size = tmp.stat().st_size
+    if size != expected_size or size == 0:
+        raise BootstrapError(f"{dest.name}: se extrajeron {size} bytes de {expected_size}.")
+    os.replace(tmp, dest)
 
 
 def _fetch_text(url: str) -> Optional[str]:
@@ -123,24 +153,38 @@ def _verify(path: Path, sums_text: Optional[str], filename: str, progress: Progr
 
 def install_ytdlp(progress: Progress) -> None:
     dest = paths.ytdlp_exe()
+    dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name("yt-dlp.download.exe")
-    _download(YTDLP_BASE + "yt-dlp.exe", tmp, progress, "yt-dlp (nightly)")
-    _verify(tmp, _fetch_text(YTDLP_BASE + "SHA2-256SUMS"), "yt-dlp.exe", progress)
-    tmp.replace(dest)
+    try:
+        _download(YTDLP_BASE + "yt-dlp.exe", tmp, progress, "yt-dlp (nightly)")
+        _verify(tmp, _fetch_text(YTDLP_BASE + "SHA2-256SUMS"), "yt-dlp.exe", progress)
+        os.replace(tmp, dest)
+    finally:
+        _remove(tmp)
 
 
 def install_deno(progress: Progress) -> None:
     work = paths.app_home() / "descargas"
     archive = work / DENO_ASSET
-    _download(DENO_BASE + DENO_ASSET, archive, progress, "deno")
-    _verify(archive, _fetch_text(DENO_BASE + DENO_ASSET + ".sha256sum"), DENO_ASSET, progress)
-    with zipfile.ZipFile(archive) as zf:
-        member = next((n for n in zf.namelist() if n.lower().endswith("deno.exe")), None)
-        if member is None:
-            raise BootstrapError("El zip de deno no contiene deno.exe.")
-        with zf.open(member) as src, open(paths.deno_exe(), "wb") as dst:
-            shutil.copyfileobj(src, dst)
-    archive.unlink(missing_ok=True)
+    dest = paths.deno_exe()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        _download(DENO_BASE + DENO_ASSET, archive, progress, "deno")
+        _verify(archive, _fetch_text(DENO_BASE + DENO_ASSET + ".sha256sum"), DENO_ASSET, progress)
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                member = next((i for i in zf.infolist() if i.filename.lower().endswith("deno.exe")), None)
+                if member is None:
+                    raise BootstrapError("El zip de deno no contiene deno.exe.")
+                with zf.open(member) as src, open(tmp, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        except zipfile.BadZipFile as exc:
+            raise BootstrapError(f"El zip de deno está dañado: {exc}") from exc
+        _replace_checked(tmp, dest, member.file_size)
+    finally:
+        _remove(tmp)
+        _remove(archive)
 
 
 def install_mpv(progress: Progress) -> None:
@@ -153,33 +197,42 @@ def install_mpv(progress: Progress) -> None:
         raise BootstrapError("No se encontró el paquete mpv-x86_64 en la última versión publicada.")
     work = paths.app_home() / "descargas"
     archive = work / asset["name"]
-    _download(asset["browser_download_url"], archive, progress, "mpv")
-    digest = str(asset.get("digest") or "")
-    if digest.startswith("sha256:"):
-        if _sha256(archive) != digest.split(":", 1)[1].lower():
-            archive.unlink(missing_ok=True)
-            raise BootstrapError("La suma SHA-256 de mpv no coincide; descarga descartada.")
-        progress("mpv: suma SHA-256 verificada.")
     out = work / "mpv_extraido"
-    shutil.rmtree(out, ignore_errors=True)
-    out.mkdir(parents=True)
-    progress("Extrayendo mpv…")
+    dest = paths.mpv_exe()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    keep_archive = False
     try:
-        proc = subprocess.run(
-            ["tar", "-xf", str(archive), "-C", str(out)],
-            capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise BootstrapError(f"No se pudo ejecutar tar para extraer mpv: {exc}") from exc
-    found = next(iter(out.rglob("mpv.exe")), None)
-    if proc.returncode != 0 or found is None:
-        raise BootstrapError(
-            "No se pudo extraer el .7z de mpv con tar. Extrae a mano "
-            f"{archive} y copia mpv.exe a {paths.bin_dir()}. Detalle: {proc.stderr.strip()[:200]}"
-        )
-    shutil.copy2(found, paths.mpv_exe())
-    shutil.rmtree(out, ignore_errors=True)
-    archive.unlink(missing_ok=True)
+        _download(asset["browser_download_url"], archive, progress, "mpv")
+        digest = str(asset.get("digest") or "")
+        if digest.startswith("sha256:"):
+            if _sha256(archive) != digest.split(":", 1)[1].lower():
+                raise BootstrapError("La suma SHA-256 de mpv no coincide; descarga descartada.")
+            progress("mpv: suma SHA-256 verificada.")
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        progress("Extrayendo mpv…")
+        try:
+            proc = subprocess.run(
+                ["tar", "-xf", str(archive), "-C", str(out)],
+                capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise BootstrapError(f"No se pudo ejecutar tar para extraer mpv: {exc}") from exc
+        found = next(iter(out.rglob("mpv.exe")), None)
+        if proc.returncode != 0 or found is None:
+            keep_archive = True       # el mensaje pide extraerlo a mano
+            raise BootstrapError(
+                "No se pudo extraer el .7z de mpv con tar. Extrae a mano "
+                f"{archive} y copia mpv.exe a {paths.bin_dir()}. Detalle: {proc.stderr.strip()[:200]}"
+            )
+        shutil.copy2(found, tmp)
+        _replace_checked(tmp, dest, found.stat().st_size)
+    finally:
+        _remove(tmp)
+        shutil.rmtree(out, ignore_errors=True)
+        if not keep_archive:
+            _remove(archive)
 
 
 def install_all(progress: Progress = print, force: bool = False) -> list[str]:

@@ -38,6 +38,7 @@ from ytm_native.playback.extractor import ExtractorManager, ExtractorState, Upda
 from ytm_native.playback.history import PlayTracker
 from ytm_native.playback.mpv_ipc import MpvPlayer
 from ytm_native.playback.player import LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE, PlaybackController
+from ytm_native.playback.session import SessionKeeper
 from ytm_native.services.sync import LibrarySync, SyncReport, SyncState, looks_device_bound, search_tracks
 from . import focus, theme
 from .art import ArtLoader, neutral_tint, placeholder_pixmap, sized_url, track_art_url
@@ -170,6 +171,8 @@ class MainWindow(QMainWindow):
         self._lyrics_for: Optional[str] = None
         self._lyrics_index = -2
         self.art = ArtLoader(self)
+        # Guarda la cola y el segundo por el que va, y los devuelve al abrir.
+        self.session = SessionKeeper(db, player, self)
         self._band_art = ""
         self._now_art = ""
         self._search_note = SEARCH_IDLE_NOTE
@@ -279,6 +282,11 @@ class MainWindow(QMainWindow):
         self.autoplay_action.setChecked(self.player.autoplay)
         self.autoplay_action.toggled.connect(self.player.set_autoplay)
         menu.addAction(show_check(self.autoplay_action, self.devicePixelRatioF()))
+        self.resume_action = QAction("Seguir donde lo dejaste al abrir", self)
+        self.resume_action.setCheckable(True)
+        self.resume_action.setChecked(self.session.enabled)
+        self.resume_action.toggled.connect(self.session.set_enabled)
+        menu.addAction(show_check(self.resume_action, self.devicePixelRatioF()))
         self.lyrics_action = QAction("Mostrar letra", self)
         self.lyrics_action.setCheckable(True)
         self.lyrics_action.setShortcut(QKeySequence("Ctrl+L"))
@@ -660,6 +668,8 @@ class MainWindow(QMainWindow):
         self._reload_sidebar()
         self._on_extractor_state(ExtractorState.IDLE.value)
         self._refresh_banner()
+        # La cola de la última vez vuelve detenida en su punto: no suena sola.
+        self.session.restore()
         self._on_player_state(self.player.state)
         if paths.mpv_exe().is_file():
             self.mpv.start()
@@ -1829,7 +1839,9 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(has_track)
         self.next_btn.setEnabled(has_track)
         self.prev_btn.setEnabled(has_track)
-        self.seek_slider.setEnabled(state in (PLAYING, PAUSED))
+        # Detenida con una pista a medias (la cola recuperada al abrir) también
+        # se puede mover: cambia el punto desde el que seguirá.
+        self.seek_slider.setEnabled(has_track and state != LOADING)
 
     def _on_position(self, pos: float, duration: float) -> None:
         self._duration = duration
@@ -2583,9 +2595,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ cierre
     def closeEvent(self, event) -> None:  # noqa: N802 - API de Qt
+        # Cada paso va por separado: si uno falla (la base bloqueada al
+        # guardar la sesión), los demás siguen y mpv y yt-dlp no quedan vivos.
+        for name, step in (
+            ("temporizadores", self._stop_timers),
+            ("guardar la sesión", self.session.save),
+            ("detener la reproducción", self.player.stop),
+            ("cerrar mpv", self.mpv.shutdown),
+            ("cerrar yt-dlp", self.extractor.shutdown),
+        ):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 - el cierre debe completarse igual
+                log.exception("al cerrar, falló: %s", name)
+        super().closeEvent(event)
+
+    def _stop_timers(self) -> None:
         self._tick.stop()
         self._sync_timer.stop()
-        self.player.stop()
-        self.mpv.shutdown()
-        self.extractor.shutdown()
-        super().closeEvent(event)

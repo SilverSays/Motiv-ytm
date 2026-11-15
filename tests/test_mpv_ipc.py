@@ -6,6 +6,9 @@ import pytest
 
 from ytm_native.playback.mpv_ipc import MpvPlayer, make_pipe_name
 
+# La ventana de prueba (con la red simulada) es la de las pruebas del inicio.
+from test_home_search import animations_on, net, window  # noqa: F401
+
 FAKE = str(Path(__file__).with_name("fake_mpv.py"))
 
 
@@ -95,3 +98,90 @@ def test_media_keys_are_bound_and_forwarded(qapp, mpv):
     assert mpv.events.index(("media", "next")) < mpv.events.index(("media", "prev"))
     mpv.command("keypress", "PLAYPAUSE")
     assert wait_until(qapp, lambda: ("pause", True) in mpv.events)
+
+
+# -- cierre de la app ----------------------------------------------------------
+
+
+def test_shutdown_cancels_a_pending_relaunch_after_a_crash(qapp, mpv):
+    mpv.load("https://example.invalid/crash")
+    assert wait_until(qapp, lambda: any(e[0] == "crashed" for e in mpv.events)), mpv.events
+    mpv.shutdown()                                  # el relanzamiento (300 ms) aún no ocurrió
+    wait_until(qapp, lambda: False, timeout=0.8)
+    assert mpv.events.count(("ready",)) == 1
+    assert mpv._proc is None and not mpv.is_ready()
+
+
+def test_start_after_shutdown_is_ignored(qapp, mpv):
+    mpv.shutdown()
+    mpv.start()
+    wait_until(qapp, lambda: False, timeout=0.3)
+    assert mpv._proc is None and not mpv.is_ready()
+    mpv.shutdown()                                  # cerrar dos veces no falla
+
+
+def test_closing_the_window_stops_children_even_if_saving_the_session_fails(window, monkeypatch):
+    calls = []
+
+    def broken_save():
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(window.session, "save", broken_save)
+    monkeypatch.setattr(window.player, "stop", lambda: calls.append("player"))
+    monkeypatch.setattr(window.mpv, "shutdown", lambda: calls.append("mpv"))
+    monkeypatch.setattr(window.extractor, "shutdown", lambda: calls.append("extractor"))
+    window.close()
+    assert calls == ["player", "mpv", "extractor"]
+
+
+# -- procesos hijos atados a la app (Windows) ----------------------------------
+
+_PARENT = r"""
+import subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+from ytm_native.core import proc_guard
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+print(child.pid, proc_guard.adopt(child.pid), flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Job Objects solo existen en Windows")
+def test_children_die_when_the_app_is_killed(tmp_path):
+    import ctypes
+    import subprocess
+    from ctypes import wintypes
+
+    root = str(Path(__file__).resolve().parent.parent)
+    script = tmp_path / "padre.py"
+    script.write_text(_PARENT, encoding="utf-8")
+    parent = subprocess.Popen([sys.executable, str(script), root], stdout=subprocess.PIPE, text=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    child = None
+    try:
+        pid, adopted = parent.stdout.readline().split()
+        assert adopted == "True"
+        child = k32.OpenProcess(0x00100000 | 0x0001, False, int(pid))   # SYNCHRONIZE | TERMINATE
+        assert child
+        assert k32.WaitForSingleObject(child, 0) == 0x102              # sigue vivo (WAIT_TIMEOUT)
+        parent.kill()                                                  # la app muere de golpe
+        assert k32.WaitForSingleObject(child, 5000) == 0               # y el hijo con ella
+    finally:
+        if child:
+            k32.TerminateProcess(child, 1)
+            k32.CloseHandle(child)
+        parent.kill()
+        parent.wait(5)
+
+
+def test_adopt_is_harmless_for_a_process_that_already_ended():
+    from ytm_native.core import proc_guard
+
+    assert proc_guard.adopt(0) is False
+    assert proc_guard.adopt(2**31 - 7) is False
+

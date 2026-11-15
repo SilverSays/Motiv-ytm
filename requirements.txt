@@ -2,3 +2,14 @@
 # incluye QtWebEngine (Chromium). NO instalar "PySide6" ni "PySide6-Addons".
 PySide6-Essentials>=6.7
 ytmusicapi>=1.10
+# Se usa directamente (sincronización y descubrimiento), no solo a través de
+# ytmusicapi: se declara para no depender de lo que arrastre otro paquete.
+requests>=2.28
+# Controles multimedia de Windows (teclas del teclado, panel de volumen y
+# pantalla de bloqueo, con carátula). Sin ellos la app funciona igual, con los
+# controles básicos de mpv.
+winrt-runtime; sys_platform == "win32"
+winrt-Windows.Foundation; sys_platform == "win32"
+winrt-Windows.Media; sys_platform == "win32"
+winrt-Windows.Media.Playback; sys_platform == "win32"
+winrt-Windows.Storage.Streams; sys_platform == "win32"

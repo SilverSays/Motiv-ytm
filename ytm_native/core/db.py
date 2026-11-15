@@ -8,12 +8,15 @@ solo necesita refrescar sus modelos al recibir la señal de fin de sincronizaci�
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+log = logging.getLogger("ytmn.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -151,7 +154,19 @@ def is_local_playlist(playlist_id: Optional[str]) -> bool:
     return bool(playlist_id) and playlist_id.startswith(LOCAL_PREFIX)
 
 
+class DatabaseLockTimeout(sqlite3.OperationalError):
+    """Otra operación retuvo la base más tiempo del razonable.
+
+    Hereda de ``OperationalError`` para que quien ya trata los errores de
+    SQLite (base bloqueada, disco lleno) trate también este igual.
+    """
+
+
 class Database:
+    # Espera máxima por el candado de la conexión antes de rendirse con un
+    # error claro, en lugar de dejar el hilo (a veces el de la ventana) parado.
+    LOCK_TIMEOUT_S = 10.0
+
     def __init__(self, path: Path | str):
         self._path = str(path)
         self._local = threading.local()
@@ -172,11 +187,15 @@ class Database:
     # -- conexiones ---------------------------------------------------------
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, timeout=15, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        if self._path != ":memory:":
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            conn.row_factory = sqlite3.Row
+            if self._path != ":memory:":
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     @property
@@ -691,20 +710,48 @@ class Database:
 
 
 class _Tx:
-    """Transacción con commit/rollback; serializa el acceso a la conexión compartida."""
+    """Transacción con commit/rollback; serializa el acceso a la conexión compartida.
+
+    El candado solo se toma cuando ya hay conexión: si abrirla falla (archivo
+    bloqueado por el antivirus o por OneDrive), la excepción sale sin dejar el
+    candado tomado y el resto de hilos siguen pudiendo usar la base.
+    """
 
     def __init__(self, db: Database):
         self._db = db
+        self._conn: Optional[sqlite3.Connection] = None
 
     def __enter__(self) -> sqlite3.Connection:
-        self._db._shared_lock.acquire()
-        return self._db.conn
+        conn = self._db.conn
+        if not self._db._shared_lock.acquire(timeout=self._db.LOCK_TIMEOUT_S):
+            raise DatabaseLockTimeout(
+                f"La base de datos lleva más de {self._db.LOCK_TIMEOUT_S:g} s "
+                "ocupada por otra operación"
+            )
+        self._conn = conn
+        return conn
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        conn = self._conn
+        self._conn = None
         try:
             if exc_type is None:
-                self._db.conn.commit()
+                try:
+                    conn.commit()
+                except BaseException:
+                    # Un commit fallido deja la transacción abierta: se deshace
+                    # para que la conexión no quede envenenada para la siguiente.
+                    _safe_rollback(conn)
+                    raise
             else:
-                self._db.conn.rollback()
+                _safe_rollback(conn)
         finally:
             self._db._shared_lock.release()
+
+
+def _safe_rollback(conn: sqlite3.Connection) -> None:
+    """Deshace sin tapar la excepción que llevó hasta aquí."""
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        log.warning("No se pudo deshacer la transacción", exc_info=True)

@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 
@@ -103,3 +104,161 @@ def test_each_thread_gets_its_own_connection(db):
     t.join()
     assert seen["conn"] is not main_conn
     assert db.get_playlist("PLw").title == "Desde el hilo"
+
+
+# -- candado y transacciones --------------------------------------------------
+
+
+def _run_with_deadline(fn, seconds=5.0):
+    """Ejecuta ``fn`` en otro hilo: si se queda bloqueado, la prueba falla en
+    vez de colgar toda la batería."""
+    out = {}
+
+    def target():
+        try:
+            out["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 - se reexamina en la prueba
+            out["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), "la operación se quedó bloqueada"
+    if "error" in out:
+        raise out["error"]
+    return out.get("value")
+
+
+def test_failed_open_in_a_thread_does_not_keep_the_lock(db, monkeypatch):
+    db.set_setting("k", "antes")
+    real_open = db._open
+
+    def flaky_open():
+        if threading.current_thread().name == "sync-roto":
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_open()
+
+    monkeypatch.setattr(db, "_open", flaky_open)
+    monkeypatch.setattr(db, "LOCK_TIMEOUT_S", 1.0)
+    seen = {}
+
+    def worker():
+        try:
+            db.get_setting("k")
+        except sqlite3.OperationalError as e:
+            seen["error"] = e
+
+    t = threading.Thread(target=worker, name="sync-roto")
+    t.start()
+    t.join()
+    assert "unable to open" in str(seen["error"])
+    # Justo después, cualquier otro hilo sigue leyendo y escribiendo.
+    assert _run_with_deadline(lambda: db.get_setting("k")) == "antes"
+    _run_with_deadline(lambda: db.set_setting("k", "después"))
+    assert _run_with_deadline(lambda: db.get_setting("k")) == "después"
+    assert db.get_setting("k") == "después"
+
+
+class _CommitFails:
+    """Conexión que delega en una real salvo en ``commit``."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_failed_commit_rolls_back_and_releases_the_lock(db, monkeypatch):
+    db.set_setting("k", "1")
+    real = db.conn
+    monkeypatch.setattr(db._local, "conn", _CommitFails(real))
+    try:
+        db.set_setting("k", "2")
+    except sqlite3.OperationalError as e:
+        assert "disk I/O" in str(e)
+    else:
+        raise AssertionError("el fallo del commit debía propagarse")
+    # La transacción se deshizo: nada quedó a medias en la conexión.
+    assert not real.in_transaction
+    monkeypatch.setattr(db._local, "conn", real)
+    assert db.get_setting("k") == "1"
+    # Y el candado quedó libre para los demás hilos.
+    _run_with_deadline(lambda: db.set_setting("k", "3"))
+    assert db.get_setting("k") == "3"
+
+
+def test_failed_commit_in_memory_database(monkeypatch):
+    from ytm_native.core.db import Database
+
+    mem = Database(":memory:")
+    mem.set_setting("k", "1")
+    real = mem._shared
+    monkeypatch.setattr(mem, "_shared", _CommitFails(real))
+    try:
+        mem.set_setting("k", "2")
+    except sqlite3.OperationalError:
+        pass
+    else:
+        raise AssertionError("el fallo del commit debía propagarse")
+    monkeypatch.setattr(mem, "_shared", real)
+    assert not real.in_transaction
+    assert _run_with_deadline(lambda: mem.get_setting("k")) == "1"
+
+
+def test_lock_wait_has_a_limit(db, monkeypatch):
+    from ytm_native.core.db import DatabaseLockTimeout
+
+    monkeypatch.setattr(db, "LOCK_TIMEOUT_S", 0.2)
+    taken, release = threading.Event(), threading.Event()
+
+    def holder():
+        with db._tx():
+            taken.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert taken.wait(5)
+        started = time.monotonic()
+        try:
+            _run_with_deadline(lambda: db.get_setting("k"))
+        except DatabaseLockTimeout as e:
+            assert "ocupada" in str(e)
+            # Hereda de OperationalError: quien ya maneja esos errores lo atrapa.
+            assert isinstance(e, sqlite3.OperationalError)
+        else:
+            raise AssertionError("debía rendirse al pasar el límite")
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()
+        t.join()
+    assert db.get_setting("k") is None
+
+
+def test_open_closes_the_connection_if_a_pragma_fails(isolated_home, monkeypatch):
+    from ytm_native.core import db as dbmod
+
+    closed = []
+
+    class Conn:
+        row_factory = None
+
+        def execute(self, sql, *args):
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(dbmod.sqlite3, "connect", lambda *a, **k: Conn())
+    try:
+        dbmod.Database(isolated_home / "x.sqlite3")
+    except sqlite3.OperationalError:
+        pass
+    else:
+        raise AssertionError("el fallo del PRAGMA debía propagarse")
+    assert closed == [True]

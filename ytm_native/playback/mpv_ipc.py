@@ -22,7 +22,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from PySide6.QtNetwork import QLocalSocket
 
-from ytm_native.core import config, paths
+from ytm_native.core import config, paths, proc_guard
 
 log = logging.getLogger("ytmn.mpv")
 
@@ -59,6 +59,7 @@ class MpvPlayer(QObject):
         self._mpv_path = Path(mpv_path) if mpv_path else paths.mpv_exe()
         self._pre_args = list(pre_args or [])   # solo para pruebas (mpv simulado)
         self._volume = volume
+        self._media_controls = True       # mpv publica su propia sesión multimedia en Windows
         self._proc: Optional[QProcess] = None
         self._sock: Optional[QLocalSocket] = None
         self._pipe = ""
@@ -68,6 +69,9 @@ class MpvPlayer(QObject):
         self._connect_attempts = 0
         self._connected = False
         self._shutting_down = False
+        # Tras ``shutdown`` (cierre de la app) ya no se relanza nunca: ni por
+        # un reinicio pendiente tras un fallo, ni por una llamada a ``start``.
+        self._closed = False
         self._restarts: list[float] = []
         self.last_time_pos = 0.0          # sin limitar, para detectar finales prematuros
         self.duration = 0.0
@@ -75,12 +79,19 @@ class MpvPlayer(QObject):
         self._retry = QTimer(self)
         self._retry.setSingleShot(True)
         self._retry.timeout.connect(self._try_connect)
+        self._relaunch = QTimer(self)
+        self._relaunch.setSingleShot(True)
+        self._relaunch.setInterval(300)
+        self._relaunch.timeout.connect(self.start)
 
     # -- ciclo de vida ------------------------------------------------------
     def is_ready(self) -> bool:
         return self._connected
 
     def start(self) -> None:
+        if self._closed:
+            log.info("mpv ya se apagó con la app: no se vuelve a lanzar")
+            return
         if self._proc is not None:
             return
         if not self._mpv_path.is_file():
@@ -112,6 +123,7 @@ class MpvPlayer(QObject):
         proc = QProcess(self)
         proc.setProgram(str(self._mpv_path))
         proc.setArguments(self._pre_args + args)
+        proc.started.connect(self._on_started)
         proc.finished.connect(self._on_finished)
         proc.errorOccurred.connect(self._on_proc_error)
         self._proc = proc
@@ -120,8 +132,14 @@ class MpvPlayer(QObject):
         self._retry.start(150)
 
     def shutdown(self) -> None:
+        """Cierra mpv para siempre. Se puede llamar varias veces (cierre de la
+        ventana, fin de la aplicación, salida de Python)."""
+        if self._closed and self._proc is None:
+            return
+        self._closed = True
         self._shutting_down = True
         self._retry.stop()
+        self._relaunch.stop()
         if self._connected:
             self.command("quit")
         if self._sock is not None:
@@ -143,6 +161,12 @@ class MpvPlayer(QObject):
             self._proc = None
         self._buffer = b""
 
+    def _on_started(self) -> None:
+        proc = self.sender()
+        if isinstance(proc, QProcess):
+            # Si la app muere de golpe, Windows cierra este mpv con ella.
+            proc_guard.adopt(int(proc.processId()))
+
     def _on_proc_error(self, error) -> None:
         if error == QProcess.ProcessError.FailedToStart:
             self._retry.stop()
@@ -152,7 +176,7 @@ class MpvPlayer(QObject):
     def _on_finished(self, *_args) -> None:
         self._retry.stop()
         self._cleanup()
-        if self._shutting_down:
+        if self._shutting_down or self._closed:
             return
         now = time.monotonic()
         self._restarts = [t for t in self._restarts if now - t < 60] + [now]
@@ -160,7 +184,7 @@ class MpvPlayer(QObject):
             self.gave_up.emit("mpv se cerró varias veces seguidas; no se reiniciará solo.")
             return
         self.crashed.emit("mpv se cerró de forma inesperada; reiniciando…")
-        QTimer.singleShot(300, self.start)
+        self._relaunch.start()      # temporizador propio: ``shutdown`` lo cancela
 
     # -- conexión IPC -------------------------------------------------------
     def _try_connect(self) -> None:
@@ -193,6 +217,8 @@ class MpvPlayer(QObject):
         self.command("observe_property", _OBS_TIME, "time-pos")
         self.command("observe_property", _OBS_DURATION, "duration")
         self.command("observe_property", _OBS_PAUSE, "pause")
+        if not self._media_controls:
+            self._apply_media_controls()      # también tras relanzarse
         # mpv registra los controles multimedia de Windows (--media-controls).
         # Con los atajos por defecto desactivados hay que enlazar sus teclas:
         # pausa la gestiona mpv; siguiente/anterior se reenvían a la cola.
@@ -277,6 +303,20 @@ class MpvPlayer(QObject):
         if user_agent:
             self.command("set_property", "user-agent", user_agent)
         self.command("loadfile", url, "replace")
+
+    def set_media_controls(self, enabled: bool) -> None:
+        """``False`` cuando la app publica su propia sesión multimedia (con
+        artista y carátula): la de mpv sobraría y Windows enseñaría dos."""
+        self._media_controls = bool(enabled)
+        self._apply_media_controls()
+
+    def _apply_media_controls(self) -> None:
+        # En marcha y no como argumento: un mpv antiguo que no conozca la
+        # opción solo rechaza la orden; con el argumento no arrancaría.
+        if not self._media_controls:
+            self.command("set_property", "media-controls", "no")
+        elif self._connected:
+            self.command("set_property", "media-controls", "player")
 
     def set_media_title(self, title: str) -> None:
         """Título que muestran los controles multimedia del sistema."""

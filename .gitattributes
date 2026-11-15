@@ -1,0 +1,5 @@
+# Texto con los finales de línea normalizados: LF en el repositorio y, en
+# Windows, CRLF en la copia de trabajo (core.autocrlf).
+* text=auto
+# cmd.exe necesita CRLF en los .bat, se clone donde se clone.
+*.bat text eol=crlf

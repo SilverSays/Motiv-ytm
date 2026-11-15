@@ -98,7 +98,11 @@ class PlaybackController(QObject):
         self._last_pos = 0.0
         self._duration = 0.0
         self._reresolves = 0
+        # Racha de pistas que no llegan a sonar. Solo la corta una pista que
+        # suena de verdad unos segundos (``_healthy_s``), no que yt-dlp
+        # resuelva: si mpv no puede reproducir nada, resolver bien no basta.
         self._consecutive_failures = 0
+        self._healthy_s = 0.0
         self._streak_marked: list[str] = []
         self._soft_cap_warned = False
         self._rng = random.Random()
@@ -142,6 +146,57 @@ class PlaybackController(QObject):
     def upcoming(self, limit: int = 50) -> list[Track]:
         return [self._queue[i] for i in self._order[self._pos + 1 : self._pos + 1 + limit]]
 
+    # -- sesión guardada ----------------------------------------------------
+    def session_queue(self) -> tuple[list[Track], list[int]]:
+        """La cola tal como se añadió y el orden en que suena."""
+        return list(self._queue), list(self._order)
+
+    def session_state(self) -> dict:
+        """Lo que cambia mientras suena: por dónde va y los modos."""
+        track = self.current_track()
+        return {
+            "pos": self._pos,
+            "video_id": track.video_id if track else "",
+            "position": round(self._last_pos, 1),
+            "shuffle": self.shuffle,
+            "repeat": self.repeat,
+        }
+
+    def restore(
+        self,
+        tracks: list[Track],
+        order: Optional[list[int]] = None,
+        pos: int = 0,
+        position: float = 0.0,
+        shuffle: bool = False,
+        repeat: str = REPEAT_OFF,
+    ) -> bool:
+        """Deja la cola como estaba al cerrar, sin sonar: «Reproducir» sigue
+        desde ``position``. No hace nada si ya hay una cola."""
+        if not tracks or self._queue or self.state != STOPPED:
+            return False
+        n = len(tracks)
+        if order is None or sorted(order) != list(range(n)):
+            order, shuffle = list(range(n)), False     # orden ilegible: el de la lista
+        self._queue = list(tracks)
+        self._order = list(order)
+        self._pos = max(0, min(int(pos), n - 1))
+        self.shuffle = bool(shuffle)
+        self.repeat = repeat if repeat in (REPEAT_OFF, REPEAT_ALL, REPEAT_ONE) else REPEAT_OFF
+        track = self.current_track()
+        self._duration = float(track.duration_s or 0)
+        position = float(position) if position == position else 0.0    # NaN
+        if position < 0 or (self._duration > 0 and position >= self._duration):
+            position = 0.0
+        self._last_pos = position
+        self._entry_id = None
+        self.modes_changed.emit(self.shuffle, self.repeat)
+        self.current_changed.emit(track)
+        self.position_changed.emit(self._last_pos, self._duration)
+        self.state_changed.emit(self.state)     # sigue detenido, pero ya hay pista: activa los botones
+        self.queue_changed.emit()
+        return True
+
     # -- órdenes de la GUI --------------------------------------------------
     def play_tracks(self, tracks: list[Track], start_index: int = 0) -> None:
         if not tracks:
@@ -149,8 +204,7 @@ class PlaybackController(QObject):
         self._queue = list(tracks)
         start_index = max(0, min(start_index, len(tracks) - 1))
         self._build_order(start_index)
-        self._consecutive_failures = 0
-        self._streak_marked = []
+        self._reset_failures()
         self._radio_token += 1            # cancela una radio pendiente de otra cola
         self._radio_pending = False
         self._goto(self._pos)
@@ -180,7 +234,7 @@ class PlaybackController(QObject):
     def jump_to(self, order_pos: int) -> None:
         """Salta a una posición de la cola (vista "Cola")."""
         if 0 <= order_pos < len(self._order):
-            self._consecutive_failures = 0
+            self._reset_failures()
             self._goto(order_pos)
 
     def set_autoplay(self, enabled: bool) -> None:
@@ -241,12 +295,13 @@ class PlaybackController(QObject):
             self.mpv.set_pause(self.state == PLAYING)
         elif self.state == STOPPED and self.current_track() is not None:
             # Reanudar tras una pausa de la cola (sin conexión, bloqueo...).
-            self._consecutive_failures = 0
+            self._reset_failures()
             self._goto(self._pos, start_at=self._last_pos)
 
     def next_track(self) -> None:
         pos = self._next_pos(auto=False)
         if pos is not None:
+            self._reset_failures()        # lo pide el usuario: la racha empieza de cero
             self._goto(pos, debounce=True)
 
     def previous_track(self) -> None:
@@ -255,12 +310,19 @@ class PlaybackController(QObject):
             return
         pos = self._prev_pos()
         if pos is not None:
+            self._reset_failures()
             self._goto(pos, debounce=True)
 
     def seek(self, seconds: float) -> None:
         if self.state in (PLAYING, PAUSED):
             self._last_pos = max(0.0, seconds)
             self.mpv.seek(self._last_pos)
+        elif self.state == STOPPED and self.current_track() is not None:
+            # Detenido con una pista a medias (la cola recuperada al abrir, o
+            # en pausa por un fallo): se mueve el punto desde el que seguirá.
+            top = self._duration - 1 if self._duration > 1 else seconds
+            self._last_pos = max(0.0, min(seconds, top))
+            self.position_changed.emit(self._last_pos, self._duration)
 
     def set_volume(self, volume: int) -> None:
         self.mpv.set_volume(volume)
@@ -386,6 +448,7 @@ class PlaybackController(QObject):
         self._load_retry.stop()
         self._prefetch_timer.stop()
         self._reresolves = 0
+        self._healthy_s = 0.0
         self._entry_id = None
         self._awaiting_start = False
         self._pending_seek = start_at
@@ -515,8 +578,6 @@ class PlaybackController(QObject):
     def _play_result(self, res: ResolveResult) -> None:
         self._current_res = res
         self._remember(res)
-        self._consecutive_failures = 0
-        self._streak_marked = []
         row = self.db.get_track(res.video_id)
         if row is not None and row.unavailable_since is not None:
             self.db.clear_unavailable(res.video_id)
@@ -588,18 +649,7 @@ class PlaybackController(QObject):
             self.notice.emit(res.message)
             return
 
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
-            # Varias seguidas no son pistas borradas: se deshacen las marcas de
-            # esta racha y se pausa la cola en lugar de seguir "quemando" pistas.
-            for vid in self._streak_marked:
-                self.db.clear_unavailable(vid)
-                self.track_flagged.emit(vid)
-            self._streak_marked = []
-            self._set_state(STOPPED)
-            self.notice.emit(
-                "Varias pistas seguidas fallaron: puede ser un bloqueo temporal. La cola quedó en pausa."
-            )
+        if self._count_failure():
             return
 
         if kind in (ErrorKind.UNAVAILABLE, ErrorKind.NEEDS_LOGIN):
@@ -614,6 +664,35 @@ class PlaybackController(QObject):
         else:
             self.notice.emit(f"No se pudo reproducir «{title}»: {res.message}")
         self._advance_auto()
+
+    def _reset_failures(self) -> None:
+        self._consecutive_failures = 0
+        self._streak_marked = []
+
+    def _count_failure(self) -> bool:
+        """Suma un fallo a la racha. Si llega al límite, para la cola (sin
+        seguir pidiendo URL a YouTube) y devuelve True."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures < config.MAX_CONSECUTIVE_FAILURES:
+            return False
+        log.warning("%d pistas seguidas sin sonar: la cola se detiene", self._consecutive_failures)
+        # Varias seguidas no son pistas borradas: se deshacen las marcas de
+        # esta racha y se pausa la cola en lugar de seguir "quemando" pistas.
+        for vid in self._streak_marked:
+            self.db.clear_unavailable(vid)
+            self.track_flagged.emit(vid)
+        self._streak_marked = []
+        self._gen += 1                    # descarta reintentos y resoluciones en vuelo
+        self._debounce.stop()
+        self._load_retry.stop()
+        self._prefetch_timer.stop()
+        self._cancel_job()
+        self._entry_id = None
+        self._set_state(STOPPED)
+        self.notice.emit(
+            "Varias pistas seguidas fallaron: puede ser un bloqueo temporal. La cola quedó en pausa."
+        )
+        return True
 
     def _advance_auto(self) -> None:
         pos = self._next_pos(auto=True)
@@ -693,6 +772,10 @@ class PlaybackController(QObject):
         if reason == "error" or premature:
             self._recover_stream(file_error or ("fin prematuro" if premature else "error"))
         else:
+            if self._loaded_ok:
+                # Sonó entera aunque durase menos que HEALTHY_PLAY_S (una intro,
+                # un interludio): la racha de fallos ya no es seguida.
+                self._reset_failures()
             self._advance_auto()
 
     def _recover_stream(self, detail: str) -> None:
@@ -702,9 +785,7 @@ class PlaybackController(QObject):
             return
         if self._reresolves >= config.MAX_RERESOLVE_PER_TRACK:
             self.notice.emit(f"No se pudo reproducir «{track.title}» ({detail}).")
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
-                self._set_state(STOPPED)
+            if self._count_failure():
                 return
             self._advance_auto()
             return
@@ -720,7 +801,14 @@ class PlaybackController(QObject):
     def _on_position(self, pos: float) -> None:
         if self._entry_id is None:
             return
+        step = pos - self._last_pos
         self._last_pos = pos
+        if 0.0 < step < config.HEALTHY_PLAY_MAX_STEP_S:   # avance normal, no un salto
+            self._healthy_s += step
+            if self._consecutive_failures and self._healthy_s >= config.HEALTHY_PLAY_S:
+                log.info("la pista suena bien: se olvida la racha de %d fallos",
+                         self._consecutive_failures)
+                self._reset_failures()
         self.position_changed.emit(pos, self._duration)
 
     def _on_duration(self, duration: float) -> None:

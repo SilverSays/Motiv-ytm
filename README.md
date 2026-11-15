@@ -37,9 +37,14 @@ interface, with each playlist's color pulled from its cover art. The app's inter
   to what's playing.
 - **Synced lyrics** from [LRCLIB](https://lrclib.net) that follow the song line by line.
 - **Playback**: queue, shuffle, repeat, radio from a song or an artist, and
-  preloading of the next tracks so there's no waiting.
+  preloading of the next tracks so there's no waiting. When you open the app,
+  the queue and the song come back at the second you left them, stopped (this can
+  be turned off in the **⋯** menu).
 - **Resilience**: if YouTube changes something and playback breaks, the app updates
   `yt-dlp` by itself, checks that the new version works and rolls back if it doesn't.
+- **Windows media controls**: the media keys on your keyboard or headphones work
+  with the app in the background, and the volume flyout and lock screen show the
+  song with its cover art, its buttons and the progress bar.
 - **Interface**: purposeful animations (sliding panels, cover art that travels from
   the card to the header, lists that appear staggered) that respect Windows'
   reduce-animations setting; full keyboard navigation.
@@ -65,7 +70,9 @@ Requirements: **Windows 10 or 11** and **Python 3.10 or later** (from
 1. Download or clone this repository.
 2. Run `instalar.bat`. It creates its own Python environment in
    `%LOCALAPPDATA%\YTMusicNativo\venv` and installs the dependencies
-   (`PySide6-Essentials` and `ytmusicapi`).
+   (`PySide6-Essentials`, `ytmusicapi` and the `winrt` packages for the media
+   controls). If you already had the app installed, run it again to add the
+   missing ones.
 3. Run `iniciar.bat` to open the app. If the environment doesn't exist yet,
    it installs it first.
 4. The first time, a notice at the top offers to **Descargar ahora** (Download now)
@@ -164,7 +171,9 @@ instalar.bat, iniciar.bat Install and launch on Windows
 | `mpv_ipc.py` | Launches `mpv` as a separate process and controls it through its IPC pipe. |
 | `history.py` | Decides when a song counts as listened and records it in listening history. |
 | `player.py` | The player: queue, shuffle, repeat, radio, preloading and error recovery. |
+| `session.py` | Saves the queue and the current second, and restores them on startup. |
 | `bootstrap.py` | Downloads and installs `yt-dlp`, `deno` and `mpv`. |
+| `media_controls.py` | Publishes what's playing to Windows (title, artist, cover art) and handles its buttons. |
 
 **`services/`: online data**
 
@@ -196,7 +205,7 @@ measures how many requests YouTube blocks with and without an account.
 ### Tests
 
 ```
-%LOCALAPPDATA%\YTMusicNativo\venv\Scripts\python.exe -m pip install pytest
+%LOCALAPPDATA%\YTMusicNativo\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 %LOCALAPPDATA%\YTMusicNativo\venv\Scripts\python.exe -m pytest tests
 ```
 
@@ -217,6 +226,7 @@ as long as the versions you distribute stay free under the same license.
 
 It uses [PySide6](https://doc.qt.io/qtforpython/) (LGPL),
 [ytmusicapi](https://github.com/sigma67/ytmusicapi) (MIT),
+[PyWinRT](https://github.com/pywinrt/pywinrt) (MIT),
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense),
 [mpv](https://mpv.io) (GPL/LGPL) and [deno](https://deno.com) (MIT), which are
 installed separately and keep their own licenses.
