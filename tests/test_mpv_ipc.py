@@ -185,3 +185,44 @@ def test_adopt_is_harmless_for_a_process_that_already_ended():
     assert proc_guard.adopt(0) is False
     assert proc_guard.adopt(2**31 - 7) is False
 
+
+
+# -- cargas confirmadas y reconexión (Fase 4) ------------------------------------
+
+
+def test_each_load_is_acknowledged_with_its_entry(qapp, mpv):
+    acks = []
+    mpv.load_acked.connect(lambda token, entry, ok: (acks.append((token, entry, ok)),
+                                                     mpv.events.append(("acked", token, entry))))
+    assert mpv.load("https://example.invalid/normal", token=7) > 0
+    assert wait_until(qapp, lambda: ("loaded",) in mpv.events), mpv.events
+    assert acks == [(7, 1, True)]
+    # La respuesta llega antes que el inicio del archivo.
+    assert mpv.events.index(("acked", 7, 1)) < mpv.events.index(("started", 1))
+    mpv.load("https://example.invalid/normal", token=8)
+    assert wait_until(qapp, lambda: (8, 2, True) in acks)
+
+
+def test_a_cut_pipe_reconnects_without_relaunching_mpv(qapp, mpv):
+    reconnected = []
+    mpv.reconnected.connect(lambda: reconnected.append(True))
+    pid = mpv._proc.processId()
+    mpv.command("ytmn-test-drop")
+    assert wait_until(qapp, lambda: reconnected), mpv.events
+    assert mpv.is_ready() and mpv._proc.processId() == pid
+    assert mpv.events.count(("ready",)) == 1 and not any(e[0] == "crashed" for e in mpv.events)
+    # Vuelve a observar las propiedades: llegan posición y duración.
+    mpv.events.clear()
+    mpv.load("https://example.invalid/normal")
+    assert wait_until(qapp, lambda: ("pos", 0.5) in mpv.events), mpv.events
+    assert ("dur", 100.0) in mpv.events
+
+
+def test_orders_without_connection_are_dropped_with_one_warning(qapp, caplog):
+    player = MpvPlayer(mpv_path=Path(sys.executable), pre_args=[FAKE])   # sin arrancar
+    with caplog.at_level("DEBUG", logger="ytmn.mpv"):
+        assert player.load("https://example.invalid/normal") == -1
+        assert player.command("stop") == -1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "loadfile" in warnings[0].getMessage()
+    assert player._pending_loads == {}

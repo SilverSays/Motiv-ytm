@@ -14,6 +14,10 @@
   tiempo, re-resuelve el mismo ``videoId`` y reanuda en la posición actual.
 * **Recuperación de mpv**: si el proceso muere y se relanza, se restaura la
   pista, la posición y el estado de pausa (la cola vive en Python).
+* **Eventos de cada carga**: cada ``loadfile`` lleva una ficha. Solo cuenta el
+  ``start-file`` que llega después de que mpv confirme *esa* carga (y, si mpv
+  lo dice, con el mismo ``playlist_entry_id``): con saltos rápidos, el inicio
+  tardío de una pista anterior no se toma por el de la nueva.
 """
 
 from __future__ import annotations
@@ -93,6 +97,10 @@ class PlaybackController(QObject):
         self._clicked_at = 0.0                    # para medir clic -> sonido en el log
         self._entry_id: Optional[int] = None
         self._awaiting_start = False
+        # Ficha de la última carga enviada a mpv y lo que respondió a ella.
+        self._load_token = 0
+        self._load_acked = False
+        self._expected_entry: Optional[int] = None
         self._pending_seek = 0.0
         self._resume_paused = False
         self._last_pos = 0.0
@@ -134,6 +142,7 @@ class PlaybackController(QObject):
         mpv.duration_changed.connect(self._on_duration)
         mpv.pause_changed.connect(self._on_pause_changed)
         mpv.file_started.connect(self._on_file_started)
+        mpv.load_acked.connect(self._on_load_acked)
         mpv.file_loaded.connect(self._on_file_loaded)
         mpv.file_ended.connect(self._on_file_ended)
 
@@ -606,10 +615,13 @@ class PlaybackController(QObject):
         self._loaded_ok = False
         self._entry_id = None
         self._awaiting_start = True
+        self._load_token += 1
+        self._load_acked = False
+        self._expected_entry = None
         track = self.current_track()
         if track is not None:
             self.mpv.set_media_title(f"{track.title} — {track.artists}" if track.artists else track.title)
-        self.mpv.load(res.url, res.user_agent)
+        self.mpv.load(res.url, res.user_agent, self._load_token)
         self.mpv.set_pause(self._resume_paused)
 
     def _retry_load(self) -> None:
@@ -718,10 +730,25 @@ class PlaybackController(QObject):
         self._goto(pos)
 
     # -- eventos de mpv -----------------------------------------------------
-    def _on_file_started(self, entry_id: int) -> None:
-        if self._awaiting_start:
+    def _on_load_acked(self, token: int, entry_id: int, accepted: bool) -> None:
+        if token != self._load_token or not self._awaiting_start:
+            return  # respuesta a una carga que ya no interesa
+        if not accepted:
             self._awaiting_start = False
-            self._entry_id = entry_id
+            self._recover_stream("mpv rechazó la orden de carga")
+            return
+        self._load_acked = True
+        self._expected_entry = entry_id or None
+
+    def _on_file_started(self, entry_id: int) -> None:
+        # mpv responde a ``loadfile`` antes de empezar ese archivo: un inicio
+        # que llega antes de la respuesta es de una carga anterior.
+        if not self._awaiting_start or not self._load_acked:
+            return
+        if self._expected_entry is not None and entry_id != self._expected_entry:
+            return
+        self._awaiting_start = False
+        self._entry_id = entry_id
 
     def _on_file_loaded(self) -> None:
         if self._entry_id is None:
@@ -793,7 +820,12 @@ class PlaybackController(QObject):
         log.info("re-resolviendo %s en %.0fs (%s)", track.video_id, self._last_pos, detail)
         self._gen += 1
         self._pending_seek = self._last_pos
-        self._resume_paused = False
+        # Una pista en pausa se recupera en pausa; si ya se estaba recuperando
+        # (LOADING), se mantiene lo que se decidió entonces.
+        if self.state == PAUSED:
+            self._resume_paused = True
+        elif self.state == PLAYING:
+            self._resume_paused = False
         self._current_res = None
         self._set_state(LOADING)
         self._begin_resolve(force_fresh=True)

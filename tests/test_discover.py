@@ -233,3 +233,78 @@ def test_lista_ajena_se_descarga_sin_las_pistas_borradas():
     assert (data.title, data.author, data.year, data.duration_s) == ("Lista ajena", "Fan", "2024", 400)
     assert [t.video_id for t in data.tracks] == ["a1", "a2"]
     assert data.tracks[1].duration_s == 200 and data.description == ""
+
+
+# ---------------------------------------------------------------------------
+# Fase 4
+# ---------------------------------------------------------------------------
+def test_los_nombres_con_coma_no_se_parten():
+    assert discover.split_artists("Tyler, The Creator, Kali Uchis") == ["Tyler, The Creator", "Kali Uchis"]
+    assert discover.split_artists("Earth, Wind & Fire") == ["Earth, Wind & Fire"]
+    assert discover.split_artists("crosby, stills, nash & young") == ["crosby, stills, nash & young"]
+    # Sin un nombre conocido, la coma separa: "The Weeknd" es otro artista.
+    assert discover.split_artists("Daft Punk, The Weeknd") == ["Daft Punk", "The Weeknd"]
+
+
+def test_un_artista_de_una_sola_letra_cuenta():
+    assert discover.split_artists("X, Ana") == ["X", "Ana"]
+    assert discover.split_artists("7, Ø") == ["7", "Ø"]
+    assert discover.split_artists("&, -, Ana") == ["Ana"]
+
+
+def test_una_fila_no_repite_la_misma_lista():
+    items = [playlist_item(1), playlist_item(2), playlist_item(1), playlist_item(3), playlist_item(2)]
+    # Quitando la ya enseñada quedan dos distintas (no cuatro): no llegan al mínimo.
+    assert discover._take_cards(items, {"PL0003"}) == ()
+    cards = discover._take_cards(items + [playlist_item(4)], set())
+    assert [c.playlist_id for c in cards] == ["PL0001", "PL0002", "PL0003", "PL0004"]
+
+
+class NowClient:
+    def __init__(self, artist_error=None):
+        self.artist_error = artist_error
+
+    def get_watch_playlist(self, videoId=None, radio=False, limit=None):
+        return {"tracks": [
+            {"videoId": videoId, "title": "Suena", "artists": [{"name": "Ana", "id": "UCana"}]},
+            {"videoId": "p1", "title": "Parecida", "artists": [{"name": "Vera"}]},
+        ]}
+
+    def get_artist(self, channel_id):
+        if self.artist_error is not None:
+            raise self.artist_error
+        return {"name": "Ana", "description": "Biografía", "thumbnails": []}
+
+
+def test_sin_red_para_el_artista_no_se_guarda_una_semana(db):
+    track = Track("np1", "Suena", "Ana")
+    info = discover.now_playing_info(track, client_factory=lambda: NowClient(OSError("timed out")))
+    assert info.partial and info.artist == "Ana" and [t.video_id for t in info.similar] == ["p1"]
+    discover.save_now_info(db, info)
+    assert discover.load_now_info(db, "np1") is None          # se volverá a pedir
+    server = Exception("Server returned HTTP 503: Service Unavailable.")
+    assert discover.now_playing_info(track, client_factory=lambda: NowClient(server)).partial
+
+
+def test_un_canal_sin_pagina_de_artista_si_se_guarda(db):
+    track = Track("np2", "Suena", "Ana")
+    info = discover.now_playing_info(track, client_factory=lambda: NowClient(KeyError("header")))
+    assert not info.partial
+    discover.save_now_info(db, info)
+    assert discover.load_now_info(db, "np2") is not None
+    complete = discover.now_playing_info(Track("np3", "Suena", "Ana"), client_factory=NowClient)
+    assert not complete.partial and complete.bio == "Biografía"
+
+
+def test_lista_ajena_sin_las_pistas_no_disponibles():
+    class Client:
+        def get_playlist(self, playlist_id, limit=None):
+            return {"title": "Lista", "tracks": [
+                {"videoId": "a1", "title": "Sí", "isAvailable": True},
+                {"videoId": "a2", "title": "No", "isAvailable": False},
+                {"videoId": "a3", "title": "Sin dato"},
+                "basura",
+            ]}
+
+    data = discover.fetch_playlist("PLx", client_factory=Client)
+    assert [t.video_id for t in data.tracks] == ["a1", "a3"]

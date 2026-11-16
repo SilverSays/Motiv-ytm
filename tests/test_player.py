@@ -20,6 +20,7 @@ class FakeMpv(QObject):
     duration_changed = Signal(float)
     pause_changed = Signal(bool)
     file_started = Signal(int)
+    load_acked = Signal(int, int, bool)
     file_loaded = Signal()
     file_ended = Signal(int, str, str)
     media_key = Signal(str)
@@ -32,10 +33,28 @@ class FakeMpv(QObject):
         self.duration = 0.0
         self.last_time_pos = 0.0
         self.entry = 0
+        # Como un mpv reciente: cada carga recibe su playlist_entry_id al
+        # responder. Por defecto, como uno antiguo (responde sin número).
+        self.assign_entries = False
+        self.defer_acks = False           # las respuestas esperan a ``ack()``
+        self.pending_acks = []
 
-    def load(self, url, user_agent=""):
+    def load(self, url, user_agent="", token=0):
         self.loaded.append(url)
         self.duration = 0.0
+        entry = 0
+        if self.assign_entries:
+            self.entry += 1
+            entry = self.entry
+        self.pending_acks.append((token, entry, True))
+        if not self.defer_acks:
+            self.ack()
+        return len(self.loaded)
+
+    def ack(self):
+        acks, self.pending_acks = self.pending_acks, []
+        for ack in acks:
+            self.load_acked.emit(*ack)
 
     def set_media_title(self, title):
         self.titles.append(title)
@@ -54,7 +73,8 @@ class FakeMpv(QObject):
 
     # -- ayudas para simular a mpv --
     def begin(self, duration=100.0):
-        self.entry += 1
+        if not self.assign_entries:
+            self.entry += 1
         self.file_started.emit(self.entry)
         self.file_loaded.emit()
         self.duration = duration
@@ -568,8 +588,8 @@ def _mpv_never_plays(env, monkeypatch):
     monkeypatch.setattr(config, "LOAD_RETRY_DELAYS_MS", ())
     real_load = env.mpv.load
 
-    def load(url, user_agent=""):
-        real_load(url, user_agent)
+    def load(url, user_agent="", token=0):
+        real_load(url, user_agent, token)
 
         def fail():
             env.mpv.entry += 1
@@ -653,3 +673,101 @@ def test_an_end_cut_short_keeps_the_failure_streak(env):
     env.mpv.at(2.0)
     env.mpv.file_ended.emit(entry, "eof", "")                  # "eof" a los 2 s de 100
     assert env.player._consecutive_failures >= 1
+
+
+# ---------------------------------------------------------------------------
+# Fase 4: cada evento de mpv con su carga
+# ---------------------------------------------------------------------------
+def test_rapid_skips_bind_the_events_to_the_last_load(env):
+    """Cinco saltos seguidos: el inicio tardío de la carga anterior no se toma
+    por el de la última, y el final de la última sí se atiende."""
+    env.mpv.assign_entries = True                 # como un mpv reciente
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    first = env.mpv.entry
+    for _ in range(5):
+        env.player.next_track()
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)
+    assert env.mpv.loaded[1] == "url://v5/1"
+    last = env.mpv.entry
+    env.mpv.file_started.emit(first)              # llega tarde, de la carga de v0
+    env.mpv.file_loaded.emit()
+    assert env.player._entry_id is None and env.player.state == LOADING
+    env.mpv.file_started.emit(last)
+    env.mpv.file_loaded.emit()
+    assert env.player._entry_id == last and env.player.state == PLAYING
+    assert env.player.current_track().video_id == "v5"
+    env.mpv.at(99.9)
+    env.mpv.file_ended.emit(last, "eof", "")      # y su final sí cuenta: fin de la cola
+    assert env.player.state == STOPPED
+
+
+def test_a_start_before_the_load_is_confirmed_is_from_an_older_load(env):
+    """Un mpv antiguo responde sin número: vale el primer inicio tras la respuesta."""
+    env.mpv.defer_acks = True
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    env.mpv.file_started.emit(41)                 # aún sin respuesta: es de antes
+    env.mpv.file_loaded.emit()
+    assert env.player._entry_id is None and env.player.state == LOADING
+    env.mpv.ack()
+    env.mpv.file_started.emit(42)
+    env.mpv.file_loaded.emit()
+    assert env.player._entry_id == 42 and env.player.state == PLAYING
+
+
+def test_an_answer_to_an_older_load_is_ignored(env):
+    env.mpv.defer_acks = True
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 1)
+    stale = env.mpv.pending_acks.pop()
+    env.player.play_tracks(env.tracks, 2)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)
+    env.mpv.load_acked.emit(*stale)               # respuesta de la carga de v0
+    env.mpv.file_started.emit(7)
+    assert env.player._entry_id is None
+    env.mpv.ack()
+    env.mpv.file_started.emit(8)
+    assert env.player._entry_id == 8
+
+
+def test_a_rejected_load_resolves_the_track_again(env):
+    real_load = env.mpv.load
+    rejected = []
+
+    def load(url, user_agent="", token=0):
+        if not rejected:
+            rejected.append(url)
+            env.mpv.loaded.append(url)
+            env.mpv.load_acked.emit(token, 0, False)
+            return 1
+        return real_load(url, user_agent, token)
+
+    env.mpv.load = load
+    env.player.play_tracks(env.tracks, 0)
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)
+    assert env.mpv.loaded == ["url://v0/1", "url://v0/2"]
+    env.mpv.begin()
+    assert env.player.state == PLAYING
+
+
+def test_a_stream_error_while_paused_comes_back_paused(env):
+    entry = start_playing(env)
+    env.mpv.at(40)
+    env.mpv.pause_changed.emit(True)
+    assert env.player.state == PAUSED
+    env.mpv.file_ended.emit(entry, "error", "stream broke")     # la URL caducó en pausa
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)
+    assert env.mpv.pauses[-1] is True
+    env.mpv.begin()
+    assert env.player.state == PAUSED and env.mpv.seeks == [40]
+
+
+def test_a_stream_error_while_playing_comes_back_playing(env):
+    entry = start_playing(env)
+    env.mpv.at(40)
+    env.mpv.file_ended.emit(entry, "error", "stream broke")
+    assert wait_until(env.qapp, lambda: len(env.mpv.loaded) == 2)
+    assert env.mpv.pauses[-1] is False
+    env.mpv.begin()
+    assert env.player.state == PLAYING

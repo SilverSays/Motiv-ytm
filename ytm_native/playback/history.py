@@ -46,6 +46,7 @@ class PlayTracker(QObject):
         self._listened = 0.0
         self._last_pos: Optional[float] = None
         self._counted = False
+        self._write_failures = 0         # intentos fallidos de anotar la escucha actual
         player.current_changed.connect(self._on_current)
         player.position_changed.connect(self._on_position)
 
@@ -59,6 +60,7 @@ class PlayTracker(QObject):
         self._listened = 0.0
         self._last_pos = None
         self._counted = False
+        self._write_failures = 0
 
     def _on_position(self, pos: float, duration: float) -> None:
         track = self._track
@@ -78,11 +80,16 @@ class PlayTracker(QObject):
             self._listened += step
         if not self.enabled or self._listened < needed_seconds(duration):
             return
-        self._counted = True
         try:
             self.db.upsert_track(track)      # el historial enseña la pista aunque no esté en ninguna lista
             self.db.log_play(track.video_id)
         except Exception:  # noqa: BLE001 - un fallo al anotar no debe parar la música
-            log.exception("no se pudo anotar la escucha de %s", track.video_id)
+            # Sin marcarla como contada: el siguiente aviso de posición lo
+            # vuelve a intentar (la base pudo estar ocupada un momento).
+            self._write_failures += 1
+            if self._write_failures == 1:
+                log.exception("no se pudo anotar la escucha de %s; se reintentará", track.video_id)
             return
+        self._counted = True
+        self._write_failures = 0
         self.logged.emit(track.video_id)

@@ -181,3 +181,97 @@ def test_device_bound_sessions_are_recognised():
     assert looks_device_bound(chrome)
     assert not looks_device_bound(firefox)
     assert not looks_device_bound("")
+
+
+# ---------------------------------------------------------------------------
+# Fase 4: LRC por palabra, desfase, caché dañada y presupuesto de tiempo
+# ---------------------------------------------------------------------------
+def test_word_marks_give_one_clean_line_each():
+    lrc = ("[00:12.00]<00:12.00>Hola <00:12.50>mun<00:12.70>do\n"
+           "[00:15.00]Otra [00:15.80]frase [00:16.40]aquí\n"
+           "<00:20.00>Solo <00:20.40>marcas")
+    lines = parse_lrc(lrc)
+    assert [(ln.start_s, ln.text) for ln in lines] == [
+        (12.0, "Hola mundo"), (15.0, "Otra frase aquí"), (20.0, "Solo marcas"),
+    ]
+
+
+def test_offset_moves_the_whole_lyrics():
+    lines = parse_lrc("[offset:+500]\n[00:10.00]Uno\n[00:00.20]Antes")
+    assert [(ln.start_s, ln.text) for ln in lines] == [(0.0, "Antes"), (9.5, "Uno")]
+    lines = parse_lrc("[00:10.00]Uno\n[offset:-250]")
+    assert lines[0].start_s == 10.25
+
+
+def test_repeated_lines_are_not_duplicated():
+    lines = parse_lrc("[00:10.00]Uno\n[00:10.00]Uno\n[00:10.00] [00:30.00]Uno")
+    assert [(ln.start_s, ln.text) for ln in lines] == [(10.0, "Uno"), (30.0, "Uno")]
+
+
+@pytest.mark.parametrize("payload", [
+    "", "no es json", "[]", "null", "42", '{"lines": "texto"}',
+    '{"lines": [[1, 2], ["a", "b"], [true, "x"], [-1, "x"], [1]], "plain": 3, "source": null}',
+    None, b"\xff",
+])
+def test_corrupt_cached_lyrics_become_empty_instead_of_failing(payload):
+    lyrics = Lyrics.from_json(payload)
+    assert lyrics.empty and lyrics.source == "LRCLIB"
+
+
+def test_partly_damaged_cached_lyrics_keep_the_good_lines():
+    lyrics = Lyrics.from_json('{"lines": [[3, "tres"], ["x", "mal"], [1.5, "uno"]], "plain": "p"}')
+    assert [(ln.start_s, ln.text) for ln in lyrics.lines] == [(1.5, "uno"), (3.0, "tres")]
+    assert lyrics.plain == "p"
+
+
+class SlowLrclib(FakeLrclib):
+    """Cada consulta "tarda" ``cost`` segundos en un reloj simulado."""
+
+    def __init__(self, clock, cost, **kwargs):
+        super().__init__(**kwargs)
+        self.clock, self.cost, self.timeouts = clock, cost, []
+
+    def __call__(self, url, timeout):
+        self.timeouts.append(timeout)
+        self.clock[0] += self.cost
+        return super().__call__(url, timeout)
+
+
+def test_the_search_stops_when_the_time_budget_runs_out():
+    now = [0.0]
+    api = SlowLrclib(now, cost=4.0)
+    with pytest.raises(TimeoutError):
+        fetch_lyrics("Tema (Official Video)", "Ana, Vera", "", 200, http_json=api,
+                     budget_s=10.0, clock=lambda: now[0])
+    assert len(api.urls) == 3 and all(t <= 10.0 for t in api.timeouts)
+    assert api.timeouts[-1] == pytest.approx(2.0)          # la última, con lo que quedaba
+
+
+def test_a_plain_lyric_found_before_the_budget_ends_is_kept():
+    now = [0.0]
+    api = SlowLrclib(now, cost=4.0, exact={"duration": 200, "syncedLyrics": None, "plainLyrics": "texto"})
+    lyrics = fetch_lyrics("Tema", "Ana, Vera", "", 200, http_json=api, budget_s=10.0, clock=lambda: now[0])
+    assert lyrics is not None and lyrics.plain == "texto"
+
+
+def test_a_later_network_failure_keeps_what_was_found():
+    calls = []
+
+    def api(url, timeout):
+        calls.append(url)
+        if len(calls) == 1:
+            return {"duration": 200, "syncedLyrics": None, "plainLyrics": "texto"}
+        raise OSError("se cayó la red")
+
+    lyrics = fetch_lyrics("Tema", "Ana, Vera", "", 200, http_json=api)
+    assert lyrics.plain == "texto" and len(calls) == 2      # no sigue insistiendo sin red
+
+
+def test_an_answer_that_is_not_json_counts_as_not_found():
+    def api(url, timeout):
+        if "/search?" in url:
+            return [{"duration": 200, "syncedLyrics": "[00:01.00]buena"}]
+        raise ValueError("Expecting value")
+
+    lyrics = fetch_lyrics("Tema", "Artista", "", 200, http_json=api)
+    assert [ln.text for ln in lyrics.lines] == ["buena"]

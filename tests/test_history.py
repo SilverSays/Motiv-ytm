@@ -325,3 +325,39 @@ def test_el_inicio_ensena_lo_escuchado_hace_poco_y_un_clic_lo_pone(window, db, m
     db.log_play("nueva")
     window.tracker.logged.emit("nueva")
     assert window.home.recent.grid._cards[0].payload().video_id == "nueva"
+
+
+def test_un_fallo_al_anotar_se_reintenta_en_el_siguiente_aviso(env, tracker, monkeypatch):
+    import sqlite3
+
+    real_log_play = env.db.log_play
+    calls = []
+
+    def flaky(video_id, now=None):
+        calls.append(video_id)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        real_log_play(video_id, now)
+
+    monkeypatch.setattr(env.db, "log_play", flaky)
+    start_playing(env)
+    listen(env, 0, 31)
+    assert len(calls) >= 2                     # el primer intento falló y hubo otro
+    assert plays(env.db) == 1 and tracker.seen == ["v0"]
+    listen(env, 31, 20)
+    assert plays(env.db) == 1                  # una vez anotada, no se repite
+
+
+def test_si_la_base_sigue_fallando_no_se_da_por_contada(env, tracker):
+    import sqlite3
+
+    def broken(video_id, now=None):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    env.db.log_play = broken
+    start_playing(env)
+    listen(env, 0, 35)
+    assert tracker.seen == [] and not tracker._counted
+    del env.db.log_play                        # la base se recupera
+    listen(env, 35, 1)                         # la base se recupera: se anota
+    assert plays(env.db) == 1 and tracker.seen == ["v0"]

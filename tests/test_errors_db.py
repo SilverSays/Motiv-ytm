@@ -262,3 +262,119 @@ def test_open_closes_the_connection_if_a_pragma_fails(isolated_home, monkeypatch
     else:
         raise AssertionError("el fallo del PRAGMA debía propagarse")
     assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# Fase 3: metadatos, números y transacciones
+# ---------------------------------------------------------------------------
+def test_upsert_track_fills_in_what_was_missing(db):
+    db.upsert_track(Track("v1", "(sin título)"))
+    db.upsert_track(Track("v1", "Canción", "Artista", "Disco", 215, thumb_url="http://x/1.jpg"))
+    assert db.get_track("v1") == Track("v1", "Canción", "Artista", "Disco", 215, thumb_url="http://x/1.jpg")
+
+
+def test_upsert_track_never_erases_known_data(db):
+    db.upsert_track(Track("v1", "Canción", "Artista", "Disco", 215, thumb_url="http://x/1.jpg"))
+    db.upsert_track(Track("v1", "", "", "", None, thumb_url="http://x/otra.jpg"))
+    db.upsert_track(Track("v1", "(sin título)"))
+    assert db.get_track("v1") == Track("v1", "Canción", "Artista", "Disco", 215, thumb_url="http://x/1.jpg")
+    db.upsert_track(Track("v1", "Canción (remasterizada)", "Artista", "Disco"))
+    assert db.get_track("v1").title == "Canción (remasterizada)"
+    assert db.get_track("v1").duration_s == 215
+
+
+def test_upsert_track_keeps_the_unavailable_mark(db):
+    db.upsert_track(Track("v1", "Canción"))
+    db.mark_unavailable("v1", "no disponible", now=100.0)
+    db.upsert_track(Track("v1", "Canción", "Artista"))
+    assert db.get_track("v1").unavailable_since == 100.0
+
+
+def test_numeric_settings_reject_nan_and_infinity(db):
+    for raw in ("nan", "NaN", "inf", "-inf", "Infinity", "1e999", "basura", ""):
+        db.set_setting("x", raw)
+        assert db.get_float("x", 2.5) == 2.5
+        assert db.get_int("x", 7) == 7
+
+
+def test_get_int_is_exact_for_big_integers(db):
+    big = 2**63 + 1
+    db.set_setting("x", big)
+    assert db.get_int("x") == big
+    db.set_setting("x", " 42 ")
+    assert db.get_int("x") == 42
+    db.set_setting("x", "41.9")
+    assert db.get_int("x") == 41
+    db.set_setting("x", "1e3")
+    assert db.get_int("x") == 1000
+    assert db.get_int("no-existe", 5) == 5
+
+
+def commits_during(db, action):
+    statements = []
+    db.conn.set_trace_callback(statements.append)
+    try:
+        result = action()
+    finally:
+        db.conn.set_trace_callback(None)
+    return result, sum(1 for s in statements if s.strip().upper() == "COMMIT")
+
+
+def test_create_local_playlist_with_50_songs_is_one_commit(db):
+    tracks = [Track(f"v{i}", f"Canción {i}", "Artista") for i in range(50)]
+    playlist_id, commits = commits_during(db, lambda: db.create_local_playlist("Mía", tracks))
+    assert commits == 1
+    assert [t.video_id for t in db.playlist_tracks(playlist_id)] == [f"v{i}" for i in range(50)]
+
+
+def test_adding_many_songs_to_a_local_list_is_one_commit_and_skips_repeats(db):
+    playlist_id = db.create_local_playlist("Mía", [Track("v0", "Cero")])
+    batch = [Track("v1", "Uno"), Track("v0", "Cero"), Track("v2", "Dos"), Track("v1", "Uno")]
+    added, commits = commits_during(db, lambda: db.add_tracks_to_local_playlist(playlist_id, batch))
+    assert (added, commits) == (2, 1)
+    assert [t.video_id for t in db.playlist_tracks(playlist_id)] == ["v0", "v1", "v2"]
+    assert db.add_to_local_playlist(playlist_id, Track("v2", "Dos")) is False
+    assert db.add_to_local_playlist(playlist_id, Track("v3", "Tres")) is True
+    assert db.add_tracks_to_local_playlist("PLcuenta", batch) == 0
+
+
+def test_a_local_playlist_is_created_whole_or_not_at_all(db, monkeypatch):
+    import ytm_native.core.db as dbmod
+
+    tracks = [Track("v0", "Cero"), Track("v1", "Uno")]
+    monkeypatch.setattr(dbmod, "_UPSERT_TRACK_SQL", "INSERT INTO tabla_que_no_existe VALUES (?, ?, ?, ?, ?, ?)")
+    try:
+        db.create_local_playlist("Mía", tracks)
+    except sqlite3.OperationalError:
+        pass
+    else:
+        raise AssertionError("debía fallar")
+    assert [p for p in db.playlists() if p.local] == []
+
+
+def test_discover_cache_purge_drops_only_expired_entries(db):
+    now = 1_000_000.0
+    db.set_discover_entry("suena:vieja", "{}", now - 8 * 86400)
+    db.set_discover_entry("suena:nueva", "{}", now - 3600)
+    db.set_discover_entry("artista:viejo", "{}", now - 2 * 86400)
+    db.set_discover_entry("artista_x", "{}", now - 30 * 86400)     # el "_" no es comodín
+    db.set_discover_entry("inicio", "{}", now - 90 * 86400)
+    removed = db.purge_discover_cache({"suena:": 7 * 86400, "artista:": 86400}, now)
+    assert removed == 2
+    assert db.get_discover_entry("suena:vieja") is None
+    assert db.get_discover_entry("artista:viejo") is None
+    for kept in ("suena:nueva", "artista_x", "inicio"):
+        assert db.get_discover_entry(kept) is not None
+
+
+def test_saving_discover_entries_purges_at_most_once_a_day(db):
+    from ytm_native.core import config
+    from ytm_native.services import discover
+
+    now = 2_000_000.0
+    db.set_discover_entry("suena:vieja", "{}", now - 8 * 86400)
+    assert discover.purge_stale_cache(db, now) == 1
+    db.set_discover_entry("suena:otra", "{}", now - 8 * 86400)
+    assert discover.purge_stale_cache(db, now + 60) == 0          # ya se purgó hoy
+    assert db.get_discover_entry("suena:otra") is not None
+    assert discover.purge_stale_cache(db, now + config.DISCOVER_PURGE_INTERVAL_S) == 1

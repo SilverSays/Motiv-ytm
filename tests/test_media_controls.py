@@ -205,6 +205,7 @@ def test_mpv_apaga_sus_controles_cuando_la_app_publica_los_suyos(qapp, monkeypat
     mpv = MpvPlayer()
     sent = []
     monkeypatch.setattr(mpv, "command", lambda *args: sent.append(args) or 1)
+    mpv._connected = True
     mpv._on_connected()
     assert not any(args[:2] == ("set_property", "media-controls") for args in sent)
     mpv.set_media_controls(False)
@@ -212,6 +213,88 @@ def test_mpv_apaga_sus_controles_cuando_la_app_publica_los_suyos(qapp, monkeypat
     sent.clear()
     mpv._on_connected()                      # tras relanzarse lo vuelve a apagar
     assert ("set_property", "media-controls", "no") in sent
+    # Antes de que mpv arranque (así lo llama la app) no se manda nada: se
+    # aplica al conectar, sin órdenes descartadas por el camino.
+    mpv._connected = False
+    sent.clear()
+    mpv.set_media_controls(False)
+    assert sent == []
     mpv._connected = True
     mpv.set_media_controls(True)
     assert sent[-1] == ("set_property", "media-controls", "player")
+
+
+# ---------------------------------------------------------------------------
+# Sesión de Windows: una carátula rota no deja la pista sin título
+# ---------------------------------------------------------------------------
+class _Music:
+    title = artist = album_title = None
+
+
+class _Updater:
+    def __init__(self):
+        self.music_properties = _Music()
+        self.thumbnail = None
+        self.type = None
+        self.updates = 0
+
+    def clear_all(self):
+        self.music_properties = _Music()
+        self.thumbnail = None
+
+    def update(self):
+        self.updates += 1
+
+
+class _Smtc:
+    def __init__(self):
+        self.display_updater = _Updater()
+        self.is_enabled = False
+
+
+def _bare_session(uri, stream_ref):
+    """Una ``WindowsSession`` sin WinRT: solo lo que usa ``set_track``."""
+    session = object.__new__(media_controls.WindowsSession)
+    session._smtc = _Smtc()
+    session._music = "MUSIC"
+    session._uri = uri
+    session._stream_ref = stream_ref
+    return session
+
+
+class _StreamRef:
+    @staticmethod
+    def create_from_uri(uri):
+        return ("carátula", uri)
+
+
+@pytest.mark.parametrize("art_url", ["no es una url", "http://[::1"])
+def test_una_caratula_que_windows_no_acepta_no_quita_titulo_ni_artista(art_url):
+    def uri(value):
+        raise OSError("El parámetro no es correcto.")      # lo que lanza WinRT
+
+    session = _bare_session(uri, _StreamRef)
+    session.set_track("Canción", "Artista", "Disco", art_url)
+    updater = session._smtc.display_updater
+    music = updater.music_properties
+    assert (music.title, music.artist, music.album_title) == ("Canción", "Artista", "Disco")
+    assert updater.thumbnail is None and updater.updates == 1
+    assert session._smtc.is_enabled is True
+
+
+def test_si_falla_la_descarga_de_la_caratula_tambien_sigue():
+    class Broken:
+        @staticmethod
+        def create_from_uri(uri):
+            raise RuntimeError("WinRT no disponible")
+
+    session = _bare_session(lambda value: value, Broken)
+    session.set_track("Canción", "Artista", "", "https://i.ytimg.com/vi/x/mqdefault.jpg")
+    assert session._smtc.display_updater.music_properties.title == "Canción"
+    assert session._smtc.is_enabled is True
+
+
+def test_con_caratula_valida_se_envia():
+    session = _bare_session(lambda value: f"uri:{value}", _StreamRef)
+    session.set_track("Canción", "Artista", "", "https://i.ytimg.com/vi/x/mqdefault.jpg")
+    assert session._smtc.display_updater.thumbnail == ("carátula", "uri:https://i.ytimg.com/vi/x/mqdefault.jpg")

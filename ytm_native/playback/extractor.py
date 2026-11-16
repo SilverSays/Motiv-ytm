@@ -672,6 +672,11 @@ class ExtractorManager:
             warm.discard()
         for reaper in reapers:
             reaper.join(35)
+        stuck = sum(reaper.is_alive() for reaper in reapers)
+        if stuck:
+            log.warning(
+                "%d yt-dlp siguen saliendo tras esperarlos: el binario puede estar aún en uso", stuck
+            )
 
     def _release_warm(self) -> None:
         with self._warm_lock:
@@ -1144,20 +1149,19 @@ class ExtractorManager:
         """
         if not self.ytdlp.is_file():
             return UpdateResult(UpdateStatus.BINARY_MISSING, message="Falta yt-dlp en bin.")
-        if not force and reason != "manual":
-            cooldown = (
-                config.PROACTIVE_UPDATE_COOLDOWN_S
-                if reason == "proactive"
-                else config.REACTIVE_UPDATE_COOLDOWN_S
-            )
-            if self._clock() - self.db.get_float("last_update_timestamp") < cooldown:
-                return UpdateResult(UpdateStatus.SKIPPED_COOLDOWN)
+        if self._in_cooldown(reason, force):
+            return UpdateResult(UpdateStatus.SKIPPED_COOLDOWN)
         if self._closed:
             return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
         self._enter_update(config.UPDATE_DRAIN_TIMEOUT_S)
         if self._closed:
             self._leave_update()
             return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
+        # Otra llamada pudo actualizar mientras esta esperaba su turno: se
+        # vuelve a mirar el cooldown, ya con la exclusividad tomada.
+        if self._in_cooldown(reason, force):
+            self._leave_update()
+            return UpdateResult(UpdateStatus.SKIPPED_COOLDOWN)
         self._hold_warm()
         try:
             self._set_state(ExtractorState.UPDATING)
@@ -1167,6 +1171,21 @@ class ExtractorManager:
             self._set_state(ExtractorState.IDLE)
             self._leave_update()
             self.prewarm()
+
+    def _in_cooldown(self, reason: str, force: bool) -> bool:
+        if force or reason == "manual":
+            return False
+        cooldown = (
+            config.PROACTIVE_UPDATE_COOLDOWN_S
+            if reason == "proactive"
+            else config.REACTIVE_UPDATE_COOLDOWN_S
+        )
+        return self._clock() - self.db.get_float("last_update_timestamp") < cooldown
+
+    def _stamp_update(self) -> None:
+        """El cooldown solo empieza cuando la comprobación llegó a alguna
+        conclusión; un corte de red no lo gasta."""
+        self.db.set_setting("last_update_timestamp", self._clock())
 
     def _recover_binary(self) -> bool:
         """Llamado desde una resolución cuando el binario es sospechoso.
@@ -1196,7 +1215,7 @@ class ExtractorManager:
                 self._notice(f"yt-dlp {unverified} falla: se restauró la versión anterior.")
                 return True
             return False
-        if self._clock() - self.db.get_float("last_update_timestamp") < config.REACTIVE_UPDATE_COOLDOWN_S:
+        if self._in_cooldown("reactive", force=False):
             return False
         result = self._update_locked("reactive")
         return result.status in (UpdateStatus.UPDATED, UpdateStatus.UPDATED_UNVERIFIED)
@@ -1276,17 +1295,18 @@ class ExtractorManager:
                 message="Hay una actualización anterior sin deshacer y el respaldo no se pudo restaurar.",
             )
         old_version = self.ytdlp_version()
-        self.db.set_setting("last_update_timestamp", self._clock())
 
         # Versión descartada: no reinstalarla; esperar a una más nueva.
         latest = self._latest_tag()
         if latest:
             if self.db.is_bad_version(latest):
+                self._stamp_update()
                 return UpdateResult(
                     UpdateStatus.SKIPPED_BAD_VERSION, old_version, latest,
                     f"La última versión ({latest}) ya se descartó; se espera una más nueva.",
                 )
             if latest == old_version:
+                self._stamp_update()
                 return UpdateResult(UpdateStatus.UP_TO_DATE, old_version, old_version)
 
         error = self._make_backup(old_version)
@@ -1301,7 +1321,12 @@ class ExtractorManager:
             )
 
         run = self._runner([str(self.ytdlp), "--ignore-config", "-U"], config.UPDATE_TIMEOUT_S, None)
-        if run.returncode not in (0, 100):
+        failed = run.returncode not in (0, 100)
+        if not (failed and classify(run.stderr, run.timed_out) is ErrorKind.NETWORK):
+            # yt-dlp -U llegó a hablar con el servidor: el cooldown corre. Sin
+            # red no, para reintentar en cuanto vuelva la conexión.
+            self._stamp_update()
+        if failed:
             detail = summarize(run.stderr) or run.returncode
             if self._undo_update():
                 return UpdateResult(UpdateStatus.FAILED, old_version, message=f"yt-dlp -U falló: {detail}")

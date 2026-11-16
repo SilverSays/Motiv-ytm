@@ -52,6 +52,14 @@ FULL_SYNC_MIN_DAYS = 7
 FULL_SYNC_MAX_DAYS = 14
 # Si el servidor no informa el conteo de una lista, se re-descarga cada:
 NO_COUNT_RESYNC_S = 2 * 86400
+# Una biblioteca que llega con menos de esta fracción de las listas guardadas
+# (habiendo más de SYNC_MASS_DELETE_MIN_LOCAL) huele a respuesta truncada: no
+# se borra nada hasta que la siguiente sincronización traiga lo mismo.
+SYNC_MASS_DELETE_MIN_LOCAL = 5
+SYNC_MASS_DELETE_RATIO = 0.5
+# Lo mismo con una lista: si trae menos de esta fracción de las canciones que
+# dice tener (y menos de las que había), no se sustituye todavía.
+SYNC_TRUNCATED_RATIO = 0.5
 
 # --- Reproducción (Fase 4) -------------------------------------------------
 DEBOUNCE_MS = 400
@@ -150,6 +158,8 @@ SEARCH_PLAYLISTS = 20
 SEARCH_ARTISTS = 8
 # Página del artista: tres o cuatro peticiones anónimas al abrirla; se guarda un día.
 ARTIST_PAGE_TTL_S = 86400
+# Cada cuánto se borra de la caché de recomendaciones lo que ya caducó.
+DISCOVER_PURGE_INTERVAL_S = 86400
 ARTIST_TOP_SONGS = 10
 ARTIST_SIMILAR_TRACKS = 12
 ARTIST_MAX_CARDS = 12
@@ -166,6 +176,10 @@ LRCLIB_BASE = "https://lrclib.net/api"
 LRCLIB_USER_AGENT = "ytmn-desktop/0.1"
 LYRICS_MAX_DURATION_DELTA_S = 2
 LYRICS_NEGATIVE_CACHE_S = 7 * 86400   # "sin letra" se vuelve a consultar pasada una semana
+# Tiempo total para buscar una letra (todas las consultas juntas) y lo mínimo
+# que debe quedar para lanzar otra.
+LYRICS_BUDGET_S = 15.0
+LYRICS_MIN_REQUEST_S = 1.0
 RADIO_LIMIT = 25
 MPV_MAX_RESTARTS_PER_MIN = 3
 # Controles multimedia de Windows: cada cuánto se le dice por dónde va la pista

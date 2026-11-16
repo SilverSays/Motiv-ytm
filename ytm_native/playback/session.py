@@ -44,28 +44,55 @@ def encode_queue(tracks: list[Track], order: list[int]) -> str:
                       ensure_ascii=False, separators=(",", ":"))
 
 
+def _decode_track(row: object) -> Optional[Track]:
+    """Una fila de la cola guardada, o ``None`` si no tiene la forma esperada.
+
+    Nada se convierte a la fuerza: ``str(None)`` daría una pista fantasma
+    llamada "None" con un ``videoId`` que no existe.
+    """
+    if not isinstance(row, list) or len(row) < 6:
+        return None
+    video_id, title, artists, album, duration, thumb = row[:6]
+    if not (isinstance(video_id, str) and video_id.strip()):
+        return None
+    if not (isinstance(title, str) and title.strip()):
+        return None
+    if not all(value is None or isinstance(value, str) for value in (artists, album, thumb)):
+        return None
+    if duration is not None and (type(duration) is not int or duration < 0):
+        duration = None             # sin duración la pista suena igual
+    return Track(video_id=video_id, title=title, artists=artists or "", album=album or "",
+                 duration_s=duration, thumb_url=thumb or "")
+
+
 def decode_queue(raw: Optional[str]) -> Optional[tuple[list[Track], list[int]]]:
-    """Pistas y orden guardados, o ``None`` si no hay nada que se pueda leer."""
+    """Pistas y orden guardados, o ``None`` si no hay nada que se pueda leer.
+
+    Las filas dañadas se descartan sin tirar el resto de la cola; el orden
+    aleatorio se conserva para las que quedan.
+    """
     try:
         data = json.loads(raw) if raw else None
-        if not isinstance(data, dict) or data.get("v") != _VERSION:
-            return None
-        tracks = [
-            Track(video_id=str(row[0]), title=str(row[1]), artists=str(row[2] or ""),
-                  album=str(row[3] or ""), duration_s=row[4] if isinstance(row[4], int) else None,
-                  thumb_url=str(row[5] or ""))
-            for row in data["tracks"]
-        ]
-        order = data.get("order")
-    except (ValueError, TypeError, KeyError, IndexError):
+    except (ValueError, TypeError):
         return None
-    if not tracks or any(not t.video_id for t in tracks):
+    if not isinstance(data, dict) or data.get("v") != _VERSION or not isinstance(data.get("tracks"), list):
+        return None
+    tracks: list[Track] = []
+    kept: dict[int, int] = {}       # índice guardado -> índice en la cola recuperada
+    for index, row in enumerate(data["tracks"]):
+        track = _decode_track(row)
+        if track is not None:
+            kept[index] = len(tracks)
+            tracks.append(track)
+    if not tracks:
         return None
     plain = list(range(len(tracks)))
-    if (not isinstance(order, list) or not all(type(i) is int for i in order)
-            or sorted(order) != plain):
-        order = plain
-    return tracks, order
+    order = data.get("order")
+    if isinstance(order, list) and all(type(i) is int for i in order):
+        order = [kept[i] for i in order if i in kept]
+        if sorted(order) == plain:
+            return tracks, order
+    return tracks, plain
 
 
 class SessionKeeper(QObject):
@@ -188,6 +215,12 @@ class SessionKeeper(QObject):
         if not self.enabled or self._restoring or self.player.current_track() is None:
             return
         state = self._state_json()
-        if state != self._last_state:
-            self._last_state = state
+        if state == self._last_state:
+            return
+        try:
             self.db.set_setting(STATE_KEY, state)
+        except Exception:  # noqa: BLE001 - la música sigue; el próximo guardado lo reintenta
+            log.warning("no se pudo guardar el punto de la sesión", exc_info=True)
+            return
+        # Solo lo que de verdad quedó escrito cuenta como guardado.
+        self._last_state = state

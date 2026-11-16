@@ -13,11 +13,17 @@ Decisiones tomadas a partir de las observaciones del plan:
 * Sesión caducada: estado ``AUTH_EXPIRED`` persistente, sin reintentos en bucle.
 * Una biblioteca remota vacía cuando la local no lo está se trata como
   sospechosa (posible sesión caducada) y **no** borra nada.
+* Una biblioteca a la que de golpe le faltan la mayoría de las listas, o una
+  lista que llega con muchas menos canciones de las que dice tener, tampoco
+  borra nada la primera vez; solo si la siguiente respuesta es igual.
+* Un 401/403 al pedir una lista concreta solo caduca la sesión si la cuenta
+  ya no responde; si no, se anota en esa lista y se sigue con las demás.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import threading
@@ -28,9 +34,13 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 from ytm_native.core import config, paths
-from ytm_native.core.db import Database, Track
+from ytm_native.core.db import Database, Playlist, Track
 
 log = logging.getLogger("ytmn.sync")
+
+# Ajustes donde se recuerda una respuesta sospechosa hasta ver si se repite.
+SHRINK_KEY = "sync_shrunk_library"
+SUSPECT_KEY = "sync_suspect:"
 
 
 class SyncState(str, Enum):
@@ -48,6 +58,7 @@ class SyncReport:
     playlists_downloaded: int = 0
     playlists_removed: int = 0
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     message: str = ""
 
 
@@ -63,12 +74,53 @@ def parse_count(value: Any) -> Optional[int]:
     return int(digits) if digits else None
 
 
+class SessionExpired(Exception):
+    """La cuenta ya no tiene sesión (la respuesta no lo dice con un código HTTP)."""
+
+
+_AUTH_STATUSES = (401, 403)
+# Solo el código de una respuesta HTTP, nunca un número suelto: "403" aparece
+# también en puertos, direcciones IP o identificadores dentro del mensaje.
+_HTTP_STATUS = re.compile(r"\bhttp(?:\s+error)?\s+(\d{3})\b|\bstatus(?:\s+code)?[\s:=]+(\d{3})\b")
+_AUTH_PHRASES = re.compile(
+    r"\bunauthori[sz]ed\b|\bforbidden\b|please provide authentication|\bsigned out\b|\blogged out\b"
+)
+
+
+def http_status(exc: BaseException) -> Optional[int]:
+    """Código HTTP de la respuesta que provocó el error, si se sabe."""
+    for source in (getattr(exc, "response", None), exc):
+        for attr in ("status_code", "status", "code"):
+            value = getattr(source, attr, None) if source is not None else None
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+                return value
+    match = _HTTP_STATUS.search(str(exc).lower())
+    if match:
+        return int(match.group(1) or match.group(2))
+    return None
+
+
 def is_auth_error(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(
-        marker in text
-        for marker in ("401", "403", "unauthorized", "forbidden", "sign in", "signed out", "logged out")
-    )
+    """¿El error dice que la cuenta no tiene permiso o sesión?
+
+    Se mira el código de la respuesta (``requests``, ``urllib``) o el que
+    ytmusicapi pone en su mensaje ("Server returned HTTP 401: ..."), y frases
+    concretas de sesión cerrada.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SessionExpired):
+            return True
+        status = http_status(current)
+        if status is not None:
+            if status in _AUTH_STATUSES:
+                return True
+        elif _AUTH_PHRASES.search(str(current).lower()):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def full_sync_interval_s(playlist_id: str) -> float:
@@ -190,9 +242,13 @@ def merge_set_cookies(cookie_header: str, set_cookies: list[str]) -> tuple[str, 
 class CookieKeeper:
     """Recoge las cookies que rota el servidor y las guarda en ``browser.json``."""
 
-    def __init__(self, path):
+    def __init__(self, path, baseline: Optional[str] = None):
         self.path = path
         self.set_cookies: list[str] = []
+        # Cabecera Cookie con la que se creó el cliente. Si el archivo ya trae
+        # otra, el usuario importó credenciales nuevas mientras esta
+        # sincronización seguía en marcha: las rotaciones de la vieja sobran.
+        self.baseline = baseline
 
     def hook(self, response, *_args, **_kwargs):
         from urllib.parse import urlparse
@@ -211,22 +267,34 @@ class CookieKeeper:
 
         if not self.set_cookies:
             return []
+        tmp = self.path.with_name(self.path.name + ".tmp")
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return []
             key = next((k for k in data if k.lower() == "cookie"), None)
             if key is None:
                 return []
-            merged, changed = merge_set_cookies(data[key], self.set_cookies)
-            self.set_cookies = []
+            pending, self.set_cookies = self.set_cookies, []
+            if self.baseline is not None and data[key] != self.baseline:
+                log.info("credenciales cambiadas durante la sincronización: se descartan sus cookies renovadas")
+                return []
+            merged, changed = merge_set_cookies(data[key], pending)
             if not changed or "SAPISID=" not in merged:
                 return []      # nunca se guarda una cabecera que perdió la sesión
             data[key] = merged
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-            tmp.replace(self.path)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False, indent=1))
+                fh.flush()
+                os.fsync(fh.fileno())   # en disco antes de sustituir: un apagón no deja un archivo vacío
+            os.replace(tmp, self.path)
             return changed
         except (OSError, ValueError) as exc:
             log.warning("no se pudieron guardar las cookies renovadas: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
             return []
 
 
@@ -239,7 +307,7 @@ def default_client_factory():
 
     path = paths.browser_json()
     raw = json.loads(path.read_text(encoding="utf-8"))
-    keeper = CookieKeeper(path)
+    keeper = CookieKeeper(path, baseline=next((v for k, v in raw.items() if k.lower() == "cookie"), None))
     session = requests.Session()
     session.request = _with_timeout(session.request)
     session.hooks["response"].append(keeper.hook)
@@ -338,7 +406,7 @@ class LibrarySync:
         if not remote and self._looks_logged_out(client):
             # ytmusicapi no lanza error con la sesión cerrada: devuelve una
             # biblioteca vacía. Una cuenta con sesión siempre trae alguna lista.
-            return self._fail(report, PermissionError("401 Unauthorized: la sesión está cerrada (logged out)"))
+            return self._fail(report, SessionExpired("la sesión está cerrada (logged out)"))
 
         if not remote and local:
             report.state = SyncState.ERROR
@@ -369,39 +437,20 @@ class LibrarySync:
                 self._pause(self._rng.uniform(lo, hi))
             downloaded_any = True
             try:
-                data = client.get_playlist(pid, limit=None)
-            except Exception as exc:  # noqa: BLE001
-                if is_auth_error(exc):
-                    return self._fail(report, exc)
-                # Una lista rota no debe frenar al resto.
-                msg = f"{title}: {exc}"
-                log.warning("no se pudo descargar la lista %s: %s", pid, exc)
-                report.errors.append(msg)
-                self.db.set_playlist_error(pid, str(exc)[:300])
-                continue
-            items = [t for t in (track_from_item(i) for i in (data.get("tracks") or [])) if t]
-            # Si la biblioteca no informó conteo, se usa el de la propia lista.
-            stored_count = count if count is not None else parse_count(data.get("trackCount"))
-            self.db.replace_playlist_tracks(pid, items, stored_count, synced_at=self._clock())
-            author = data.get("author")
-            self.db.set_playlist_details(
-                pid,
-                description=str(data.get("description") or ""),
-                author=str(author.get("name") or "") if isinstance(author, dict) else str(author or ""),
-                year=str(data.get("year") or ""),
-                duration_s=parse_count(data.get("duration_seconds")),
-                thumb_url=best_thumbnail(data.get("thumbnails")) or best_thumbnail(item.get("thumbnails")),
-            )
-            report.playlists_downloaded += 1
+                if self._sync_playlist(client, item, known, count, title, report):
+                    report.playlists_downloaded += 1
+            except SessionExpired as exc:
+                return self._fail(report, exc)
 
         if not only_playlist and not cancel.is_set():
-            report.playlists_removed = self.db.delete_playlists_not_in(p["playlistId"] for p in remote)
+            self._remove_missing(remote, local, report)
             self.db.set_setting("last_sync_check", self._clock())
 
         report.state = SyncState.IDLE
-        report.message = (
-            f"{report.playlists_downloaded} lista(s) actualizadas de {report.playlists_seen}."
-            + (f" {len(report.errors)} con errores." if report.errors else "")
+        report.message = " ".join(
+            [f"{report.playlists_downloaded} lista(s) actualizadas de {report.playlists_seen}."]
+            + ([f"{len(report.errors)} con errores."] if report.errors else [])
+            + report.warnings
         )
         self._set_state(SyncState.IDLE)
         log.info("sincronización correcta: %s", report.message)
@@ -411,6 +460,105 @@ class LibrarySync:
             # Solo nombres, nunca valores: sirve para saber si el servidor rota la sesión.
             log.info("cookies renovadas y guardadas: %s", ", ".join(sorted(set(rotated))) or "ninguna")
         return report
+
+    def _sync_playlist(
+        self, client: Any, item: dict, known: Optional[Playlist], count: Optional[int],
+        title: str, report: SyncReport,
+    ) -> bool:
+        """Descarga una lista y la guarda. Devuelve si se guardó.
+
+        Lo que falle en esta lista se anota en ella y la sincronización sigue
+        con las demás. Solo una sesión perdida (``SessionExpired``) la corta:
+        un 401/403 de una lista (privada, de otra cuenta) no dice nada de la
+        sesión mientras la cuenta siga respondiendo.
+        """
+        pid = item["playlistId"]
+        try:
+            data = client.get_playlist(pid, limit=None)
+            if not isinstance(data, dict):
+                raise ValueError("la respuesta no trae la lista")
+            raw_tracks = data.get("tracks") or []
+            items = [t for t in (track_from_item(i) for i in raw_tracks if isinstance(i, dict)) if t]
+        except Exception as exc:  # noqa: BLE001 - una lista rota no debe frenar al resto
+            if is_auth_error(exc) and self._looks_logged_out(client):
+                raise SessionExpired(str(exc)) from exc
+            log.warning("no se pudo descargar la lista %s: %s", pid, exc)
+            report.errors.append(f"{title}: {exc}")
+            self.db.set_playlist_error(pid, str(exc)[:300])
+            return False
+
+        # Si la biblioteca no informó conteo, se usa el de la propia lista.
+        stored_count = count if count is not None else parse_count(data.get("trackCount"))
+        suspicion = self._truncation(known, len(raw_tracks), len(items), stored_count)
+        if suspicion:
+            key = SUSPECT_KEY + pid
+            signature = f"{len(raw_tracks)}/{stored_count}"
+            if self.db.get_setting(key) != signature:
+                # Primera vez: se guarda lo que había y se reintenta en la próxima.
+                self.db.set_setting(key, signature)
+                log.warning("lista %s sospechosa de llegar truncada: %s", pid, suspicion)
+                report.errors.append(f"{title}: {suspicion}")
+                self.db.set_playlist_error(pid, suspicion)
+                return False
+            log.warning("lista %s: la misma respuesta dos veces seguidas, se acepta (%s)", pid, suspicion)
+        if self.db.get_setting(SUSPECT_KEY + pid) is not None:
+            self.db.set_setting(SUSPECT_KEY + pid, None)
+
+        self.db.replace_playlist_tracks(pid, items, stored_count, synced_at=self._clock())
+        author = data.get("author")
+        self.db.set_playlist_details(
+            pid,
+            description=str(data.get("description") or ""),
+            author=str(author.get("name") or "") if isinstance(author, dict) else str(author or ""),
+            year=str(data.get("year") or ""),
+            duration_s=parse_count(data.get("duration_seconds")),
+            thumb_url=best_thumbnail(data.get("thumbnails")) or best_thumbnail(item.get("thumbnails")),
+        )
+        return True
+
+    @staticmethod
+    def _truncation(known: Optional[Playlist], received: int, playable: int,
+                    expected: Optional[int]) -> str:
+        """Motivo para no fiarse de la lista recibida, o ``""``.
+
+        Solo preocupa si se perderían canciones guardadas. Si el propio
+        servidor dice que la lista mengua (su conteo baja), es que se borraron
+        de verdad; si no da conteo, solo una lista vacía es sospechosa.
+        """
+        had = known.stored_tracks if known is not None else 0
+        if had == 0 or playable >= had:
+            return ""
+        if expected is not None:
+            if expected == 0 or received >= expected * config.SYNC_TRUNCATED_RATIO:
+                return ""
+            return (f"llegaron {received} de las {expected} canciones que dice tener; "
+                    "no se borró nada y se reintentará")
+        if playable > 0:
+            return ""
+        return f"llegó vacía y tenía {had} canciones; no se borró nada y se reintentará"
+
+    def _remove_missing(self, remote: list[dict], local: dict[str, Playlist], report: SyncReport) -> None:
+        """Borra las listas que ya no están en la cuenta, salvo que falten
+        tantas de golpe que parezca una respuesta truncada: entonces se espera
+        a que la siguiente sincronización traiga la misma biblioteca."""
+        remote_ids = {p["playlistId"] for p in remote}
+        gone = sorted(set(local) - remote_ids)
+        if (gone and len(local) > config.SYNC_MASS_DELETE_MIN_LOCAL
+                and len(remote_ids) < len(local) * config.SYNC_MASS_DELETE_RATIO):
+            signature = f"{len(gone)}:{zlib.crc32(','.join(gone).encode('utf-8'))}"
+            if self.db.get_setting(SHRINK_KEY) != signature:
+                self.db.set_setting(SHRINK_KEY, signature)
+                warning = (
+                    f"La cuenta devolvió {len(remote_ids)} listas de las {len(local)} guardadas; "
+                    "no se borró ninguna. Si las quitaste tú, desaparecerán en la próxima sincronización."
+                )
+                log.warning("biblioteca remota sospechosamente corta: %s", warning)
+                report.warnings.append(warning)
+                return
+            log.warning("la biblioteca llegó corta dos veces seguidas: se borran %d listas", len(gone))
+        if self.db.get_setting(SHRINK_KEY) is not None:
+            self.db.set_setting(SHRINK_KEY, None)
+        report.playlists_removed = self.db.delete_playlists_not_in(remote_ids)
 
     @staticmethod
     def _looks_logged_out(client: Any) -> bool:
@@ -423,6 +571,8 @@ class LibrarySync:
     def _needs_download(known, count: Optional[int], now: float) -> bool:
         if known is None or known.last_full_sync is None:
             return True
+        if known.last_error:
+            return True  # falló o llegó sospechosa la última vez: se reintenta
         if known.thumb_url is None:
             return True  # sincronizada antes de guardar carátulas: una descarga para completarla
         age = now - known.last_full_sync

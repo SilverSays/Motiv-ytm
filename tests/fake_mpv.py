@@ -28,8 +28,21 @@ def main() -> int:
 
     def handle(msg):
         cmd = msg.get("command") or []
-        send({"error": "success", "request_id": msg.get("request_id")})
-        if cmd[0] == "observe_property":
+        if cmd[0] == "loadfile":
+            # Como mpv >= 0.36: la respuesta trae la entrada, antes que start-file.
+            if "crash" in cmd[1]:
+                os._exit(3)
+            state["entry"] += 1
+            send({"error": "success", "request_id": msg.get("request_id"),
+                  "data": {"playlist_entry_id": state["entry"]}})
+        else:
+            send({"error": "success", "request_id": msg.get("request_id")})
+        if cmd[0] == "ytmn-test-drop":
+            # Solo pruebas: corta la tubería sin terminar, como un fallo del IPC.
+            sock, state["sock"] = state["sock"], None
+            state["observed"] = {}
+            sock.disconnectFromServer()
+        elif cmd[0] == "observe_property":
             state["observed"][cmd[2]] = cmd[1]
         elif cmd[0] == "keybind":
             state["binds"][cmd[1]] = cmd[2]
@@ -41,9 +54,6 @@ def main() -> int:
                 prop("pause", True)
         elif cmd[0] == "loadfile":
             url = cmd[1]
-            if "crash" in url:
-                os._exit(3)
-            state["entry"] += 1
             entry = state["entry"]
             send({"event": "start-file", "playlist_entry_id": entry})
             if "fail" in url:
@@ -66,14 +76,17 @@ def main() -> int:
             app.quit()
 
     def on_ready():
+        if state["sock"] is None:
+            return
         state["buf"] += bytes(state["sock"].readAll())
-        while b"\n" in state["buf"]:
+        while b"\n" in state["buf"] and state["sock"] is not None:
             line, state["buf"] = state["buf"].split(b"\n", 1)
             if line.strip():
                 handle(json.loads(line))
 
     def on_connection():
         state["sock"] = server.nextPendingConnection()
+        state["buf"] = b""
         state["sock"].readyRead.connect(on_ready)
         on_ready()
 

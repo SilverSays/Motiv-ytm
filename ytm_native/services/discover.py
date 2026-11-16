@@ -32,11 +32,22 @@ from typing import Any, Callable, Iterable, Optional
 
 from ytm_native.core import config
 from ytm_native.core.db import Database, Track
-from ytm_native.services.sync import _fold, _with_timeout, anon_client, best_thumbnail, parse_count, track_from_item
+from ytm_native.services.sync import (
+    _fold,
+    _with_timeout,
+    anon_client,
+    best_thumbnail,
+    http_status,
+    parse_count,
+    track_from_item,
+)
 
 log = logging.getLogger("ytmn.discover")
 
 HOME_CACHE_KEY = "inicio"
+NOW_CACHE_PREFIX = "suena:"
+ARTIST_CACHE_PREFIX = "artista:"
+CACHE_PURGED_KEY = "discover_cache_purged_at"
 RECENT_KEY = "recent_searches"
 
 
@@ -133,12 +144,54 @@ _NOT_AN_ARTIST = re.compile(
 )
 
 
+# Nombres oficiales que llevan coma: unidos con ", " a otros artistas serían
+# indistinguibles de dos artistas, así que se reconocen por su nombre.
+_COMMA_NAMES = (
+    "Tyler, The Creator",
+    "Earth, Wind & Fire",
+    "Crosby, Stills & Nash",
+    "Crosby, Stills, Nash & Young",
+    "Emerson, Lake & Palmer",
+    "Blood, Sweat & Tears",
+    "Peter, Paul and Mary",
+    "Peter, Paul & Mary",
+    "Now, Now",
+    "Hey, Ocean!",
+)
+_COMMA_PARTS = sorted(
+    ([part.strip().casefold() for part in name.split(",")] for name in _COMMA_NAMES),
+    key=len, reverse=True,
+)
+
+
+def _join_comma_names(pieces: list[str]) -> list[str]:
+    """Vuelve a unir los trozos que forman un nombre con coma de ``_COMMA_NAMES``."""
+    folded = [p.casefold() for p in pieces]
+    names: list[str] = []
+    i = 0
+    while i < len(pieces):
+        for parts in _COMMA_PARTS:
+            if folded[i:i + len(parts)] == parts:
+                names.append(", ".join(pieces[i:i + len(parts)]))
+                i += len(parts)
+                break
+        else:
+            names.append(pieces[i])
+            i += 1
+    return names
+
+
 def split_artists(artists: str) -> list[str]:
-    """``"A, B"`` -> ``["A", "B"]``, sin entradas que no son artistas."""
+    """``"A, B"`` -> ``["A", "B"]``, sin entradas que no son artistas.
+
+    Un nombre que lleva coma ("Tyler, The Creator") no se parte, y uno de una
+    sola letra o cifra ("X", "7") es un artista como cualquier otro."""
+    pieces = [p.strip() for p in (artists or "").split(",")]
     names = []
-    for raw in (artists or "").split(","):
-        name = re.sub(r"\s+-\s+Topic$", "", raw.strip())
-        if len(name) >= 2 and not _NOT_AN_ARTIST.search(name):
+    for raw in _join_comma_names([p for p in pieces if p]):
+        name = re.sub(r"\s+-\s+Topic$", "", raw)
+        # Lo que no tiene ni una letra ni una cifra ("&", "-") no es un nombre.
+        if any(c.isalnum() for c in name) and not _NOT_AN_ARTIST.search(name):
             names.append(name)
     return names
 
@@ -209,12 +262,15 @@ def card_from_item(item: Any) -> Optional[PlaylistCard]:
 
 
 def _take_cards(items: Iterable[Any], seen: set[str]) -> tuple[PlaylistCard, ...]:
-    """Tarjetas nuevas (ni de la biblioteca ni ya enseñadas en otra fila)."""
+    """Tarjetas nuevas: ni de la biblioteca, ni ya enseñadas en otra fila, ni
+    repetidas dentro de esta (la misma lista puede llegar dos veces)."""
     cards = []
+    taken: set[str] = set()
     for item in items or []:
         card = card_from_item(item)
-        if card is None or card.playlist_id in seen:
+        if card is None or card.playlist_id in seen or card.playlist_id in taken:
             continue
+        taken.add(card.playlist_id)
         cards.append(card)
         if len(cards) >= config.HOME_SHELF_MAX_CARDS:
             break
@@ -462,6 +518,9 @@ class NowInfo:
     artist_stats: list[list[str]] = field(default_factory=list)  # [etiqueta, valor] del artista
     bio: str = ""                                           # historia del artista o grupo
     facts: list[list[str]] = field(default_factory=list)    # [etiqueta, valor] de la canción
+    # Faltan los datos del artista por un fallo pasajero (red, servidor): se
+    # enseña lo que hay, pero no se guarda, para pedirlo entero la próxima vez.
+    partial: bool = False
 
 
 _VIDEO_KINDS = {
@@ -514,6 +573,14 @@ def artist_stats(data: dict) -> list[list[str]]:
     return stats
 
 
+def _transient(exc: BaseException) -> bool:
+    """¿Un fallo que puede no repetirse (red, servidor saturado)?"""
+    if isinstance(exc, OSError):          # también los de requests y urllib
+        return True
+    status = http_status(exc)
+    return status is not None and (status == 429 or status >= 500)
+
+
 def now_playing_info(track: Track, client_factory: Optional[Callable[[], Any]] = None) -> NowInfo:
     """Música parecida, datos de la canción y del artista (bloqueante, sin cuenta).
 
@@ -551,7 +618,11 @@ def now_playing_info(track: Track, client_factory: Optional[Callable[[], Any]] =
         try:
             data = tolerant(client).get_artist(artist_id) or {}
         except Exception as exc:  # noqa: BLE001 - un canal de usuario no tiene página de artista
-            log.info("sin página de artista para %s: %s", artist_id, type(exc).__name__)
+            if _transient(exc):
+                log.info("datos del artista %s pendientes (fallo pasajero): %s", artist_id, exc)
+                info.partial = True
+            else:
+                log.info("sin página de artista para %s: %s", artist_id, type(exc).__name__)
             data = {}
         if data:
             info.artist_id = str(artist_id)
@@ -562,13 +633,36 @@ def now_playing_info(track: Track, client_factory: Optional[Callable[[], Any]] =
     return info
 
 
+def purge_stale_cache(db: Database, now: Optional[float] = None) -> int:
+    """Quita de la caché lo que ya no se usaría (más viejo que su plazo), como
+    mucho una vez cada ``DISCOVER_PURGE_INTERVAL_S``: cada canción y cada
+    artista que se abren dejan una entrada, y sin esto la base solo crece.
+    Las recomendaciones del inicio no se tocan: se enseñan aunque sean viejas."""
+    now = time.time() if now is None else now
+    if 0 <= now - db.get_float(CACHE_PURGED_KEY) < config.DISCOVER_PURGE_INTERVAL_S:
+        return 0
+    db.set_setting(CACHE_PURGED_KEY, now)
+    removed = db.purge_discover_cache(
+        {NOW_CACHE_PREFIX: config.NOW_INFO_TTL_S, ARTIST_CACHE_PREFIX: config.ARTIST_PAGE_TTL_S}, now
+    )
+    if removed:
+        log.info("caché de recomendaciones: %d entradas caducadas borradas", removed)
+    return removed
+
+
 def save_now_info(db: Database, info: NowInfo, now: Optional[float] = None) -> None:
-    db.set_discover_entry(f"suena:{info.video_id}", json.dumps(asdict(info), ensure_ascii=False), now)
+    """Guarda la información una semana; la incompleta por un fallo pasajero no."""
+    if info.partial:
+        return
+    db.set_discover_entry(
+        f"{NOW_CACHE_PREFIX}{info.video_id}", json.dumps(asdict(info), ensure_ascii=False), now
+    )
+    purge_stale_cache(db, now)
 
 
 def load_now_info(db: Database, video_id: str, now: Optional[float] = None) -> Optional[NowInfo]:
     """Lo guardado para esa canción, si no tiene más de una semana."""
-    entry = db.get_discover_entry(f"suena:{video_id}")
+    entry = db.get_discover_entry(f"{NOW_CACHE_PREFIX}{video_id}")
     if entry is None:
         return None
     fetched_at, raw = entry
@@ -599,7 +693,9 @@ def fetch_playlist(
     data = (client_factory or anon_client)().get_playlist(playlist_id, limit=limit) or {}
     author = data.get("author")
     author = str(author.get("name") or "") if isinstance(author, dict) else str(author or "")
-    tracks = [t[0] for t in (track_from_item(i) for i in (data.get("tracks") or [])) if t]
+    # Como en los álbumes: lo que YouTube marca como no disponible no se enseña.
+    items = [i for i in (data.get("tracks") or []) if isinstance(i, dict) and i.get("isAvailable") is not False]
+    tracks = [t[0] for t in (track_from_item(i) for i in items) if t]
     if not author and playlist_id.startswith("OLAK5uy") and tracks:
         author = split_artists(tracks[0].artists)[:1][0] if split_artists(tracks[0].artists) else ""
     return RemotePlaylist(
@@ -905,12 +1001,15 @@ def artist_page(
 
 
 def save_artist_page(db: Database, page: ArtistPage, now: Optional[float] = None) -> None:
-    db.set_discover_entry(f"artista:{page.channel_id}", json.dumps(asdict(page), ensure_ascii=False), now)
+    db.set_discover_entry(
+        f"{ARTIST_CACHE_PREFIX}{page.channel_id}", json.dumps(asdict(page), ensure_ascii=False), now
+    )
+    purge_stale_cache(db, now)
 
 
 def load_artist_page(db: Database, channel_id: str, now: Optional[float] = None) -> Optional[ArtistPage]:
     """Lo guardado de ese artista, si no tiene más de un día."""
-    entry = db.get_discover_entry(f"artista:{channel_id}")
+    entry = db.get_discover_entry(f"{ARTIST_CACHE_PREFIX}{channel_id}")
     if entry is None:
         return None
     fetched_at, raw = entry

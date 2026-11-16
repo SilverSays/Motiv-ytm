@@ -95,7 +95,12 @@ class WindowsSession:
         music.title, music.artist, music.album_title = title, artist, album
         if art_url:
             # Windows descarga la carátula por su cuenta, del mismo CDN público.
-            updater.thumbnail = self._stream_ref.create_from_uri(self._uri(art_url))
+            # Una URL que no acepta (o un fallo de WinRT) deja la pista sin
+            # carátula, pero con su título y su artista.
+            try:
+                updater.thumbnail = self._stream_ref.create_from_uri(self._uri(art_url))
+            except Exception as exc:  # noqa: BLE001 - WinRT lanza tipos variados
+                log.warning("carátula no válida para los controles de Windows (%s): %s", art_url, exc)
         updater.update()
         self._smtc.is_enabled = True
 

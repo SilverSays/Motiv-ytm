@@ -35,6 +35,7 @@ class FakeYtdlp:
         self.calls = []                   # (video_id, cookies)
         self.next_version = next_version
         self.update_rc = 0
+        self.update_stderr = "ERROR: update failed"
         self.update_writes = None         # lo que deja -U en el .exe (None: la versión nueva)
         self.updates = 0
         self.by_version = {}              # versión -> {video_id: resultado}
@@ -53,7 +54,7 @@ class FakeYtdlp:
                 self.exe.write_text(self.update_writes)
             elif self.update_rc == 0:
                 self.exe.write_text(self.next_version)
-            return RunResult(self.update_rc, stderr="" if self.update_rc == 0 else "ERROR: update failed")
+            return RunResult(self.update_rc, stderr="" if self.update_rc == 0 else self.update_stderr)
         video_id = args[-1].split("v=")[-1]
         cookies = "--cookies" in args
         self.calls.append((video_id, cookies))
@@ -307,6 +308,90 @@ def test_up_to_date_when_release_matches(env):
     env.mgr._latest_tag = lambda: "2026.01.01"
     assert env.mgr.update("manual").status is UpdateStatus.UP_TO_DATE
     assert env.fake.updates == 0
+
+
+def test_concurrent_update_rechecks_cooldown_once_it_gets_its_turn(env):
+    """Dos actualizaciones a la vez: la que esperaba su turno no repite yt-dlp -U."""
+    env.db.set_setting("last_update_timestamp", env.clock.now - 25 * 3600)
+    enter = env.mgr._enter_update
+
+    def other_update_finished_meanwhile(drain_timeout):
+        enter(drain_timeout)
+        env.db.set_setting("last_update_timestamp", env.clock.now)
+
+    env.mgr._enter_update = other_update_finished_meanwhile
+    assert env.mgr.update("proactive").status is UpdateStatus.SKIPPED_COOLDOWN
+    assert env.fake.updates == 0
+    assert not env.mgr._exclusive                  # la exclusividad se devolvió
+    del env.mgr._enter_update
+    assert env.mgr.update("manual").status is UpdateStatus.UPDATED
+
+
+def test_update_without_network_does_not_burn_the_cooldown(env):
+    before = env.clock.now - 25 * 3600
+    env.db.set_setting("last_update_timestamp", before)
+    env.fake.update_rc = 1
+    env.fake.update_stderr = DNS
+    assert env.mgr.update("proactive").status is UpdateStatus.FAILED
+    assert env.db.get_float("last_update_timestamp") == before
+    # Vuelve la red: la siguiente llamada lo intenta, sin esperar 24 h.
+    env.fake.update_rc = 0
+    assert env.mgr.update("proactive").status is UpdateStatus.UPDATED
+    assert env.fake.updates == 2
+    assert env.db.get_float("last_update_timestamp") == env.clock.now
+
+
+def test_update_that_reached_the_server_starts_the_cooldown_even_if_it_failed(env):
+    env.db.set_setting("last_update_timestamp", env.clock.now - 25 * 3600)
+    env.fake.update_rc = 1                         # error que no es de red
+    assert env.mgr.update("proactive").status is UpdateStatus.FAILED
+    assert env.db.get_float("last_update_timestamp") == env.clock.now
+    assert env.mgr.update("proactive").status is UpdateStatus.SKIPPED_COOLDOWN
+
+
+def test_conclusive_answers_without_running_the_update_start_the_cooldown(env):
+    env.db.set_setting("last_update_timestamp", env.clock.now - 25 * 3600)
+    env.mgr._latest_tag = lambda: "2026.01.01"
+    assert env.mgr.update("proactive").status is UpdateStatus.UP_TO_DATE
+    assert env.db.get_float("last_update_timestamp") == env.clock.now
+
+
+def test_a_backup_that_cannot_be_made_does_not_burn_the_cooldown(env, monkeypatch):
+    before = env.clock.now - 25 * 3600
+    env.db.set_setting("last_update_timestamp", before)
+    monkeypatch.setattr(env.mgr, "_make_backup", lambda old_version: "disco lleno")
+    assert env.mgr.update("proactive").status is UpdateStatus.FAILED
+    assert env.fake.updates == 0
+    assert env.db.get_float("last_update_timestamp") == before
+
+
+def test_a_reaper_still_alive_after_waiting_is_logged(env, caplog):
+    class StuckReaper:
+        joined = None
+
+        def join(self, timeout=None):
+            self.joined = timeout
+
+        def is_alive(self):
+            return True
+
+    stuck = StuckReaper()
+    env.mgr._reapers = [stuck]
+    with caplog.at_level("WARNING", logger="ytmn.extractor"):
+        env.mgr._hold_warm()
+    env.mgr._release_warm()
+    assert stuck.joined == 35
+    assert any("siguen saliendo" in r.getMessage() for r in caplog.records)
+
+
+def test_reapers_that_finished_leave_no_warning(env, caplog):
+    done = threading.Thread(target=lambda: None)
+    done.start()
+    env.mgr._reapers = [done]
+    with caplog.at_level("WARNING", logger="ytmn.extractor"):
+        env.mgr._hold_warm()
+    env.mgr._release_warm()
+    assert not any("siguen saliendo" in r.getMessage() for r in caplog.records)
 
 
 def test_prefetch_respects_local_hourly_limit(env):

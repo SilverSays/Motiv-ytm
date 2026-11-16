@@ -2106,9 +2106,12 @@ class MainWindow(QMainWindow):
         if entry is not None:
             fetched_at, payload = entry
             if payload is not None:
-                self._show_lyrics(Lyrics.from_json(payload))
-                return
-            if time.time() - fetched_at < config.LYRICS_NEGATIVE_CACHE_S:
+                cached = Lyrics.from_json(payload)
+                if not cached.empty:
+                    self._show_lyrics(cached)
+                    return
+                # Guardada pero ilegible: se busca de nuevo.
+            elif time.time() - fetched_at < config.LYRICS_NEGATIVE_CACHE_S:
                 self._lyrics_message("Sin letra disponible para esta canción.")
                 return
         self._lyrics_message("Buscando letra…")

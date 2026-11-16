@@ -9,6 +9,7 @@ solo necesita refrescar sus modelos al recibir la señal de fin de sincronizaci�
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -145,6 +146,30 @@ class Playlist:
         return is_local_playlist(self.playlist_id)
 
 
+# Alta o enriquecimiento de una pista. Un dato vacío (o el título de relleno
+# de la sincronización) nunca pisa uno que ya se conocía; la carátula que ya
+# había se conserva. No toca ``unavailable_since``: eso lo decide el extractor.
+_UPSERT_TRACK_SQL = (
+    "INSERT INTO tracks (video_id, title, artists, album, duration_s, thumb_url) "
+    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(video_id) DO UPDATE SET "
+    "title=CASE WHEN TRIM(excluded.title) IN ('', '(sin título)') THEN tracks.title "
+    "ELSE excluded.title END, "
+    "artists=COALESCE(NULLIF(excluded.artists, ''), tracks.artists), "
+    "album=COALESCE(NULLIF(excluded.album, ''), tracks.album), "
+    "duration_s=COALESCE(excluded.duration_s, tracks.duration_s), "
+    "thumb_url=COALESCE(NULLIF(tracks.thumb_url, ''), excluded.thumb_url)"
+)
+
+
+def _track_params(track: Track) -> tuple:
+    return (track.video_id, track.title, track.artists, track.album, track.duration_s, track.thumb_url)
+
+
+def _like_prefix(prefix: str) -> str:
+    """Patrón LIKE (con barra invertida como escape) para las claves que empiezan por ``prefix``."""
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 # Las listas creadas en la app viven solo en esta base: su id lleva este
 # prefijo y la sincronización con la cuenta nunca las toca.
 LOCAL_PREFIX = "local:"
@@ -232,14 +257,31 @@ class Database:
             )
 
     def get_float(self, key: str, default: float = 0.0) -> float:
+        """El ajuste como número finito; ``nan``, ``inf`` o basura dan ``default``."""
         raw = self.get_setting(key)
-        try:
-            return float(raw) if raw is not None else default
-        except ValueError:
+        if raw is None:
             return default
+        try:
+            value = float(raw)
+        except (ValueError, OverflowError):
+            return default
+        return value if math.isfinite(value) else default
 
     def get_int(self, key: str, default: int = 0) -> int:
-        return int(self.get_float(key, float(default)))
+        """El ajuste como entero. Un entero escrito tal cual se lee exacto
+        (sin pasar por ``float``, que redondea a partir de 2**53)."""
+        raw = self.get_setting(key)
+        if raw is None:
+            return default
+        try:
+            return int(raw.strip())
+        except ValueError:
+            pass
+        try:
+            value = float(raw)
+        except (ValueError, OverflowError):
+            return default
+        return int(value) if math.isfinite(value) else default
 
     def get_bool(self, key: str, default: bool = False) -> bool:
         raw = self.get_setting(key)
@@ -421,8 +463,9 @@ class Database:
                 "author, year, thumb_url) VALUES (?, ?, ?, ?, '', '', '', '')",
                 (playlist_id, title.strip() or "Lista sin nombre", first + 1, now),
             )
-        for track in tracks:
-            self.add_to_local_playlist(playlist_id, track)
+            # La lista y sus canciones, juntas o nada: un fallo a mitad no
+            # deja una lista a medio llenar.
+            self._append_tracks(c, playlist_id, tracks)
         return playlist_id
 
     def rename_playlist(self, playlist_id: str, title: str) -> None:
@@ -439,24 +482,42 @@ class Database:
 
     def add_to_local_playlist(self, playlist_id: str, track: Track) -> bool:
         """Añade la pista al final. ``False`` si ya estaba (o la lista no es local)."""
+        return self.add_tracks_to_local_playlist(playlist_id, [track]) == 1
+
+    def add_tracks_to_local_playlist(self, playlist_id: str, tracks: Iterable[Track]) -> int:
+        """Añade al final, en una sola transacción, las pistas que aún no
+        estén. Devuelve cuántas se añadieron (0 si la lista no es local)."""
         if not is_local_playlist(playlist_id):
-            return False
-        self.upsert_track(track)
+            return 0
         with self._tx() as c:
-            if c.execute(
-                "SELECT 1 FROM playlist_tracks WHERE playlist_id=? AND video_id=?",
-                (playlist_id, track.video_id),
-            ).fetchone():
-                return False
-            position = c.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM playlist_tracks WHERE playlist_id=?",
-                (playlist_id,),
-            ).fetchone()["p"]
-            c.execute(
-                "INSERT INTO playlist_tracks (playlist_id, position, video_id) VALUES (?, ?, ?)",
-                (playlist_id, position, track.video_id),
-            )
-        return True
+            return self._append_tracks(c, playlist_id, tracks)
+
+    @staticmethod
+    def _append_tracks(c: sqlite3.Connection, playlist_id: str, tracks: Iterable[Track]) -> int:
+        tracks = list(tracks)
+        if not tracks:
+            return 0
+        c.executemany(_UPSERT_TRACK_SQL, [_track_params(t) for t in tracks])
+        present = {
+            r["video_id"]
+            for r in c.execute("SELECT video_id FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
+        }
+        fresh: list[str] = []
+        for track in tracks:
+            if track.video_id not in present:
+                present.add(track.video_id)
+                fresh.append(track.video_id)
+        if not fresh:
+            return 0
+        start = c.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM playlist_tracks WHERE playlist_id=?",
+            (playlist_id,),
+        ).fetchone()["p"]
+        c.executemany(
+            "INSERT INTO playlist_tracks (playlist_id, position, video_id) VALUES (?, ?, ?)",
+            [(playlist_id, start + i, vid) for i, vid in enumerate(fresh)],
+        )
+        return len(fresh)
 
     def remove_from_local_playlist(self, playlist_id: str, video_id: str) -> bool:
         if not is_local_playlist(playlist_id):
@@ -525,15 +586,10 @@ class Database:
         return self._track(row) if row else None
 
     def upsert_track(self, track: Track) -> None:
-        """Registra una pista fuera de la biblioteca (p. ej. un resultado de búsqueda)."""
+        """Registra una pista fuera de la biblioteca (p. ej. un resultado de
+        búsqueda) o completa la que ya había con los datos que traiga."""
         with self._tx() as c:
-            c.execute(
-                "INSERT INTO tracks (video_id, title, artists, album, duration_s, thumb_url) "
-                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(video_id) DO UPDATE SET "
-                "thumb_url=COALESCE(NULLIF(tracks.thumb_url, ''), excluded.thumb_url)",
-                (track.video_id, track.title, track.artists, track.album, track.duration_s,
-                 track.thumb_url),
-            )
+            c.execute(_UPSERT_TRACK_SQL, _track_params(track))
 
     @staticmethod
     def _track(r: sqlite3.Row) -> Track:
@@ -688,6 +744,19 @@ class Database:
                 "INSERT OR REPLACE INTO discover_cache (key, fetched_at, payload) VALUES (?, ?, ?)",
                 (key, time.time() if now is None else now, payload),
             )
+
+    def purge_discover_cache(self, max_age_by_prefix: dict[str, float], now: Optional[float] = None) -> int:
+        """Borra las entradas de cada prefijo más viejas que su plazo. Las
+        claves que no empiezan por ninguno (la del inicio) no se tocan."""
+        now = time.time() if now is None else now
+        removed = 0
+        with self._tx() as c:
+            for prefix, max_age in max_age_by_prefix.items():
+                removed += c.execute(
+                    "DELETE FROM discover_cache WHERE key LIKE ? ESCAPE '\\' AND fetched_at < ?",
+                    (_like_prefix(prefix), now - max_age),
+                ).rowcount
+        return removed
 
     # -- registro de resoluciones (límite de tasa y diagnóstico) ----------
     def log_resolve(

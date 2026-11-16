@@ -7,6 +7,11 @@
   versión, sin cookies) y con ``--no-config`` para no heredar ajustes ajenos.
 * El IPC usa ``QLocalSocket`` (tubería con nombre en Windows, socket Unix en
   el resto): todo es asíncrono en el hilo de la GUI, sin hilos bloqueantes.
+* Si la tubería se corta y ``mpv`` sigue vivo, se vuelve a conectar (y a
+  observar sus propiedades) sin relanzarlo: la música no se interrumpe.
+* Cada ``loadfile`` lleva una ficha de quien lo pide; la respuesta de mpv
+  (``load_acked``) la devuelve con el ``playlist_entry_id`` que le asignó, para
+  que los eventos de una carga anterior no se confundan con los de esta.
 """
 
 from __future__ import annotations
@@ -44,6 +49,10 @@ class MpvPlayer(QObject):
     duration_changed = Signal(float)
     pause_changed = Signal(bool)
     file_started = Signal(int)            # playlist_entry_id
+    # Respuesta a ``load``: ficha que se pasó, playlist_entry_id que asignó mpv
+    # (0 si es una versión que no lo dice) y si aceptó la orden.
+    load_acked = Signal(int, int, bool)
+    reconnected = Signal()                # la tubería se cortó y se recuperó con mpv vivo
     file_loaded = Signal()
     file_ended = Signal(int, str, str)    # playlist_entry_id, reason, file_error
     media_key = Signal(str)               # "next" | "prev" (teclas multimedia de Windows)
@@ -68,6 +77,9 @@ class MpvPlayer(QObject):
         self._request_id = 0
         self._connect_attempts = 0
         self._connected = False
+        self._reconnecting = False
+        self._dropped = 0                 # órdenes descartadas por falta de conexión
+        self._pending_loads: dict[int, int] = {}   # request_id de loadfile -> ficha
         self._shutting_down = False
         # Tras ``shutdown`` (cierre de la app) ya no se relanza nunca: ni por
         # un reinicio pendiente tras un fallo, ni por una llamada a ``start``.
@@ -128,6 +140,7 @@ class MpvPlayer(QObject):
         proc.errorOccurred.connect(self._on_proc_error)
         self._proc = proc
         self._connect_attempts = 0
+        self._reconnecting = False
         proc.start()
         self._retry.start(150)
 
@@ -151,15 +164,26 @@ class MpvPlayer(QObject):
         self._cleanup()
 
     def _cleanup(self) -> None:
-        self._connected = False
-        if self._sock is not None:
-            self._sock.abort()
-            self._sock.deleteLater()
-            self._sock = None
+        self._drop_socket()
+        self._reconnecting = False
         if self._proc is not None:
             self._proc.deleteLater()
             self._proc = None
+
+    def _drop_socket(self) -> None:
+        """Suelta la conexión actual (sin avisos: el corte lo pide la app)."""
+        self._connected = False
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            try:
+                sock.disconnected.disconnect(self._on_disconnected)
+                sock.readyRead.disconnect(self._on_ready_read)
+            except (RuntimeError, TypeError):
+                pass
+            sock.abort()
+            sock.deleteLater()
         self._buffer = b""
+        self._pending_loads.clear()       # sus respuestas ya no llegarán
 
     def _on_started(self) -> None:
         proc = self.sender()
@@ -198,12 +222,28 @@ class MpvPlayer(QObject):
             sock.readyRead.connect(self._on_ready_read)
             sock.disconnected.connect(self._on_disconnected)
             self._connected = True
-            self._on_connected()
+            if self._dropped:
+                log.info("conexión con mpv lista; se descartaron %d órdenes mientras faltaba", self._dropped)
+                self._dropped = 0
+            if self._reconnecting:
+                self._reconnecting = False
+                log.info("conexión IPC con mpv recuperada")
+                self._setup_session()
+                self.reconnected.emit()
+            else:
+                self._on_connected()
             return
         sock.abort()
         sock.deleteLater()
         if self._connect_attempts < 100:
             self._retry.start(100)
+        elif self._reconnecting:
+            # mpv sigue vivo pero ya no atiende: se cierra y el relanzamiento
+            # normal (``_on_finished``) restaura la pista.
+            log.error("no se pudo volver a conectar con mpv: se reinicia")
+            self._reconnecting = False
+            if self._proc is not None:
+                self._proc.kill()
         else:
             log.error("no se pudo conectar a la tubería de mpv: %s", self._pipe)
             self._shutting_down = True
@@ -214,6 +254,12 @@ class MpvPlayer(QObject):
     def _on_connected(self) -> None:
         self.last_time_pos = 0.0
         self.duration = 0.0
+        self._setup_session()
+        self.ready.emit()
+
+    def _setup_session(self) -> None:
+        """Lo que vive en la conexión y no en mpv: las propiedades observadas
+        (también al reconectar) y los atajos de las teclas multimedia."""
         self.command("observe_property", _OBS_TIME, "time-pos")
         self.command("observe_property", _OBS_DURATION, "duration")
         self.command("observe_property", _OBS_PAUSE, "pause")
@@ -226,14 +272,33 @@ class MpvPlayer(QObject):
             self.command("keybind", key, "cycle pause")
         self.command("keybind", "NEXT", "script-message ytmn-media next")
         self.command("keybind", "PREV", "script-message ytmn-media prev")
-        self.ready.emit()
 
     def _on_disconnected(self) -> None:
         self._connected = False
+        if self._shutting_down or self._closed:
+            return
+        proc = self._proc
+        if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
+            return                        # mpv murió: lo relanza ``_on_finished``
+        # La tubería se cortó con mpv vivo: se reconecta en vez de seguir
+        # descartando órdenes. Si en realidad está muriendo, ``_on_finished``
+        # para estos intentos.
+        log.warning("se cortó la conexión IPC con mpv, que sigue en marcha: reconectando")
+        self._drop_socket()
+        self._reconnecting = True
+        self._connect_attempts = 0
+        self._retry.start(100)
 
     # -- protocolo ----------------------------------------------------------
     def command(self, *args) -> int:
         if not self._connected or self._sock is None:
+            if not self._closed:
+                self._dropped += 1
+                name = args[0] if args else "?"
+                if self._dropped == 1:
+                    log.warning("mpv no está conectado: se descarta la orden «%s»", name)
+                else:
+                    log.debug("mpv no está conectado: se descarta la orden «%s»", name)
             return -1
         self._request_id += 1
         payload = json.dumps({"command": list(args), "request_id": self._request_id})
@@ -254,8 +319,25 @@ class MpvPlayer(QObject):
                 msg = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
                 continue
-            if isinstance(msg, dict) and "event" in msg:
+            if not isinstance(msg, dict):
+                continue
+            if "event" in msg:
                 self._on_event(msg)
+            elif "request_id" in msg:
+                self._on_reply(msg)
+
+    def _on_reply(self, msg: dict) -> None:
+        ok = msg.get("error") == "success"
+        token = self._pending_loads.pop(msg.get("request_id"), None)
+        if token is None:
+            if not ok:
+                log.debug("mpv rechazó una orden: %s", msg.get("error"))
+            return
+        data = msg.get("data")
+        entry = data.get("playlist_entry_id") if isinstance(data, dict) else None
+        if not ok:
+            log.warning("mpv rechazó la orden de carga: %s", msg.get("error"))
+        self.load_acked.emit(token, entry if type(entry) is int and entry > 0 else 0, ok)
 
     def _on_event(self, msg: dict) -> None:
         event = msg.get("event")
@@ -298,11 +380,16 @@ class MpvPlayer(QObject):
                 self.pause_changed.emit(data)
 
     # -- órdenes de alto nivel ---------------------------------------------
-    def load(self, url: str, user_agent: str = "") -> None:
+    def load(self, url: str, user_agent: str = "", token: int = 0) -> int:
+        """Carga ``url``. La respuesta de mpv llega por ``load_acked`` con
+        ``token``. Devuelve el ``request_id`` (-1 si no hay conexión)."""
         self.duration = 0.0
         if user_agent:
             self.command("set_property", "user-agent", user_agent)
-        self.command("loadfile", url, "replace")
+        request = self.command("loadfile", url, "replace")
+        if request > 0:
+            self._pending_loads[request] = token
+        return request
 
     def set_media_controls(self, enabled: bool) -> None:
         """``False`` cuando la app publica su propia sesión multimedia (con
@@ -313,10 +400,9 @@ class MpvPlayer(QObject):
     def _apply_media_controls(self) -> None:
         # En marcha y no como argumento: un mpv antiguo que no conozca la
         # opción solo rechaza la orden; con el argumento no arrancaría.
-        if not self._media_controls:
-            self.command("set_property", "media-controls", "no")
-        elif self._connected:
-            self.command("set_property", "media-controls", "player")
+        if not self._connected:
+            return                        # se aplica al conectar (``_setup_session``)
+        self.command("set_property", "media-controls", "no" if not self._media_controls else "player")
 
     def set_media_title(self, title: str) -> None:
         """Título que muestran los controles multimedia del sistema."""

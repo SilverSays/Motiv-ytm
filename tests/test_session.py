@@ -1,6 +1,7 @@
 """Seguir donde se dejó: guardar la cola y el punto, y recuperarlos al abrir (sin red)."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -238,3 +239,62 @@ def test_al_cerrar_la_ventana_queda_guardado_el_punto(window, db, qapp):
     window.close()
     assert json.loads(db.get_setting(session.STATE_KEY))["position"] == 33
     assert [t.video_id for t in decode_queue(db.get_setting(session.QUEUE_KEY))[0]] == ["s0", "s1", "s2"]
+
+
+def test_las_filas_danadas_se_descartan_sin_perder_el_resto():
+    good = ["a", "Uno", "Ana", "Disco", 200, "http://x/a.jpg"]
+    raw = json.dumps({"v": 1, "order": [3, 0, 2, 1, 4], "tracks": [
+        good,
+        [None, "Fantasma", "", "", 10, ""],        # sin videoId: daría una pista "None"
+        ["c", None, "", "", 10, ""],               # sin título
+        ["d", "Cuatro", None, None, None, None],    # vacíos admitidos
+        ["e", 5, "", "", 10, ""],                  # título que no es texto
+    ]})
+    tracks, order = decode_queue(raw)
+    assert [t.video_id for t in tracks] == ["a", "d"]
+    assert tracks[1] == Track("d", "Cuatro", "", "", None, thumb_url="")
+    assert order == [1, 0]                     # el aleatorio se conserva para las que quedan
+
+
+@pytest.mark.parametrize("row", [
+    [" ", "Título", "", "", 1, ""],
+    ["a", "", "", "", 1, ""],
+    ["a", "T", 3, "", 1, ""],
+    ["a", "T", "", ["x"], 1, ""],
+    ["a", "T", "", "", 1, {"url": "x"}],
+    {"video_id": "a"},
+    "a",
+    ["a", "T", "", "", 1],
+])
+def test_una_fila_con_tipos_inesperados_no_crea_pista(row):
+    assert decode_queue(json.dumps({"v": 1, "tracks": [row]})) is None
+
+
+def test_una_duracion_rara_no_tira_la_pista():
+    for duration in (True, -5, 3.5, "200"):
+        raw = json.dumps({"v": 1, "tracks": [["a", "Uno", "", "", duration, ""]]})
+        assert decode_queue(raw)[0][0].duration_s is None
+
+
+def test_tracks_que_no_es_lista_no_se_recupera():
+    assert decode_queue('{"v":1,"tracks":{"a":1}}') is None
+
+
+def test_un_fallo_al_guardar_el_punto_se_reintenta(env, keeper, monkeypatch):
+    start_playing(env, 2)
+    env.mpv.at(20)
+    real_set = env.db.set_setting
+    failures = []
+
+    def flaky(key, value):
+        if key == session.STATE_KEY and not failures:
+            failures.append(value)
+            raise sqlite3.OperationalError("database is locked")
+        real_set(key, value)
+
+    monkeypatch.setattr(env.db, "set_setting", flaky)
+    keeper._save_state()                       # falla: no queda como guardado
+    assert failures and keeper._last_state != failures[0]
+    keeper._save_state()                       # el mismo estado se vuelve a escribir
+    assert env.db.get_setting(session.STATE_KEY) == failures[0]
+    assert keeper._last_state == failures[0]
