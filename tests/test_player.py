@@ -771,3 +771,59 @@ def test_a_stream_error_while_playing_comes_back_playing(env):
     assert env.mpv.pauses[-1] is False
     env.mpv.begin()
     assert env.player.state == PLAYING
+
+
+# ---------------------------------------------------------------------------
+# Aleatorio y orden lógico de la cola
+# ---------------------------------------------------------------------------
+def test_quitar_el_aleatorio_deja_lo_anadido_en_su_sitio_logico(env):
+    start_playing(env, 2)
+    env.player.set_shuffle(True)
+    extra_next, extra_end = Track("xn", "A continuación"), Track("xe", "Al final")
+    env.player.play_next(extra_next)
+    env.player.enqueue(extra_end)
+    order, pos = env.player.queue_snapshot()
+    assert order[pos + 1].video_id == "xn" and order[-1].video_id == "xe"
+    env.player.set_shuffle(False)
+    order, pos = env.player.queue_snapshot()
+    ids = [t.video_id for t in order]
+    # El orden de la lista, con «a continuación» tras la que suena y «a la cola» al final.
+    assert ids == ["v0", "v1", "v2", "xn", "v3", "v4", "v5", "xe"]
+    assert order[pos].video_id == "v2" and env.player.current_track().video_id == "v2"
+    assert sorted(ids) == sorted(set(ids))                    # ni duplicados ni omisiones
+
+
+def test_barajar_varias_veces_no_pierde_ni_repite_pistas(env):
+    start_playing(env)
+    env.player.play_next(Track("xa", "Colada"))
+    for i in range(4):
+        env.player.set_shuffle(True)
+        env.player.enqueue(Track(f"e{i}", "Encolada"))
+        env.player.set_shuffle(False)
+    ids = [t.video_id for t in env.player.queue_snapshot()[0]]
+    assert ids == ["v0", "xa", "v1", "v2", "v3", "v4", "v5", "e0", "e1", "e2", "e3"]
+    assert env.player.current_track().video_id == "v0"
+
+
+def test_sin_aleatorio_a_continuacion_sigue_igual(env):
+    start_playing(env, 1)
+    env.player.play_next(Track("xa", "Colada"))
+    env.player.set_shuffle(True)
+    env.player.set_shuffle(False)
+    ids = [t.video_id for t in env.player.queue_snapshot()[0]]
+    assert ids == ["v0", "v1", "xa", "v2", "v3", "v4", "v5"]
+
+
+# ---------------------------------------------------------------------------
+# Volumen guardado
+# ---------------------------------------------------------------------------
+def test_volumen_guardado_ignora_un_cero_y_valores_fuera_de_rango(db):
+    from ytm_native.playback.player import DEFAULT_VOLUME, saved_volume
+
+    assert saved_volume(db) == DEFAULT_VOLUME                 # nada guardado
+    db.set_setting("volume", 75)
+    assert saved_volume(db) == 75
+    db.set_setting("volume", 0)                               # versiones anteriores guardaban el silencio
+    assert saved_volume(db) == DEFAULT_VOLUME
+    db.set_setting("volume", 140)
+    assert saved_volume(db) == DEFAULT_VOLUME

@@ -18,11 +18,12 @@ from ytm_native.core.instance import SingleInstance
 from ytm_native.playback.extractor import ExtractorManager, probe_url
 from ytm_native.playback.media_controls import MediaControls
 from ytm_native.playback.mpv_ipc import MpvPlayer
-from ytm_native.playback.player import PlaybackController
+from ytm_native.playback.player import PlaybackController, saved_volume
 from ytm_native.services.sync import LibrarySync
 from ytm_native.ui import chrome
 from ytm_native.ui.art import track_art_url
 from ytm_native.ui.main_window import Bridge, MainWindow
+from ytm_native.ui.tray import MINIMIZED_ARG
 
 
 log = logging.getLogger("ytmn.app")
@@ -117,7 +118,7 @@ def build(app: QApplication) -> MainWindow:
         prewarm=True,
         url_probe=probe_url,
     )
-    mpv = MpvPlayer(volume=db.get_int("volume", 80))
+    mpv = MpvPlayer(volume=saved_volume(db))
     player = PlaybackController(db, extractor, mpv)
     sync = LibrarySync(db)
     window = MainWindow(db, extractor, mpv, player, sync, bridge)
@@ -131,6 +132,9 @@ def build(app: QApplication) -> MainWindow:
     # La ventana ya los cierra al cerrarse; esto cubre las salidas que no pasan
     # por ella (un ``quit`` de Qt, un error) y, al final, la salida de Python.
     stop = _child_stopper(mpv, extractor)
+    # Salir sin pasar por la ventana (cerrar sesión en Windows con la app en
+    # la bandeja) también guarda la sesión y cierra lo demás en orden.
+    app.aboutToQuit.connect(window.shutdown)
     app.aboutToQuit.connect(stop)
     atexit.register(stop)
     # Referencias vivas mientras exista la ventana.
@@ -149,12 +153,13 @@ def _child_stopper(mpv: MpvPlayer, extractor: ExtractorManager):
     return stop
 
 
-def _bring_to_front(window: MainWindow) -> None:
-    if window.isMinimized():
-        window.showNormal()
-    window.show()
-    window.raise_()
-    window.activateWindow()
+def show_initial(window: MainWindow, argv: list[str]) -> None:
+    """Con ``--minimized`` (el inicio con Windows) la app arranca en la
+    bandeja; si no hay bandeja, minimizada, para que se pueda encontrar."""
+    if MINIMIZED_ARG not in argv[1:]:
+        window.show()
+    elif not window.tray_ready():
+        window.showMinimized()
 
 
 def main() -> int:
@@ -169,8 +174,10 @@ def main() -> int:
     try:
         chrome.install(app)
         window = build(app)
-        instance.activated.connect(lambda: _bring_to_front(window))
-        window.show()
+        # Abrir la app otra vez (con esta en la bandeja o en el mini
+        # reproductor) devuelve la ventana principal al frente.
+        instance.activated.connect(window.bring_to_front)
+        show_initial(window, sys.argv)
         window.start()
         return app.exec()
     finally:

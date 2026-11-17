@@ -33,6 +33,13 @@ log = logging.getLogger("ytmn.mpv")
 
 _OBS_TIME, _OBS_DURATION, _OBS_PAUSE = 1, 2, 3
 
+# Volumen igualado entre canciones. ``loudnorm`` sigue la norma EBU R128 (el
+# mismo nivel de sonoridad para todo); ``dynaudnorm`` es más suave y adapta la
+# ganancia sobre la marcha.
+LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
+DYNAUDNORM = "dynaudnorm=f=150:g=15"
+NORMALIZERS = {"loudnorm": LOUDNORM, "dynaudnorm": DYNAUDNORM}
+
 
 def make_pipe_name(counter: int) -> str:
     name = f"ytmn-mpv-{os.getpid()}-{counter}"
@@ -68,6 +75,8 @@ class MpvPlayer(QObject):
         self._mpv_path = Path(mpv_path) if mpv_path else paths.mpv_exe()
         self._pre_args = list(pre_args or [])   # solo para pruebas (mpv simulado)
         self._volume = volume
+        self._audio_filter = ""           # filtro de audio vigente ("" = ninguno)
+        self._filter_request = -1
         self._media_controls = True       # mpv publica su propia sesión multimedia en Windows
         self._proc: Optional[QProcess] = None
         self._sock: Optional[QLocalSocket] = None
@@ -265,6 +274,8 @@ class MpvPlayer(QObject):
         self.command("observe_property", _OBS_PAUSE, "pause")
         if not self._media_controls:
             self._apply_media_controls()      # también tras relanzarse
+        if self._audio_filter:
+            self._apply_audio_filter()        # un mpv relanzado arranca sin filtros
         # mpv registra los controles multimedia de Windows (--media-controls).
         # Con los atajos por defecto desactivados hay que enlazar sus teclas:
         # pausa la gestiona mpv; siguiente/anterior se reenvían a la cola.
@@ -328,6 +339,11 @@ class MpvPlayer(QObject):
 
     def _on_reply(self, msg: dict) -> None:
         ok = msg.get("error") == "success"
+        if msg.get("request_id") == self._filter_request:
+            self._filter_request = -1
+            if not ok:
+                log.warning("mpv rechazó el filtro de audio «%s»: %s", self._audio_filter, msg.get("error"))
+            return
         token = self._pending_loads.pop(msg.get("request_id"), None)
         if token is None:
             if not ok:
@@ -417,6 +433,28 @@ class MpvPlayer(QObject):
     def seek(self, seconds: float) -> None:
         self.command("seek", float(seconds), "absolute")
 
+    @property
+    def volume(self) -> int:
+        return self._volume
+
     def set_volume(self, volume: int) -> None:
         self._volume = max(0, min(100, int(volume)))
         self.command("set_property", "volume", self._volume)
+
+    @property
+    def audio_filter(self) -> str:
+        return self._audio_filter
+
+    def set_normalization(self, mode: Optional[str]) -> None:
+        """Iguala el volumen entre canciones (``"loudnorm"`` o ``"dynaudnorm"``)
+        o lo deja como viene (``None``). Se aplica en marcha, sin relanzar mpv
+        ni cortar la pista; si mpv aún no está conectado, al conectar."""
+        wanted = NORMALIZERS.get(mode or "", "")
+        if wanted == self._audio_filter:
+            return
+        self._audio_filter = wanted
+        self._apply_audio_filter()
+
+    def _apply_audio_filter(self) -> None:
+        if self._connected:
+            self._filter_request = self.command("set_property", "af", self._audio_filter)

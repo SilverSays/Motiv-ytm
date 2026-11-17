@@ -33,7 +33,7 @@ LINEA_CLARA = "#b4c6ca"  # borde de lo que flota sobre un panel
 BANDA_NEUTRA = "#d3e6e4" # banda de cabecera cuando no hay carátula: menta plateada
 PAPEL = "#18262e"        # tinta principal (14,4:1 sobre PANEL)
 HUMO = "#4a5d66"         # texto secundario (6,4:1 sobre PANEL)
-TENUE = "#5a6e76"        # terciario: cabeceras, notas (5,0:1 sobre PANEL)
+TENUE = "#52666e"        # terciario: cabeceras, notas, desactivado (5,6:1 sobre PANEL, 4,5:1 sobre RELIEVE_2)
 PAPEL_SUAVE = "#2d3e47"  # texto largo de lectura continua
 CREMA = "#0b7470"        # tinta por defecto (sin carátula): aguamarina honda
 AVISO = "#b8403a"        # errores y bloqueos
@@ -60,6 +60,38 @@ R_CONTROL = 8    # filas, campos, botones rectos
 R_COVER = 6      # carátulas grandes
 R_THUMB = 5      # carátulas de fila
 GUTTER = 8       # separación entre paneles (rejilla de 4/8)
+
+MIN_TEXT_CONTRAST = 4.5  # WCAG AA para texto normal
+
+
+def _linear(channel: float) -> float:
+    return channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+
+
+def relative_luminance(color: "str | QColor") -> float:
+    """Luminancia relativa de WCAG 2 (0 = negro, 1 = blanco)."""
+    c = QColor(color)
+    return 0.2126 * _linear(c.redF()) + 0.7152 * _linear(c.greenF()) + 0.0722 * _linear(c.blueF())
+
+
+def composite(fg: "str | QColor", bg: "str | QColor") -> QColor:
+    """El color que se ve al pintar ``fg`` (con su transparencia) sobre ``bg`` opaco."""
+    top, base = QColor(fg), QColor(bg)
+    a = top.alphaF()
+    return QColor.fromRgbF(
+        top.redF() * a + base.redF() * (1 - a),
+        top.greenF() * a + base.greenF() * (1 - a),
+        top.blueF() * a + base.blueF() * (1 - a),
+    )
+
+
+def contrast_ratio(fg: "str | QColor", bg: "str | QColor") -> float:
+    """Contraste WCAG entre un texto (que puede ser translúcido) y su fondo opaco."""
+    a = relative_luminance(composite(fg, bg))
+    b = relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
 
 UI_FAMILIES = ["Bahnschrift", "Segoe UI Variable Text", "Segoe UI"]
 DISPLAY_FAMILIES = ["Bahnschrift Light SemiCondensed", "Bahnschrift", "Segoe UI Variable Display"]
@@ -255,6 +287,9 @@ GLYPHS = {
     "chevron_down": ("\uE70D", "▾"),
     "chevron_up": ("\uE70E", "▴"),
     "save": ("\uE74E", "↓"),
+    "mini": ("\uEE49", "⧉"),
+    "window": ("\uE8A7", "↗"),
+    "sleep": ("\uE708", "☾"),
 }
 
 _icon_family: str | None = None

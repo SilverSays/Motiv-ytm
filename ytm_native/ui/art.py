@@ -10,18 +10,24 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import math
+import os
 import re
+import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QRectF, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 from ytm_native.core import paths
 from . import theme
+
+# Carátula del reproductor (la barra de abajo): el panel la usa de reserva.
+BAR_ART_PX = 160
 
 _SIZE_WH = re.compile(r"=w\d+-h\d+")
 _SIZE_S = re.compile(r"=s\d+")
@@ -85,9 +91,43 @@ def tint_from_image(image: QImage) -> Tint:
         return neutral_tint()
     hue = (math.atan2(best[2], best[1]) / math.tau) % 1.0
     sat = best[3] / best[0]
-    band = QColor.fromHslF(hue, min(0.50, max(0.26, sat * 0.6)), 0.86)
-    ink = QColor.fromHslF(hue, min(0.78, max(0.46, sat)), 0.33)
+    band = readable_band(hue, min(0.50, max(0.26, sat * 0.6)))
+    ink = readable_ink(hue, min(0.78, max(0.46, sat)))
     return Tint(band, ink)
+
+
+# Fondo más oscuro sobre el que se lee la tinta: la fila que suena seleccionada
+# (la tinta al 17 % sobre el panel). El texto de la banda es el más tenue que
+# se pinta encima de ella.
+INK_ROW_ALPHA = 0.17
+BAND_TEXT = QColor(24, 38, 46, round(0.80 * 255))
+
+
+def readable_ink(hue: float, sat: float, lightness: float = 0.33) -> QColor:
+    """Tinta honda del tono de la carátula que se lee con contraste AA sobre
+    el panel y sobre la fila que suena. Los amarillos, verdes y cianes son
+    mucho más luminosos que un azul con la misma luminosidad HSL: para ellos
+    se baja la luminosidad hasta llegar al contraste mínimo."""
+    panel = QColor(theme.PANEL)
+    while True:
+        ink = QColor.fromHslF(hue, sat, lightness)
+        tinted = QColor(ink)
+        tinted.setAlphaF(INK_ROW_ALPHA)
+        row = theme.composite(tinted, panel)
+        if lightness <= 0.12 or min(theme.contrast_ratio(ink, panel),
+                                    theme.contrast_ratio(ink, row)) >= theme.MIN_TEXT_CONTRAST:
+            return ink
+        lightness -= 0.01
+
+
+def readable_band(hue: float, sat: float, lightness: float = 0.86) -> QColor:
+    """Banda pastel sobre la que el texto más tenue de la cabecera se lee con
+    contraste AA; si no llega, se aclara."""
+    while True:
+        band = QColor.fromHslF(hue, sat, lightness)
+        if lightness >= 0.97 or theme.contrast_ratio(BAND_TEXT, band) >= theme.MIN_TEXT_CONTRAST:
+            return band
+        lightness += 0.01
 
 
 def square_pixmap(image: QImage, size: int, radius: float, dpr: float = 1.0) -> QPixmap:
@@ -110,8 +150,22 @@ def square_pixmap(image: QImage, size: int, radius: float, dpr: float = 1.0) -> 
     return out
 
 
+_PLACEHOLDERS: dict[tuple, QPixmap] = {}
+
+
 def placeholder_pixmap(size: int, radius: float, dpr: float = 1.0) -> QPixmap:
-    """Funda sin carátula: un disco esquemático sobre el color de relieve."""
+    """Funda sin carátula: un disco esquemático sobre el color de relieve.
+
+    Se dibuja una vez por tamaño: las filas sin carátula la piden en cada
+    repintado y crear una imagen nueva cada vez se notaba al desplazarse."""
+    key = (size, round(radius, 2), round(dpr, 2))
+    cached = _PLACEHOLDERS.get(key)
+    if cached is None:
+        cached = _PLACEHOLDERS[key] = _draw_placeholder(size, radius, dpr)
+    return cached
+
+
+def _draw_placeholder(size: int, radius: float, dpr: float) -> QPixmap:
     px = max(1, round(size * dpr))
     out = QPixmap(px, px)
     out.fill(Qt.GlobalColor.transparent)
@@ -135,6 +189,14 @@ class ArtLoader(QObject):
 
     MAX_PARALLEL = 6
     MEMORY_IMAGES = 400
+    # Carátulas que se leen del disco y se escalan dentro de un mismo pintado.
+    # Al desplazar deprisa una lista larga entran decenas de filas de golpe:
+    # el resto se lee en los fotogramas siguientes y no se pierde ninguno.
+    DECODES_PER_FRAME = 4
+    # La caché en disco no crece sin fin: pasado este tamaño se borran las
+    # carátulas que hace más tiempo que no se usan.
+    DISK_LIMIT_BYTES = 200 * 1024 * 1024
+    PRUNE_EVERY = 200      # escrituras entre una poda y la siguiente
 
     def __init__(self, parent: Optional[QObject] = None, cache_dir: Optional[Path] = None):
         super().__init__(parent)
@@ -146,6 +208,16 @@ class ArtLoader(QObject):
         self._failed: set[str] = set()
         self._active: dict[str, QNetworkReply] = {}
         self._queue: list[str] = []
+        self._budget = self.DECODES_PER_FRAME
+        self._deferred: "OrderedDict[str, None]" = OrderedDict()
+        self._frame = QTimer(self)
+        self._frame.setSingleShot(True)
+        self._frame.setInterval(0)
+        self._frame.timeout.connect(self._next_frame)
+        self._writes = 0
+        self._pruning = False
+        # Una poda al poco de arrancar, fuera del camino del primer pintado.
+        QTimer.singleShot(8000, self, self.prune_disk)
 
     # -- consulta -----------------------------------------------------------
     def image(self, url: str) -> Optional[QImage]:
@@ -161,6 +233,7 @@ class ArtLoader(QObject):
             image = QImage(str(path))
             if not image.isNull():
                 self._remember(url, image)
+                self._touch(path)
                 return image
         self._enqueue(url)
         return None
@@ -169,17 +242,45 @@ class ArtLoader(QObject):
         """¿Ya se intentó descargar y no hay imagen? (no se reintenta en esta sesión)."""
         return url in self._failed
 
-    def pixmap(self, url: str, size: int, radius: float = 3.0, dpr: float = 1.0) -> Optional[QPixmap]:
+    def pixmap(self, url: str, size: int, radius: float = 3.0, dpr: float = 1.0,
+               lazy: bool = False) -> Optional[QPixmap]:
+        """``lazy``: para las filas de una lista. Si la imagen no está ya en
+        memoria y este fotograma ya gastó su cupo de lecturas, devuelve None y
+        avisa con ``loaded`` cuando la tenga lista (en el fotograma siguiente)."""
         key = (url, size, radius, round(dpr, 2))
         cached = self._pixmaps.get(key)
         if cached is not None:
             return cached
+        if lazy and url and url not in self._images and url not in self._failed:
+            if self._budget <= 0:
+                self._deferred[url] = None
+                self._frame.start()
+                return None
+            self._budget -= 1
+            self._frame.start()
         image = self.image(url)
         if image is None:
             return None
         pixmap = square_pixmap(image, size, radius, dpr)
         self._pixmaps[key] = pixmap
         return pixmap
+
+    def _next_frame(self) -> None:
+        """Nuevo cupo de lecturas; las aplazadas se leen ahora y avisan a quien
+        las pidió para que vuelva a pintar su fila."""
+        self._budget = self.DECODES_PER_FRAME
+        ready = []
+        while self._deferred and self._budget > 0:
+            url, _ = self._deferred.popitem(last=False)
+            self._budget -= 1
+            if self.image(url) is not None:
+                ready.append(url)
+        for url in ready:
+            self.loaded.emit(url)
+        if self._deferred:
+            self._frame.start()
+        else:
+            self._budget = self.DECODES_PER_FRAME
 
     def tint(self, url: str) -> Optional[Tint]:
         cached = self._tints.get(url)
@@ -229,11 +330,88 @@ class ArtLoader(QObject):
             self._failed.add(url)
         else:
             self._remember(url, image)
-            try:
-                path = self._path(url)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-            except OSError:
-                pass
+            self._store(url, data)
         self.loaded.emit(url)
         self._pump()
+
+    # -- caché en disco -----------------------------------------------------
+    def _store(self, url: str, data: bytes) -> None:
+        """Escritura atómica: se escribe aparte y se renombra encima. Un
+        cierre a medias deja, como mucho, un temporal huérfano (lo borra la
+        poda), nunca una carátula truncada que luego se leería rota."""
+        path = self._path(url)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        self._writes += 1
+        if self._writes % self.PRUNE_EVERY == 0:
+            self.prune_disk()
+
+    @staticmethod
+    def _touch(path: Path) -> None:
+        """Marca la carátula como usada: la poda empieza por las más olvidadas."""
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+
+    def prune_disk(self) -> None:
+        """Poda la caché en disco en un hilo aparte (recorre miles de archivos)."""
+        if self._pruning or not self._dir.is_dir():
+            return
+        self._pruning = True
+        directory, limit = self._dir, self.DISK_LIMIT_BYTES
+
+        def work() -> None:
+            try:
+                prune_cache(directory, limit)
+            finally:
+                self._pruning = False
+
+        threading.Thread(target=work, name="poda-caratulas", daemon=True).start()
+
+
+def prune_cache(directory: Path, limit_bytes: int, stale_tmp_s: float = 3600.0) -> int:
+    """Borra las carátulas usadas hace más tiempo hasta que la carpeta quepa en
+    ``limit_bytes``, y los temporales que llevan una hora huérfanos. Devuelve
+    cuántos archivos borró."""
+    entries = []
+    removed = 0
+    now = time.time()
+    for path in directory.glob("*/*"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.name.endswith(".tmp"):
+            if now - stat.st_mtime > stale_tmp_s:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            continue
+        entries.append((stat.st_mtime, stat.st_size, path))
+    total = sum(size for _, size, _ in entries)
+    if total <= limit_bytes:
+        return removed
+    entries.sort()
+    for _, size, path in entries:
+        if total <= limit_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+    return removed

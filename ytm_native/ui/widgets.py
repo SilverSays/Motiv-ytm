@@ -112,22 +112,79 @@ class TrackModel(QAbstractTableModel):
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._tracks: list[Track] = []
+        self._rows: dict[str, list[int]] = {}      # videoId -> filas donde está
         self._current_id: Optional[str] = None
         self._notes: Optional[dict[str, str]] = None
         self._note_header = ""
 
+    # Pasado este número de filas distintas, cambiar la lista por partes deja
+    # de compensar frente a empezar de cero (otra lista, no la misma retocada).
+    DIFF_LIMIT = 64
+
     def set_tracks(self, tracks: list[Track], notes: Optional[dict[str, str]] = None,
                    note_header: str = "") -> None:
-        """``notes``: texto por ``videoId`` que ocupa la columna del álbum."""
+        """``notes``: texto por ``videoId`` que ocupa la columna del álbum.
+
+        Si la lista nueva es la de antes con pocos cambios (la cola tras
+        «Reproducir a continuación», una sincronización que añade dos
+        canciones), solo se insertan o quitan esas filas: la vista conserva el
+        desplazamiento y la selección y no vuelve a hacer aparecer la lista."""
         header = note_header if notes is not None else ""
         changed = header != self._note_header
-        self.beginResetModel()
-        self._tracks = list(tracks)
+        tracks = list(tracks)
+        if changed or not self._patch(tracks):
+            self.beginResetModel()
+            self._tracks = tracks
+            self._index_rows()
+            self.endResetModel()
         self._notes = notes
         self._note_header = header
-        self.endResetModel()
         if changed:
             self.headerDataChanged.emit(Qt.Orientation.Horizontal, 1, 1)
+        elif notes is not None and self._tracks:
+            self.dataChanged.emit(self.index(0, 1), self.index(len(self._tracks) - 1, 1))
+
+    def _patch(self, new: list[Track]) -> bool:
+        """Cambia solo el tramo distinto entre la lista actual y ``new``.
+        Devuelve False si no se parecen lo bastante (o si no hay lista)."""
+        old = self._tracks
+        if not old or not new:
+            return False
+        old_ids = [t.video_id for t in old]
+        new_ids = [t.video_id for t in new]
+        head = 0
+        limit = min(len(old_ids), len(new_ids))
+        while head < limit and old_ids[head] == new_ids[head]:
+            head += 1
+        tail = 0
+        while (tail < limit - head
+               and old_ids[len(old_ids) - 1 - tail] == new_ids[len(new_ids) - 1 - tail]):
+            tail += 1
+        removed = len(old_ids) - head - tail
+        added = len(new_ids) - head - tail
+        if removed + added > self.DIFF_LIMIT or (removed and removed >= len(old_ids) // 2 + 1):
+            return False
+        if removed:
+            self.beginRemoveRows(QModelIndex(), head, head + removed - 1)
+            del self._tracks[head:head + removed]
+            self.endRemoveRows()
+        if added:
+            self.beginInsertRows(QModelIndex(), head, head + added - 1)
+            self._tracks[head:head] = new[head:head + added]
+            self.endInsertRows()
+        # Las filas que siguen ahí pueden traer datos nuevos (un título
+        # corregido, la marca de no disponible): se toman y se repintan.
+        self._tracks = list(new)
+        self._index_rows()
+        if self._tracks:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self._tracks) - 1, len(self.HEADERS) - 1))
+        return True
+
+    def _index_rows(self) -> None:
+        rows: dict[str, list[int]] = {}
+        for row, track in enumerate(self._tracks):
+            rows.setdefault(track.video_id, []).append(row)
+        self._rows = rows
 
     def tracks(self) -> list[Track]:
         return list(self._tracks)
@@ -135,25 +192,25 @@ class TrackModel(QAbstractTableModel):
     def track_at(self, row: int) -> Track:
         return self._tracks[row]
 
+    def rows_of(self, video_id: Optional[str]) -> list[int]:
+        return list(self._rows.get(video_id, ())) if video_id else []
+
     def is_current(self, row: int) -> bool:
         return self._current_id is not None and self._tracks[row].video_id == self._current_id
 
     def set_current(self, video_id: Optional[str]) -> None:
-        if video_id != self._current_id:
-            self._current_id = video_id
-            self._repaint()
+        """Mueve la marca de lo que suena: solo se repintan la fila que la
+        pierde y la que la gana, no la tabla entera."""
+        if video_id == self._current_id:
+            return
+        previous, self._current_id = self._current_id, video_id
+        for row in sorted(set(self.rows_of(previous)) | set(self.rows_of(video_id))):
+            self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.HEADERS) - 1))
 
     def update_track(self, track: Track) -> None:
-        for row, existing in enumerate(self._tracks):
-            if existing.video_id == track.video_id:
-                self._tracks[row] = track
-        self._repaint()
-
-    def _repaint(self) -> None:
-        if self._tracks:
-            self.dataChanged.emit(
-                self.index(0, 0), self.index(len(self._tracks) - 1, len(self.HEADERS) - 1)
-            )
+        for row in self.rows_of(track.video_id):
+            self._tracks[row] = track
+            self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.HEADERS) - 1))
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._tracks)
@@ -295,6 +352,9 @@ class AccountDialog(QDialog):
         self.headers_edit = QPlainTextEdit()
         self.headers_edit.setPlaceholderText("Pega aquí las cabeceras de la petición…")
         self.headers_edit.setFixedHeight(96)
+        # Tab pasa al siguiente control: las cabeceras se pegan, no se teclean
+        # tabuladores a mano, y sin esto el foco quedaba atrapado en el campo.
+        self.headers_edit.setTabChangesFocus(True)
         lay.addWidget(self.headers_edit)
         save = QPushButton("Guardar cabeceras")
         save.clicked.connect(self._save_headers)

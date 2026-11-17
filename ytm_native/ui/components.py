@@ -57,7 +57,9 @@ from .motion import (
     EASE_IN_OUT,
     EASE_OUT,
     ENTER_MS,
+    FRAME_MS,
     REFLOW_MS,
+    SPIN_MS,
     REVEAL_MS,
     ROW_STAGGER,
     STAGGER_CAP,
@@ -168,6 +170,22 @@ def fade_visible(widget: QWidget, visible: bool, animate: bool = True) -> None:
         tween.to(0.0) if animate else tween.set(0.0)
 
 
+def window_settling(widget: QWidget) -> bool:
+    """¿La ventana está deslizando un panel o cambiando de vista?
+
+    Mientras tanto el ancho del contenido cambia en cada fotograma: lo que se
+    recoloca a mano (rejillas de tarjetas, cabecera, columnas) no debe
+    animarse ni recalcularse en cada paso, sino una vez al final."""
+    probe = getattr(widget.window(), "layout_settling", None)
+    return bool(probe()) if callable(probe) else False
+
+
+def window_sliding(widget: QWidget) -> bool:
+    """¿La ventana está deslizando un panel ahora mismo?"""
+    probe = getattr(widget.window(), "is_sliding", None)
+    return bool(probe()) if callable(probe) else False
+
+
 def _alpha(color: str | QColor, alpha: float) -> QColor:
     out = QColor(color)
     out.setAlphaF(max(0.0, min(1.0, alpha)))
@@ -257,12 +275,13 @@ class PillButton(_Pressable):
     PAD = 18
 
     def __init__(self, text: str, kind: str = "ghost", glyph: Optional[str] = None,
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None, tabular: bool = False):
         super().__init__(parent)
         self._kind = kind
         self._glyph = glyph
         weight = QFont.Weight.DemiBold if kind == "primary" else QFont.Weight.Medium
-        self._font = theme.ui_font(13, weight)
+        # Cifras de ancho fijo para lo que cuenta (una cuenta atrás no baila).
+        self._font = theme.ui_font(13, weight, tabular=tabular)
         self._icon_only = False
         # Cuánto texto se ve (1 = entero, 0 = solo el icono).
         self._label = Tween(self, 1.0, self._on_label, ms=REFLOW_MS, curve=EASE_IN_OUT, movement=True)
@@ -818,6 +837,9 @@ class CoverLabel(QWidget):
         self._display: Optional[float] = None    # tamaño de paso mientras se anima
         self._presence = 1.0
         self._held = False      # la imagen está de viaje: aquí no se pinta
+        self._waiting = False   # se sigue enseñando la anterior hasta que llegue la nueva
+        self._hold_for = ""     # la dirección por la que se esperó (una sola vez)
+        self._serial = 0
         self.setFixedSize(size + shadow, size + shadow)
         loader.loaded.connect(self._on_loaded)
 
@@ -889,8 +911,29 @@ class CoverLabel(QWidget):
         pixmap = self._loader.pixmap(self._url, self._size, self._corner(), dpr) if self._url else None
         return pixmap or placeholder_pixmap(self._size, self._corner(), dpr)
 
+    # Lo que se espera a la carátula nueva antes de dar paso a la funda vacía.
+    HOLD_MS = 1200
+
     def _swap(self) -> None:
-        new = self._resolve()
+        url = self._url
+        new_art = (self._loader.pixmap(url, self._size, self._corner(), self.devicePixelRatioF())
+                   if url else None)
+        pending = new_art is None and bool(url) and not self._loader.failed(url)
+        if pending and self._shown is not None and self._hold_for != url:
+            # La nueva aún viene de camino: la de antes sigue entera en vez de
+            # fundirse con la funda vacía y luego saltar a la buena (dos
+            # cambios seguidos se ven como un parpadeo). Si tarda, la funda.
+            self._hold_for = url
+            self._waiting = True
+            self._serial += 1
+            serial = self._serial
+            QTimer.singleShot(self.HOLD_MS, self, lambda: self._give_up(serial))
+            return
+        if pending and self._waiting:
+            return
+        self._waiting = False
+        self._serial += 1
+        new = new_art or placeholder_pixmap(self._size, self._corner(), self.devicePixelRatioF())
         if self._shown is not None and new.cacheKey() == self._shown.cacheKey():
             return
         self._previous = self._shown
@@ -907,9 +950,27 @@ class CoverLabel(QWidget):
                 self._echo.to(1.0)
         self.update()
 
+    def _give_up(self, serial: int) -> None:
+        if serial == self._serial and self._waiting:
+            self._waiting = False
+            self._swap()
+
     def _on_loaded(self, url: str) -> None:
         if url == self._url:
             self._swap()
+
+    def _refresh_resolution(self) -> None:
+        """La ventana pasó a una pantalla con otra escala: la misma imagen,
+        rehecha a la densidad nueva y sin fundido (no ha cambiado nada)."""
+        self._shown = self._resolve()
+        self._previous = None
+        self._fade.set(1.0)
+        self.update()
+
+    def event(self, event) -> bool:  # noqa: D401 - API de Qt
+        if event.type() == QEvent.Type.DevicePixelRatioChange:
+            self._refresh_resolution()
+        return super().event(event)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -1013,6 +1074,7 @@ class PlaylistBand(QWidget):
         self._searching = False
         self._color = Tween(self, QColor(neutral_tint().band), self._on_color, ms=FADE_MS + 60, curve=EASE)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._init_rings()
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(32, 28, 32, 26)
@@ -1289,14 +1351,65 @@ class PlaylistBand(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - API de Qt
         super().resizeEvent(event)
-        self._fit_width()
+        self._layout_rings()
+        # Con un panel deslizándose o al cambiar de vista, el ancho cambia en
+        # cada fotograma: animar cada paso haría competir decenas de tweens.
+        self._fit_width(animate=not window_settling(self))
 
-    def paintEvent(self, _event) -> None:  # noqa: N802 - API de Qt
-        # Color plano, sin degradados; solo las esquinas de arriba siguen al panel.
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        radius = float(theme.R_PANEL)
+    # -- aros de luz --------------------------------------------------------
+    # Dos anillos que salen por la esquina, con tramos de oro: la única
+    # decoración de la interfaz. Mientras suena música los tramos giran (el de
+    # fuera a SPIN_OUTER grados por segundo, el de dentro a SPIN_INNER) y los
+    # anillos respiran; la cadencia sigue el reloj de la pista (se para con
+    # ella y salta con ella al buscar), no un pulso inventado. En pausa
+    # frenan con EASE_OUT hasta quedarse quietos, y entonces no queda ningún
+    # temporizador en marcha.
+    RING_INNER, RING_OUTER = 0.55, 0.78     # radios, en altos de banda
+    RING_CENTER = (0.08, -0.05)              # el centro, fuera de la esquina
+    BREATH = 0.012                           # cuánto crece y mengua el radio
+    BREATH_S = 7.0                           # periodo de la respiración
+    SPIN_OUTER, SPIN_INNER = 14.0, 23.0      # grados por segundo (X e Y)
+    CADENCE = 0.22                           # cuánto acelera en lo alto de cada ciclo
+    CADENCE_S = 4.0                          # ciclo de la cadencia, en segundos de pista
+    ARC_OUTER, ARC_INNER = 24, 16            # largo de cada tramo de oro, en grados
+    REST_OUTER, REST_INNER = 214.0, 236.0    # dónde quedan en reposo
+    ARCS = 4                                 # tramos por anillo: siempre asoma alguno
+    RING_PEN = 1.5
+    GOLD_PEN = 3.0
+
+    def _init_rings(self) -> None:
+        self._playing = False
+        self._window_shown = True
+        self._angles = [self.REST_OUTER, self.REST_INNER]
+        self._breath = (0.0, 0.0)
+        self._breath_t = 0.0
+        self._level = 0.0                    # 0 quietos, 1 a toda velocidad
+        self._level_from = self._level_to = 0.0
+        self._ramp_at = 0
+        self._song_pos = 0.0
+        self._song_pos_at = 0
+        self._ring_clock = QElapsedTimer()
+        self._ring_clock.start()
+        self._last_tick = 0
+        self._ring_timer = QTimer(self)
+        self._ring_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._ring_timer.setInterval(FRAME_MS)
+        self._ring_timer.timeout.connect(self._ring_tick)
+        # Lo que no cambia de un fotograma a otro se prepara una vez.
+        self._pen_inner = QPen(QColor(255, 255, 255, 120), self.RING_PEN)
+        self._pen_outer = QPen(QColor(255, 255, 255, 170), self.RING_PEN)
+        self._pen_gold = QPen(QColor(theme.ORO), self.GOLD_PEN)
+        self._pen_gold.setCapStyle(Qt.PenCapStyle.RoundCap)
+        self._band_path = QPainterPath()
+        self._ring_center = QPointF()
+        self._radii = (0.0, 0.0)
+        self._rings_rect = QRect()
+        self._layout_rings()
+
+    def _layout_rings(self) -> None:
+        """Geometría de la banda y de los aros: solo cambia con el tamaño."""
         rect = QRectF(self.rect())
+        radius = float(theme.R_PANEL)
         path = QPainterPath()
         path.moveTo(rect.left(), rect.bottom())
         path.lineTo(rect.left(), rect.top() + radius)
@@ -1305,21 +1418,114 @@ class PlaylistBand(QWidget):
         path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + radius)
         path.lineTo(rect.right(), rect.bottom())
         path.closeSubpath()
-        painter.fillPath(path, QColor(self._color.value))
-        # Dos anillos de luz que salen por la esquina, con un tramo de oro: la
-        # única decoración de la interfaz, y por eso vive aquí, en la cabecera.
-        painter.setClipPath(path)
+        self._band_path = path
+        h = rect.height()
+        dx, dy = self.RING_CENTER
+        self._ring_center = QPointF(rect.right() + h * dx, rect.top() + h * dy)
+        self._radii = (h * self.RING_OUTER, h * self.RING_INNER)
+        # Lo único que se repinta en cada fotograma: el cuadro que encierra el
+        # anillo de fuera en su punto más grande, con el grosor del oro.
+        reach = self._radii[0] * (1 + self.BREATH) + self.GOLD_PEN + 2
+        left = math.floor(self._ring_center.x() - reach)
+        bottom = math.ceil(self._ring_center.y() + reach)
+        self._rings_rect = QRect(left, 0, self.width() - left, bottom).intersected(self.rect())
+
+    def rings_rect(self) -> QRect:
+        return QRect(self._rings_rect)
+
+    def rings_running(self) -> bool:
+        return self._ring_timer.isActive()
+
+    def set_playing(self, playing: bool) -> None:
+        """Con música, los tramos cogen velocidad; sin ella, frenan."""
+        if playing == self._playing:
+            return
+        self._playing = playing
+        if reduced_motion():
+            return                       # quietos siempre: ni temporizador ni repintados
+        now = self._ring_clock.elapsed()
+        self._level_from = self._level_at(now)
+        self._level_to = 1.0 if playing else 0.0
+        self._ramp_at = now
+        if playing:
+            self._song_pos_at = now
+        self._sync_rings()
+
+    def set_position(self, seconds: float) -> None:
+        """Segundo de la pista: marca la cadencia del giro."""
+        self._song_pos = max(0.0, float(seconds))
+        self._song_pos_at = self._ring_clock.elapsed()
+
+    def set_window_shown(self, shown: bool) -> None:
+        """La ventana se minimizó o volvió: minimizada no se gasta nada."""
+        self._window_shown = shown
+        self._sync_rings()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - API de Qt
+        super().showEvent(event)
+        self._sync_rings()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - API de Qt
+        super().hideEvent(event)
+        self._sync_rings()
+
+    def _level_at(self, now: int) -> float:
+        progress = (now - self._ramp_at) / SPIN_MS
+        if progress >= 1.0:
+            return self._level_to
+        eased = EASE_OUT.valueForProgress(max(0.0, progress))
+        return self._level_from + (self._level_to - self._level_from) * eased
+
+    def _sync_rings(self) -> None:
+        moving = self._playing or self._level > 0.0 or self._level_to > 0.0
+        run = (moving and self._window_shown and self.isVisible() and not reduced_motion())
+        if run and not self._ring_timer.isActive():
+            self._last_tick = self._ring_clock.elapsed()
+            self._ring_timer.start()
+        elif not run and self._ring_timer.isActive():
+            self._ring_timer.stop()
+
+    def _ring_tick(self) -> None:
+        now = self._ring_clock.elapsed()
+        # Tras un tropiezo (la ventana ocupada) el giro sigue donde iba: no salta.
+        dt = min(0.05, max(0.0, (now - self._last_tick) / 1000.0))
+        self._last_tick = now
+        level = self._level = self._level_at(now)
+        song = self._song_pos + ((now - self._song_pos_at) / 1000.0 if self._playing else 0.0)
+        cadence = 0.5 - 0.5 * math.cos(math.tau * song / self.CADENCE_S)
+        speed = level * (1.0 + self.CADENCE * cadence) * dt
+        self._angles[0] = (self._angles[0] - self.SPIN_OUTER * speed) % 360.0
+        self._angles[1] = (self._angles[1] - self.SPIN_INNER * speed) % 360.0
+        self._breath_t += dt
+        phase = math.tau * self._breath_t / self.BREATH_S
+        amount = self.BREATH * level
+        self._breath = (amount * math.sin(phase), amount * math.sin(phase + math.pi / 2))
+        self.update(self._rings_rect)
+        if level <= 0.0 and self._level_to <= 0.0 and not self._playing:
+            self._level = 0.0
+            self._ring_timer.stop()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - API de Qt
+        # Color plano, sin degradados; solo las esquinas de arriba siguen al panel.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillPath(self._band_path, QColor(self._color.value))
+        # Los aros no llegan a las esquinas redondeadas: basta el recorte del widget.
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        center = QPointF(rect.right() + rect.height() * 0.08, rect.top() - rect.height() * 0.05)
-        inner, outer = rect.height() * 0.55, rect.height() * 0.78
-        painter.setPen(QPen(QColor(255, 255, 255, 120), 1.5))
+        center = self._ring_center
+        outer = self._radii[0] * (1.0 + self._breath[0])
+        inner = self._radii[1] * (1.0 + self._breath[1])
+        painter.setPen(self._pen_inner)
         painter.drawEllipse(center, inner, inner)
-        painter.setPen(QPen(QColor(255, 255, 255, 170), 1.5))
+        painter.setPen(self._pen_outer)
         painter.drawEllipse(center, outer, outer)
-        gold = QPen(QColor(theme.ORO), 3)
-        gold.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(gold)
-        painter.drawArc(QRectF(center.x() - outer, center.y() - outer, 2 * outer, 2 * outer), 214 * 16, 24 * 16)
+        painter.setPen(self._pen_gold)
+        step = 360.0 / self.ARCS
+        for radius, angle, span in ((outer, self._angles[0], self.ARC_OUTER),
+                                    (inner, self._angles[1], self.ARC_INNER)):
+            box = QRectF(center.x() - radius, center.y() - radius, 2 * radius, 2 * radius)
+            for k in range(self.ARCS):
+                painter.drawArc(box, round((angle + k * step) * 16), span * 16)
 
 
 # ---------------------------------------------------------------------------
@@ -1590,7 +1796,11 @@ class TrackTable(QTableView):
 
     def fit_columns(self) -> None:
         available = max(120, self.viewport().width() - self.DURATION_WIDTH)
-        self._album.to(1.0 if available > 460 else 0.0)
+        share = 1.0 if available > 460 else 0.0
+        if window_settling(self):
+            self._album.set(share)          # sin animación mientras la ventana se reacomoda
+        else:
+            self._album.to(share)
         self._apply_columns()
 
     def _apply_columns(self) -> None:
@@ -1703,6 +1913,21 @@ class TrackDelegate(QStyledItemDelegate):
         self._papel = QColor(theme.PAPEL)
         self._humo = QColor(theme.HUMO)
         self._dim = QColor(theme.TENUE)
+        # Fuentes y métricas se crean una vez: el pintado de cada fila no
+        # reserva objetos nuevos (al desplazar deprisa son cientos por segundo).
+        self._title_font = theme.ui_font(14)
+        self._title_font_current = theme.ui_font(14, QFont.Weight.DemiBold)
+        self._artist_font = theme.ui_font(12)
+        self._cell_font = theme.ui_font(13)
+        self._time_font = theme.ui_font(13, tabular=True)
+        self._metrics = {id(f): QFontMetrics(f) for f in (
+            self._title_font, self._title_font_current, self._artist_font, self._cell_font, self._time_font)}
+        self._on_veil = QColor(theme.SOBRE_SOLIDO)
+        self._play_pen = QPen(self._on_veil, 1.4)
+        self._play_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    def _elide(self, font: QFont, text: str, width: int) -> str:
+        return self._metrics[id(font)].elidedText(text, Qt.TextElideMode.ElideRight, width)
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # noqa: N802
         return QSize(option.rect.width(), self.ROW_HEIGHT)
@@ -1755,7 +1980,7 @@ class TrackDelegate(QStyledItemDelegate):
             dpr = painter.device().devicePixelRatioF()
             x = rect.left() + self.PAD
             y = rect.top() + (rect.height() - self.THUMB) // 2
-            pixmap = self._loader.pixmap(self._art_url(track), self.THUMB, theme.R_THUMB, dpr)
+            pixmap = self._loader.pixmap(self._art_url(track), self.THUMB, theme.R_THUMB, dpr, lazy=True)
             if pixmap is None:
                 pixmap = placeholder_pixmap(self.THUMB, theme.R_THUMB, dpr)
             if unavailable:
@@ -1776,34 +2001,30 @@ class TrackDelegate(QStyledItemDelegate):
                     path.lineTo(cx + 6.5, cy)
                     path.lineTo(cx - 3.5, cy + 6)
                     path.closeSubpath()
-                    on_veil = QColor(theme.SOBRE_SOLIDO)
-                    pen = QPen(on_veil, 1.4)
-                    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-                    painter.setPen(pen)
-                    painter.setBrush(on_veil)
+                    painter.setPen(self._play_pen)
+                    painter.setBrush(self._on_veil)
                     painter.drawPath(path)
 
             text_left = x + self.THUMB + 14
             text_width = max(10, rect.right() - text_left - 10)
-            title_font = theme.ui_font(14, QFont.Weight.DemiBold if current else QFont.Weight.Normal)
+            title_font = self._title_font_current if current else self._title_font
             painter.setFont(title_font)
             painter.setPen(self._dim if unavailable else (self.ink if current else self._papel))
             painter.drawText(
                 QRect(text_left, rect.top() + 9, text_width, 20),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                QFontMetrics(title_font).elidedText(track.title, Qt.TextElideMode.ElideRight, text_width),
+                self._elide(title_font, track.title, text_width),
             )
-            artist_font = theme.ui_font(12)
-            painter.setFont(artist_font)
+            painter.setFont(self._artist_font)
             painter.setPen(self._dim if unavailable else self._humo)
             painter.drawText(
                 QRect(text_left, rect.top() + 29, text_width, 18),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                QFontMetrics(artist_font).elidedText(track.artists, Qt.TextElideMode.ElideRight, text_width),
+                self._elide(self._artist_font, track.artists, text_width),
             )
         else:
             # Cifras tabulares: las duraciones se alinean sin recurrir a una monoespaciada.
-            font = theme.ui_font(13, tabular=index.column() == 2)
+            font = self._time_font if index.column() == 2 else self._cell_font
             if index.column() == 1:
                 painter.setOpacity(self._view.album_share)
             painter.setFont(font)
@@ -1813,7 +2034,7 @@ class TrackDelegate(QStyledItemDelegate):
             inner = rect.adjusted(10, 0, -14, 0)
             painter.drawText(
                 inner, align | Qt.AlignmentFlag.AlignVCenter,
-                QFontMetrics(font).elidedText(text, Qt.TextElideMode.ElideRight, inner.width()),
+                self._elide(font, text, inner.width()),
             )
         progress = self._view.reveal_progress(row)
         if progress < 1.0:
@@ -1935,21 +2156,42 @@ def take_launch(max_age: float = 0.6) -> Optional[tuple]:
     return launch
 
 
+def fit_aspect(rect: QRectF, aspect: float) -> QRectF:
+    """El rectángulo más grande de proporción ``aspect`` (ancho / alto) que
+    cabe en ``rect``, centrado en él."""
+    if rect.isEmpty() or aspect <= 0:
+        return QRectF(rect)
+    width, height = rect.width(), rect.height()
+    if width / height > aspect:
+        width = height * aspect
+    else:
+        height = width / aspect
+    out = QRectF(0, 0, width, height)
+    out.moveCenter(rect.center())
+    return out
+
+
 class CoverFlight(QWidget):
     """La carátula viajando del reproductor al panel «Ahora suena» (o de vuelta).
 
     Es una capa transparente sobre la ventana que pinta solo la imagen en
-    camino. El destino se vuelve a medir en cada fotograma: el panel se está
-    abriendo a la vez y la carátula grande se mueve y crece con él.
+    camino. Origen y destino pueden ser rectángulos fijos (el vuelo es una
+    recta, siempre igual) o funciones que se vuelven a medir en cada
+    fotograma (cuando el destino aún se está colocando).
+
+    Con ``aspect`` la imagen conserva su proporción durante todo el vuelo (una
+    miniatura de vídeo apaisada no se estira ni se recorta a medias): el marco
+    de los extremos se ajusta a esa proporción. El dibujo no sale del pasillo
+    que une origen y destino, así que nunca asoma sobre la cabecera.
     """
 
-    def __init__(self, host: QWidget, image: QImage, start: Callable[[], QRectF],
-                 end: Callable[[], QRectF], radii: tuple[float, float], ms: int,
-                 on_done: Callable[[], None]):
+    def __init__(self, host: QWidget, image: QImage, start, end, radii: tuple[float, float], ms: int,
+                 on_done: Callable[[], None], aspect: Optional[float] = None):
         super().__init__(host)
         self._image = image
-        self._start = start
-        self._end = end
+        self._aspect = aspect
+        self._start = self._fixed(start)
+        self._end = self._fixed(end)
         self._radii = radii
         self._on_done = on_done
         self._done = False
@@ -1958,6 +2200,22 @@ class CoverFlight(QWidget):
         self._t = Tween(self, 0.0, self._step, ms=ms, curve=EASE_IN_OUT, movement=True)
         self.show()
         self.raise_()
+
+    def _fixed(self, where):
+        """Un extremo fijo se ajusta una vez a la proporción; uno medido en
+        vivo, en cada fotograma."""
+        if callable(where):
+            if self._aspect is None:
+                return where
+            return lambda: fit_aspect(where(), self._aspect)
+        rect = QRectF(where) if self._aspect is None else fit_aspect(QRectF(where), self._aspect)
+        return lambda: rect
+
+    def start_rect(self) -> QRectF:
+        return self._start()
+
+    def end_rect(self) -> QRectF:
+        return self._end()
 
     def fly(self) -> None:
         self._t.to(1.0)
@@ -1969,28 +2227,35 @@ class CoverFlight(QWidget):
     def _step(self, value) -> None:
         if float(value) >= 1.0 and not self._done:
             self._done = True
-            self.hide()
+            # Primero aparece la carátula de destino y después se va la copia:
+            # en ningún fotograma falta la imagen.
             self._on_done()
+            self.hide()
             self.deleteLater()
             return
         self.update()
 
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        t = float(self._t.value)
+    def rect_at(self, t: float) -> QRectF:
         a, b = self._start(), self._end()
-        rect = QRectF(
+        return QRectF(
             a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t,
             a.width() + (b.width() - a.width()) * t, a.height() + (b.height() - a.height()) * t,
         )
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        t = float(self._t.value)
+        rect = self.rect_at(t)
         if rect.width() < 2 or rect.height() < 2:
             return
         radius = self._radii[0] + (self._radii[1] - self._radii[0]) * t
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # El pasillo entre origen y destino: fuera de él no se pinta nada.
+        painter.setClipRect(self._start().united(self._end()).adjusted(-1, -1, 1, 1))
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
-        painter.setClipPath(path)
+        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
         # Rellena el marco recortando lo que sobra, como las carátulas.
         iw, ih = self._image.width(), self._image.height()
         scale = max(rect.width() / iw, rect.height() / ih)

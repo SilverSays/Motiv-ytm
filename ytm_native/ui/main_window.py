@@ -6,24 +6,34 @@ import logging
 import os
 import random
 import re
+import sys
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
+    QAbstractSlider,
+    QAbstractSpinBox,
     QApplication,
+    QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QSplitter,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -37,11 +47,17 @@ from ytm_native.core.db import Database, Track, is_local_playlist
 from ytm_native.playback.extractor import ExtractorManager, ExtractorState, UpdateResult, UpdateStatus
 from ytm_native.playback.history import PlayTracker
 from ytm_native.playback.mpv_ipc import MpvPlayer
-from ytm_native.playback.player import LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE, PlaybackController
+from ytm_native.playback.player import (
+    DEFAULT_VOLUME, LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE, PlaybackController, saved_volume,
+)
+from ytm_native.playback import history as play_history
+from ytm_native.playback import session as play_session
 from ytm_native.playback.session import SessionKeeper
+from ytm_native.playback.sleep_timer import PRESETS_MIN, TIME, TRACK, SleepTimer
+from ytm_native.services import backup
 from ytm_native.services.sync import LibrarySync, SyncReport, SyncState, looks_device_bound, search_tracks
 from . import focus, theme
-from .art import ArtLoader, neutral_tint, placeholder_pixmap, sized_url, track_art_url
+from .art import BAR_ART_PX, ArtLoader, neutral_tint, placeholder_pixmap, sized_url, track_art_url
 from .artist import ArtistView
 from .chrome import rounded_menu, show_check
 from .components import (
@@ -66,11 +82,17 @@ from .components import (
     TrackTable,
     glyph_pixmap,
 )
-from .home import HomePage
+from .home import CardGrid, HomePage
+from .mini_player import MiniPlayer
 from .motion import EASE, EASE_DRAWER, FADE_MS, FLIGHT_MS, PANE_CLOSE_MS, PANE_OPEN_MS, Tween, reduced_motion
 from .now import NowPanel
 from .search import ARTISTS, PLAYLISTS, SONGS, ArtistStrip, CardsPage, ScopeBar
+from .taskbar import ThumbBar
+from .tray import Autostart, TrayIcon, app_icon
 from .widgets import AccountDialog, TrackModel, format_ago, format_time, run_async
+
+if sys.platform == "win32":
+    from ctypes import wintypes
 
 log = logging.getLogger("ytmn.ui")
 
@@ -144,6 +166,9 @@ class MainWindow(QMainWindow):
     SIDE_COLLAPSED = 64
     CONTENT_MIN = 360
     NOW_MIN = 300
+    NAV_DEBOUNCE_MS = 180     # pausa en las flechas de la barra lateral antes de cargar la vista
+    _SIDEBAR_NAV_KEYS = (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown,
+                         Qt.Key.Key_Home, Qt.Key.Key_End)
 
     def __init__(
         self,
@@ -211,9 +236,17 @@ class MainWindow(QMainWindow):
         self._now_failed: set[str] = set()
         self._side_collapsed = False
         self._side_width = 248
+        self._sidebar_entries: list[tuple[str, str, str]] = []    # listas que enseña la barra
         # Paneles que se deslizan: el ancho al que vuelve cada uno y su animación en curso.
         self._pane_widths: dict = {}
         self._slides: dict = {}
+        self._pane_targets: dict = {}       # ancho al que va cada panel que se abre
+        self._view_switching = False         # cambiando de vista: nada de animar anchos
+        # Preparando un deslizamiento (anchos mínimos que cambian antes del
+        # primer fotograma) o recién acabado (Qt aún reparte el sitio del
+        # panel que se ocultó): cuenta como deslizar.
+        self._slide_hold = 0
+        self._settle_pending = False
         self._swapping = False
         self._flight: Optional[CoverFlight] = None
         self._band_flight: Optional[CoverFlight] = None
@@ -226,6 +259,16 @@ class MainWindow(QMainWindow):
         self.tracker = PlayTracker(db, player, self)
         self._heard_scope = HEARD_RECENT
         self._recent_tracks: list[Track] = []
+        # Escritorio: bandeja, miniatura de la barra de tareas, mini reproductor,
+        # temporizador de apagado e inicio con Windows.
+        self.sleep = SleepTimer(player, self)
+        self.autostart = Autostart()
+        self.tray: Optional[TrayIcon] = None
+        self.thumbbar: Optional[ThumbBar] = None
+        self.mini: Optional[MiniPlayer] = None
+        self._quitting = False          # salir de verdad (no a la bandeja)
+        self._shut_down = False
+        self._exit_app: Callable[[], None] = QApplication.quit
 
         self.setWindowTitle("YT Music Nativo")
         self.resize(1180, 760)
@@ -240,6 +283,7 @@ class MainWindow(QMainWindow):
         # La tinta no salta de una pista a otra: se funde, como la banda.
         self._ink = Tween(self, QColor(theme.CREMA), self._paint_ink, ms=FADE_MS + 60, curve=EASE)
         self._connect()
+        self._setup_desktop()
 
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
@@ -258,6 +302,12 @@ class MainWindow(QMainWindow):
         self._live_timer.setSingleShot(True)
         self._live_timer.setInterval(config.SEARCH_LIVE_DEBOUNCE_MS)
         self._live_timer.timeout.connect(self._do_search)
+        # Navegar la barra lateral con flechas: la vista espera a que se pare.
+        self._sidebar_keys = False
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setSingleShot(True)
+        self._nav_timer.setInterval(self.NAV_DEBOUNCE_MS)
+        self._nav_timer.timeout.connect(self._settle_sidebar_nav)
 
     # ------------------------------------------------------------------ UI
     def _build_menu(self) -> None:
@@ -287,6 +337,11 @@ class MainWindow(QMainWindow):
         self.resume_action.setChecked(self.session.enabled)
         self.resume_action.toggled.connect(self.session.set_enabled)
         menu.addAction(show_check(self.resume_action, self.devicePixelRatioF()))
+        self.equalize_action = QAction("Igualar el volumen entre canciones", self)
+        self.equalize_action.setCheckable(True)
+        self.equalize_action.setChecked(self.db.get_bool("equalize_volume", False))
+        self.equalize_action.toggled.connect(self._set_equalize)
+        menu.addAction(show_check(self.equalize_action, self.devicePixelRatioF()))
         self.lyrics_action = QAction("Mostrar letra", self)
         self.lyrics_action.setCheckable(True)
         self.lyrics_action.setShortcut(QKeySequence("Ctrl+L"))
@@ -305,6 +360,9 @@ class MainWindow(QMainWindow):
         self.collapse_action.toggled.connect(self._set_sidebar_collapsed)
         menu.addAction(show_check(self.collapse_action, self.devicePixelRatioF()))
         self.addAction(self.collapse_action)
+        self.mini_action = self._add_action(menu, "Mini reproductor", self.toggle_mini, "Ctrl+M")
+        self._build_sleep_menu(rounded_menu(menu.addMenu("Temporizador de apagado")))
+        self._build_desktop_menu(rounded_menu(menu.addMenu("Bandeja e inicio con Windows")))
         menu.addSeparator()
         self._add_action(menu, "Nueva lista…", lambda: self._create_local_playlist(), "Ctrl+N")
         menu.addSeparator()
@@ -312,8 +370,50 @@ class MainWindow(QMainWindow):
         self._add_action(menu, "Descargar binarios que faltan", self._install_binaries)
         self._add_action(menu, "Diagnóstico…", self._show_diagnostics)
         self._add_action(menu, "Abrir carpeta de datos", self._open_data_folder)
+        self._add_action(menu, "Exportar copia de seguridad…", self._export_backup)
+        self._add_action(menu, "Importar copia de seguridad…", self._import_backup)
         menu.addSeparator()
-        self._add_action(menu, "Salir", self.close, "Ctrl+Q")
+        self._add_action(menu, "Salir", self.quit_app, "Ctrl+Q")
+
+    def _build_sleep_menu(self, menu: QMenu) -> None:
+        self.sleep_menu = menu
+        for minutes in PRESETS_MIN:
+            label = "1 hora" if minutes == 60 else f"{minutes} minutos"
+            menu.addAction(label, lambda m=minutes: self.sleep.start_minutes(m))
+        menu.addAction("Otro tiempo…", self._ask_sleep_minutes)
+        menu.addAction("Al terminar esta canción", self.sleep.stop_after_track)
+        menu.addSeparator()
+        self.sleep_quit_action = QAction("Cerrar la aplicación al terminar", self)
+        self.sleep_quit_action.setCheckable(True)
+        self.sleep_quit_action.setChecked(self.db.get_bool("sleep_quit_app", False))
+        self.sleep_quit_action.toggled.connect(
+            lambda on: self.db.set_setting("sleep_quit_app", "1" if on else "0"))
+        menu.addAction(show_check(self.sleep_quit_action, self.devicePixelRatioF()))
+        menu.addSeparator()
+        self.sleep_cancel_action = menu.addAction("Cancelar el temporizador", self.sleep.cancel)
+        self.sleep_cancel_action.setEnabled(False)
+
+    def _build_desktop_menu(self, menu: QMenu) -> None:
+        dpr = self.devicePixelRatioF()
+        self.close_to_tray_action = QAction("Al cerrar, seguir sonando en la bandeja", self)
+        self.close_to_tray_action.setCheckable(True)
+        self.close_to_tray_action.setChecked(self.db.get_bool("tray_close_to_tray", True))
+        self.close_to_tray_action.toggled.connect(
+            lambda on: self.db.set_setting("tray_close_to_tray", "1" if on else "0"))
+        menu.addAction(show_check(self.close_to_tray_action, dpr))
+        self.minimize_to_tray_action = QAction("Al minimizar, ir a la bandeja", self)
+        self.minimize_to_tray_action.setCheckable(True)
+        self.minimize_to_tray_action.setChecked(self.db.get_bool("tray_minimize_to_tray", False))
+        self.minimize_to_tray_action.toggled.connect(
+            lambda on: self.db.set_setting("tray_minimize_to_tray", "1" if on else "0"))
+        menu.addAction(show_check(self.minimize_to_tray_action, dpr))
+        menu.addSeparator()
+        self.autostart_action = QAction("Iniciar con Windows (en la bandeja)", self)
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(self.db.get_bool("autostart_with_windows", False))
+        self.autostart_action.setEnabled(self.autostart.supported)
+        self.autostart_action.toggled.connect(self._set_autostart)
+        menu.addAction(show_check(self.autostart_action, dpr))
 
     def _add_action(self, menu, text, slot, shortcut: Optional[str] = None) -> QAction:
         action = QAction(text, self)
@@ -525,10 +625,20 @@ class MainWindow(QMainWindow):
         self.play_btn = PlayButton()
         self.next_btn = IconButton("next", "Siguiente (Ctrl+Derecha)")
         self.repeat_btn = IconButton("repeat_all", "Repetir: desactivado", checkable=True, quiet=True)
+        # Temporizador de apagado: solo se ve mientras hay uno programado, al
+        # final de la fila; un hueco igual al principio mantiene centrado el
+        # botón de reproducir.
+        self.sleep_btn = PillButton("", "quiet", glyph="sleep", tabular=True)
+        self.sleep_btn.setFixedHeight(30)
+        self.sleep_btn.hide()
+        self.sleep_twin = QWidget()
+        self.sleep_twin.hide()
+        controls.addWidget(self.sleep_twin)
         controls.addStretch(1)
         for btn in (self.shuffle_btn, self.prev_btn, self.play_btn, self.next_btn, self.repeat_btn):
             controls.addWidget(btn)
         controls.addStretch(1)
+        controls.addWidget(self.sleep_btn)
         center.addLayout(controls)
 
         seek = QHBoxLayout()
@@ -562,7 +672,8 @@ class MainWindow(QMainWindow):
         self.volume_slider = SeekSlider()
         self.volume_slider.setAccessibleName("Volumen")
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(self.db.get_int("volume", 80))
+        self._pre_mute = saved_volume(self.db)
+        self.volume_slider.setValue(self._pre_mute)
         self.volume_slider.setFixedWidth(108)
         right.addStretch(1)
         right.addWidget(self.lyrics_btn)
@@ -647,12 +758,21 @@ class MainWindow(QMainWindow):
         self.player.blocked.connect(self._on_blocked)
         self.player.track_flagged.connect(self._on_track_flagged)
         self.player.modes_changed.connect(self._on_modes_changed)
+        self.sleep.changed.connect(self._on_sleep_changed)
+        self.sleep.remaining_changed.connect(self._on_sleep_remaining)
+        self.sleep.expired.connect(self._on_sleep_expired)
+        self.sleep_btn.clicked.connect(self._open_sleep_badge_menu)
 
         self.bridge.extractor_state.connect(self._on_extractor_state)
         self.bridge.notice.connect(self._notice)
         self.bridge.progress.connect(self._on_progress)
 
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.player.toggle_pause)
+        # Espacio pausa o reanuda salvo que el foco esté en un control que lo
+        # usa (un botón se pulsa, un campo escribe el espacio): entonces el
+        # atajo se aparta y la tecla le llega a ese control.
+        self.space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.player.toggle_pause)
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
+        self.sidebar.itemActivated.connect(self._on_sidebar_activated)
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self.player.next_track)
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=self.player.previous_track)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self._focus_search)
@@ -674,6 +794,9 @@ class MainWindow(QMainWindow):
         if paths.mpv_exe().is_file():
             self.mpv.start()
         self._startup_checks()
+        if self.autostart_action.isChecked():
+            # Si la carpeta del proyecto o el Python cambiaron, la orden se renueva.
+            self.autostart.sync(True)
         lo, hi = config.SYNC_STARTUP_DELAY_S
         QTimer.singleShot(int(random.uniform(lo, hi) * 1000), self._auto_sync)
         self._sync_timer.start()
@@ -751,6 +874,94 @@ class MainWindow(QMainWindow):
             self._banner_action()
 
     # ---------------------------------------------------------------- sidebar
+    def _playlist_entries(self) -> list[tuple[str, str, str]]:
+        """Lo que la barra lateral enseña de cada lista: clave, título y carátula."""
+        return [(p.playlist_id, p.title, sized_url(self.db.playlist_cover(p), 96)) for p in self.db.playlists()]
+
+    def _style_playlist_item(self, item: QListWidgetItem, title: str, url: str) -> None:
+        collapsed = self._side_collapsed
+        text = "" if collapsed else title
+        if item.text() != text:
+            item.setText(text)
+        if item.data(Qt.ItemDataRole.AccessibleTextRole) != title:
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, title)
+            item.setToolTip(title)
+        if item.data(ROLE_ART) != url or item.icon().isNull():
+            item.setData(ROLE_ART, url)
+            item.setIcon(self._sidebar_icon(url))
+
+    def _patch_sidebar(self, entries: list[tuple[str, str, str]]) -> None:
+        """Pone las listas de la barra al día tocando solo las filas que
+        cambian: la fila marcada y el desplazamiento se quedan donde estaban."""
+        bar = self.sidebar.verticalScrollBar()
+        scroll = bar.value()
+        base = self._sidebar_row(NEW_LIST_KEY) + 1
+        wanted = {key for key, _title, _url in entries}
+        self.sidebar.blockSignals(True)
+        try:
+            for row in range(self.sidebar.count() - 1, base - 1, -1):
+                if self.sidebar.item(row).data(ROLE_ID) not in wanted:
+                    self.sidebar.takeItem(row)
+            for offset, (key, title, url) in enumerate(entries):
+                row = base + offset
+                item = self.sidebar.item(row)
+                if item is None or item.data(ROLE_ID) != key:
+                    found = self._sidebar_row(key)
+                    if found >= 0:
+                        item = self.sidebar.takeItem(found)
+                    else:
+                        item = QListWidgetItem()
+                        item.setData(ROLE_ID, key)
+                    self.sidebar.insertItem(row, item)
+                self._style_playlist_item(item, title, url)
+            self.sidebar.setCurrentRow(self._sidebar_row(self._view_key or HOME_KEY))
+        finally:
+            self.sidebar.blockSignals(False)
+        self._sidebar_entries = entries
+        bar.setValue(scroll)
+        self.active_mark.follow(animate=False)
+
+    def _refresh_after_sync(self) -> None:
+        entries = self._playlist_entries()
+        if entries != self._sidebar_entries:
+            self._patch_sidebar(entries)
+        key = self._view_key or HOME_KEY
+        if is_library(key):
+            if self.db.get_playlist(key) is None:
+                self._navigate(HOME_KEY)           # la lista que se veía ya no existe
+            else:
+                self._refresh_library_view(key)
+        elif key == HOME_KEY:
+            self._refresh_home()                   # reutiliza sus tarjetas: no parpadea
+
+    def _refresh_library_view(self, key: str) -> None:
+        """La lista a la vista tras sincronizar: filas nuevas o quitadas sin
+        volver arriba, y la cabecera solo si cambió."""
+        playlist = self.db.get_playlist(key)
+        tracks = self.db.playlist_tracks(key)
+        self.model.set_tracks(tracks)
+        current = self.player.current_track()
+        self.model.set_current(current.video_id if current else None)
+        description = playlist.description.strip()
+        if len(description) > 230:
+            description = description[:228].rstrip() + "…"
+        art = sized_url(self.db.playlist_cover(playlist), 400)
+        facts = self._playlist_facts(playlist, tracks)
+        header = (playlist.title, description, art)
+        if header != (self.band._full_title, self.band.description.text(), self._band_art):
+            self._band_art = art
+            self.band.set_content(
+                playlist.title, description, facts, art, show_sync=not playlist.local,
+                extra=("Opciones", "more") if playlist.local else None,
+            )
+            self._apply_band_tint()
+        else:
+            self.band.set_facts(facts)
+        if not playlist.local:
+            self._set_empty("" if tracks else "Esta lista aún no tiene pistas guardadas",
+                            "Sincronízala para verlas.")
+        self._update_buttons()
+
     def _reload_sidebar(self) -> None:
         keep = self._view_key or HOME_KEY
         dpr = self.devicePixelRatioF()
@@ -781,10 +992,11 @@ class MainWindow(QMainWindow):
         self.sidebar.addItem(heading)
         add(glyph_icon("add"), "Nueva lista", NEW_LIST_KEY,
             "Crea una lista que se guarda solo en esta app (Ctrl+N)")
-        for playlist in self.db.playlists():
-            url = sized_url(self.db.playlist_cover(playlist), 96)
-            item = add(self._sidebar_icon(url), playlist.title, playlist.playlist_id, playlist.title)
+        entries = self._playlist_entries()
+        for key, title, url in entries:
+            item = add(self._sidebar_icon(url), title, key, title)
             item.setData(ROLE_ART, url)
+        self._sidebar_entries = entries
         self.sidebar.blockSignals(False)
         if not (is_remote(keep) or is_artist(keep)) and self._sidebar_row(keep) < 0:
             keep = HOME_KEY          # la lista que se veía ya no está en la biblioteca
@@ -847,6 +1059,15 @@ class MainWindow(QMainWindow):
     def _on_sidebar_changed(self, item: Optional[QListWidgetItem], _prev) -> None:
         if item is None or not item.data(ROLE_ID):
             return
+        by_keys, self._sidebar_keys = self._sidebar_keys, False
+        if by_keys:
+            # Con las flechas se pasa por muchas filas seguidas: la marca sigue
+            # a cada una al instante, pero la vista (base de datos, tabla,
+            # cabecera) se carga solo cuando el usuario se detiene. Llegar a
+            # «Nueva lista» de paso no abre el diálogo: lo abre Intro.
+            self._nav_timer.start()
+            return
+        self._nav_timer.stop()
         if item.data(ROLE_ID) == NEW_LIST_KEY:
             # No es una vista: la selección vuelve a donde estaba y se abre el diálogo.
             self._select_in_sidebar(self._view_key or HOME_KEY)
@@ -859,6 +1080,36 @@ class MainWindow(QMainWindow):
             icon = QRectF(row.left() + 8, row.center().y() - 15.5, 32, 32)
             note_launch(self.sidebar.viewport(), icon, self.art.image(url), 5)
         self._show_view(item.data(ROLE_ID))
+
+    def _settle_sidebar_nav(self) -> None:
+        """Las flechas se detuvieron: se abre la vista de la fila marcada."""
+        item = self.sidebar.currentItem()
+        key = item.data(ROLE_ID) if item is not None else None
+        if key and key != NEW_LIST_KEY:
+            self._show_view(key)
+
+    def _on_sidebar_activated(self, item: QListWidgetItem) -> None:
+        """Intro (o doble clic) sobre una fila: sin esperar al reposo."""
+        key = item.data(ROLE_ID)
+        # Con el ratón, el primer clic ya actuó (y la marca volvió a la vista
+        # abierta): el doble clic no debe abrir el diálogo una segunda vez.
+        if not key or item is not self.sidebar.currentItem():
+            return
+        self._nav_timer.stop()
+        if key == NEW_LIST_KEY:
+            self._select_in_sidebar(self._view_key or HOME_KEY)
+            QTimer.singleShot(0, self._create_local_playlist)
+        else:
+            self._show_view(key)
+
+    @staticmethod
+    def _uses_space(widget: Optional[QWidget]) -> bool:
+        """¿El control con foco hace algo con la barra espaciadora?"""
+        return isinstance(widget, (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox,
+                                   QLineEdit, QPlainTextEdit, QTextEdit, ClickableCover))
+
+    def _on_focus_changed(self, _old, new) -> None:
+        self.space_shortcut.setEnabled(not self._uses_space(new))
 
     # ------------------------------------------------------- barra contraíble
     def _set_sidebar_collapsed(self, collapsed: bool) -> None:
@@ -895,9 +1146,13 @@ class MainWindow(QMainWindow):
         if not self._animate_panes():
             settle()
             return
-        side.setMinimumWidth(self.SIDE_COLLAPSED)
-        side.setMaximumWidth(self.SIDE_MAX)
-        self._run_slide(side, side.width(), target, PANE_CLOSE_MS if collapsed else PANE_OPEN_MS, settle)
+        self._hold_slide(True)
+        try:
+            side.setMinimumWidth(self.SIDE_COLLAPSED)
+            side.setMaximumWidth(self.SIDE_MAX)
+            self._run_slide(side, side.width(), target, PANE_CLOSE_MS if collapsed else PANE_OPEN_MS, settle)
+        finally:
+            self._hold_slide(False)
 
     # ------------------------------------------------------- paneles que se deslizan
     def _animate_panes(self) -> bool:
@@ -915,6 +1170,37 @@ class MainWindow(QMainWindow):
         sizes[index] = width
         self.splitter.setSizes(sizes)
 
+    def is_sliding(self) -> bool:
+        """¿Hay un panel deslizándose? El contenido cambia de ancho en cada
+        fotograma: lo que se recoloca a mano espera al final."""
+        return bool(self._slides) or self._slide_hold > 0 or self._settle_pending
+
+    def layout_settling(self) -> bool:
+        """¿Deslizando un panel o cambiando de vista? Los anchos se ajustan
+        sin animarse (si no, sus tweens competirían con el deslizamiento)."""
+        return self.is_sliding() or self._view_switching
+
+    def _hold_slide(self, hold: bool) -> None:
+        self._slide_hold += 1 if hold else -1
+
+    def _finish_slides(self) -> None:
+        """Acabó el último deslizamiento. El reajuste espera a que Qt
+        termine de repartir el sitio (ocultar un panel se resuelve en el
+        siguiente ciclo): así es uno solo, al ancho definitivo."""
+        if not self._settle_pending:
+            self._settle_pending = True
+            QTimer.singleShot(0, self, self._settle_layouts)
+
+    def _settle_layouts(self) -> None:
+        """Fin del deslizamiento: un único reajuste al ancho definitivo de
+        lo que esperó (rejillas de tarjetas, columnas de la tabla)."""
+        self._settle_pending = False
+        if self.is_sliding():
+            return                      # empezó otro mientras tanto: ya se reajustará
+        for grid in self.findChildren(CardGrid):
+            grid.settle()
+        self.table.fit_columns()
+
     def _run_slide(self, pane: QWidget, start: int, end: int, ms: int, done) -> None:
         previous = self._slides.pop(pane, None)
         if previous is not None:
@@ -924,8 +1210,14 @@ class MainWindow(QMainWindow):
             t = float(value)
             self._set_pane_width(pane, round(start + (end - start) * t))
             if t >= 1.0 and self._slides.get(pane) is tween:
-                del self._slides[pane]
-                done()
+                self._hold_slide(True)          # lo que haga ``done`` también cuenta
+                try:
+                    del self._slides[pane]
+                    done()
+                finally:
+                    self._hold_slide(False)
+                if not self._slides:
+                    self._finish_slides()
 
         tween = Tween(self, 0.0, step, ms=ms, curve=EASE_DRAWER, movement=True)
         self._slides[pane] = tween
@@ -938,6 +1230,18 @@ class MainWindow(QMainWindow):
     def _slide_pane(self, pane: QWidget, opening: bool) -> None:
         """Abre o cierra un panel derecho (letra o «Ahora suena») deslizándolo
         desde el borde, en lugar de que aparezca o desaparezca de golpe."""
+        animate = self._animate_panes()
+        if animate:
+            self._hold_slide(True)          # los anchos mínimos cambian antes del primer paso
+        try:
+            self._slide_pane_now(pane, opening)
+        finally:
+            if animate:
+                self._hold_slide(False)
+                if not self._slides:
+                    self._finish_slides()   # no hubo deslizamiento: reajuste igualmente
+
+    def _slide_pane_now(self, pane: QWidget, opening: bool) -> None:
         natural = self._pane_min(pane)
         sliding = self._slides.pop(pane, None)
         if sliding is not None:
@@ -964,7 +1268,18 @@ class MainWindow(QMainWindow):
         start = 0 if pane.isHidden() else pane.width()
         # Nunca más ancho de lo que el contenido puede ceder sin bajar de su mínimo.
         room = content + start - self.CONTENT_MIN
+        if room < natural and len(sizes) > 1:
+            # Ni el mínimo del panel cabe: lo que falta lo cede la barra lateral
+            # (hasta su propio mínimo) en vez de aplastar el contenido.
+            side_min = self.SIDE_COLLAPSED if self._side_collapsed else self.SIDE_MIN
+            give = min(natural - room, max(0, sizes[0] - side_min))
+            if give > 0:
+                sizes[0] -= give
+                sizes[1] += give
+                self.splitter.setSizes(sizes)
+                room += give
         target = min(self._pane_widths.get(pane, 340), max(natural, room))
+        self._pane_targets[pane] = target
         if not self._animate_panes():
             pane.setMinimumWidth(natural)
             pane.show()
@@ -1120,6 +1435,7 @@ class MainWindow(QMainWindow):
             self._apply_band_tint()
         if url == self._now_art:
             self._apply_ink()
+            self._sync_tray_cover()
         for row in range(self.sidebar.count()):
             item = self.sidebar.item(row)
             if item.data(ROLE_ART) == url:
@@ -1141,6 +1457,8 @@ class MainWindow(QMainWindow):
         for widget in (self.seek_slider, self.volume_slider, self.play_btn, self.shuffle_btn,
                        self.repeat_btn, self.lyrics):
             widget.set_ink(ink)
+        if self.mini is not None:
+            self.mini.set_ink(ink)
         self.table.viewport().update()
 
     def _playlist_facts(self, playlist, tracks: list[Track]) -> list[str]:
@@ -1161,8 +1479,14 @@ class MainWindow(QMainWindow):
         return facts
 
     def _show_view(self, key: str, force: bool = False) -> None:
+        self._nav_timer.stop()            # una vista pedida de otro modo gana a las flechas
         if key == self._view_key and not force:
             return
+        # Mientras la vista nueva se coloca (también los reajustes que Qt deja
+        # para el siguiente ciclo), los anchos no se animan.
+        if not self._view_switching:
+            self._view_switching = True
+            QTimer.singleShot(0, self, self._end_view_switch)
         previous = self._view_key
         if previous and previous != key and not self._going_back:
             self._history.append(previous)
@@ -1194,11 +1518,9 @@ class MainWindow(QMainWindow):
         elif artist:
             self._show_artist(key[len(ARTIST_PREFIX):])
         elif key == QUEUE_KEY:
-            tracks, pos = self.player.queue_snapshot()
+            tracks, facts = self._queue_contents()
             self.model.set_tracks(tracks)
             current = self.player.current_track()
-            ahead = max(0, len(tracks) - pos - 1) if pos >= 0 else 0
-            facts = [plural(len(tracks), "pista", "pistas"), f"{ahead} por delante"] if tracks else []
             self._band_art = track_art_url(current.video_id, current.thumb_url, 400) if current else ""
             self.band.set_content(
                 "Cola de reproducción",
@@ -1251,6 +1573,9 @@ class MainWindow(QMainWindow):
         self.table.scrollToTop()
         self._update_buttons()
         self._fly_to_band()
+
+    def _end_view_switch(self) -> None:
+        self._view_switching = False
 
     def _fly_to_band(self) -> None:
         """Si la vista se abrió con un clic en una carátula (una tarjeta, una
@@ -1814,17 +2139,19 @@ class MainWindow(QMainWindow):
             if self.now_panel.isVisible():
                 self._load_now(None)
             self.setWindowTitle("YT Music Nativo")
+            self._sync_tray_track()
             return
         self.now_title.setText(track.title)
         self.now_title.set_color(theme.PAPEL)
         self.now_artist.setText(track.artists)
-        self._now_art = track_art_url(track.video_id, track.thumb_url, 160)
+        self._now_art = track_art_url(track.video_id, track.thumb_url, BAR_ART_PX)
         self.now_cover.set_url(self._now_art)
         self._apply_ink()
         self.model.set_current(track.video_id)
         self.setWindowTitle(f"{track.title} — YT Music Nativo")
+        self._sync_tray_track()
         if self._view_key == QUEUE_KEY:
-            self._show_view(QUEUE_KEY, force=True)
+            self._refresh_queue()
         if self.lyrics.isVisible():
             self._load_lyrics(track)
         if self.now_panel.isVisible():
@@ -1835,6 +2162,8 @@ class MainWindow(QMainWindow):
         self.play_btn.set_playing(state in (PLAYING, LOADING))
         self.play_btn.set_loading(state == LOADING)
         self.table.set_playing(state == PLAYING)
+        # Los aros de la cabecera giran con la música y frenan al pararse.
+        self.band.set_playing(state == PLAYING)
         has_track = self.player.current_track() is not None
         self.play_btn.setEnabled(has_track)
         self.next_btn.setEnabled(has_track)
@@ -1842,10 +2171,16 @@ class MainWindow(QMainWindow):
         # Detenida con una pista a medias (la cola recuperada al abrir) también
         # se puede mover: cambia el punto desde el que seguirá.
         self.seek_slider.setEnabled(has_track and state != LOADING)
+        playing = state in (PLAYING, LOADING)
+        if self.tray is not None:
+            self.tray.set_playing(playing)
+        if self.thumbbar is not None:
+            self.thumbbar.set_state(playing, has_track)
 
     def _on_position(self, pos: float, duration: float) -> None:
         self._duration = duration
         self.dur_label.setText(format_time(duration) if duration > 0 else "–:––")
+        self.band.set_position(pos)
         if self._seeking:
             return
         self.pos_label.setText(format_time(pos))
@@ -1868,7 +2203,13 @@ class MainWindow(QMainWindow):
 
     def _on_volume(self, value: int) -> None:
         self.player.set_volume(value)
-        self.db.set_setting("volume", value)
+        self.sleep.note_volume(value)        # si el temporizador está bajándolo, sigue desde aquí
+        # Silenciar (o bajar la barra hasta 0) no es el volumen que el usuario
+        # prefiere: se guarda el último audible, que es el que vuelve al abrir
+        # y al quitar el silencio.
+        if value > 0:
+            self._pre_mute = value
+            self.db.set_setting("volume", value)
         self._sync_volume_glyph(value)
 
     def _sync_volume_glyph(self, value: int) -> None:
@@ -1881,7 +2222,7 @@ class MainWindow(QMainWindow):
             self._pre_mute = self.volume_slider.value()
             self.volume_slider.setValue(0)
         else:
-            self.volume_slider.setValue(self._pre_mute or 60)
+            self.volume_slider.setValue(self._pre_mute or DEFAULT_VOLUME)
 
     def _on_modes_changed(self, shuffle: bool, repeat: str) -> None:
         self.shuffle_btn.setChecked(shuffle)
@@ -1900,9 +2241,34 @@ class MainWindow(QMainWindow):
         self._on_tick()
 
     # ------------------------------------------------------------ cola y menú
+    def _queue_contents(self) -> tuple[list[Track], list[str]]:
+        tracks, pos = self.player.queue_snapshot()
+        ahead = max(0, len(tracks) - pos - 1) if pos >= 0 else 0
+        facts = [plural(len(tracks), "pista", "pistas"), f"{ahead} por delante"] if tracks else []
+        return tracks, facts
+
+    def _refresh_queue(self) -> None:
+        """La cola a la vista cuando avanza o cambia: se tocan solo las filas
+        que cambian, la marca de lo que suena y las notas de la banda. Nada se
+        reconstruye ni vuelve arriba: quien esté desplazándose por una cola
+        larga sigue donde estaba."""
+        tracks, facts = self._queue_contents()
+        current = self.player.current_track()
+        self.model.set_tracks(tracks)
+        self.model.set_current(current.video_id if current else None)
+        art = track_art_url(current.video_id, current.thumb_url, 400) if current else ""
+        if art != self._band_art:
+            self._band_art = art
+            self.band.cover.set_url(art)
+            self._apply_band_tint()
+        self.band.set_facts(facts)
+        self._set_empty("" if tracks else "La cola está vacía", "Reproduce una lista o una búsqueda.",
+                        glyph="queue")
+        self._update_buttons()
+
     def _on_queue_changed(self) -> None:
         if self._view_key == QUEUE_KEY:
-            self._show_view(QUEUE_KEY, force=True)
+            self._refresh_queue()
 
     def _on_table_menu(self, point) -> None:
         index = self.table.indexAt(point)
@@ -1993,19 +2359,28 @@ class MainWindow(QMainWindow):
         if opening and flying:
             self._fly_cover(opening=True)
 
-    def _cover_rects(self):
-        """Dónde está cada carátula, en coordenadas de la ventana (medido en vivo)."""
+    def _projected_now_cover(self) -> QRectF:
+        """Dónde quedará la carátula grande con el panel ya abierto a su ancho
+        final, en coordenadas de la ventana. El panel es el último del
+        divisor: acaba en su borde derecho."""
+        panel = self.now_panel
+        width = self._pane_targets.get(panel) or panel.width()
+        origin = self.splitter.mapTo(self.centralWidget(), QPoint(self.splitter.width() - width, 0))
+        return panel.projected_cover_rect(width, self.splitter.height()).translated(QPointF(origin))
+
+    def _cover_rects(self, opening: bool = True) -> tuple[QRectF, QRectF]:
+        """Origen y destino del vuelo, fijos para todo el trayecto (en
+        coordenadas de la ventana): la carátula del reproductor y la grande.
+        Al abrir, la grande es la proyectada con el panel a su ancho final;
+        al cerrar, la que hay ahora (luego el panel se va encogiendo)."""
         host = self.centralWidget()
-
-        def small() -> QRectF:
-            return QRectF(QPointF(self.now_cover.mapTo(host, QPoint(0, 0))), QPointF(
-                self.now_cover.mapTo(host, QPoint(self.now_cover.width(), self.now_cover.height()))))
-
-        def big() -> QRectF:
+        small = QRectF(QPointF(self.now_cover.mapTo(host, QPoint(0, 0))),
+                       QSizeF(self.now_cover.width(), self.now_cover.height()))
+        if opening:
+            big = self._projected_now_cover()
+        else:
             cover = self.now_panel.cover
-            art = cover.art_rect()
-            return art.translated(QPointF(cover.mapTo(host, QPoint(0, 0))))
-
+            big = cover.art_rect().translated(QPointF(cover.mapTo(host, QPoint(0, 0))))
         return small, big
 
     def _fly_cover(self, opening: bool) -> None:
@@ -2016,7 +2391,9 @@ class MainWindow(QMainWindow):
         image = cover.flight_image() or (self.art.image(self._now_art) if self._now_art else None)
         if image is None or image.isNull():
             return
-        small, big = self._cover_rects()
+        small, big = self._cover_rects(opening)
+        if opening:
+            cover.prepare(round(big.width()))     # lista para pintarse al aterrizar
         start, end = (small, big) if opening else (big, small)
         radii = (theme.R_COVER, theme.R_COVER + 2)
         cover.set_held(True)
@@ -2028,7 +2405,7 @@ class MainWindow(QMainWindow):
 
         flight = CoverFlight(self.centralWidget(), image, start, end,
                              radii if opening else radii[::-1],
-                             FLIGHT_MS if opening else PANE_CLOSE_MS, landed)
+                             FLIGHT_MS if opening else PANE_CLOSE_MS, landed, aspect=cover.aspect())
         flight.opening = opening
         self._flight = flight
         flight.fly()
@@ -2229,8 +2606,9 @@ class MainWindow(QMainWindow):
             self._notice(f"Error de sincronización: {error}", "error")
         elif report is not None:
             self._notice(report.message)
-        # La GUI lee solo de SQLite: refrescar los modelos al terminar.
-        self._reload_sidebar()
+        # La GUI lee solo de SQLite: se refresca lo que cambió, sin reconstruir
+        # la barra lateral ni la vista (ni robar el foco o mover el desplazamiento).
+        self._refresh_after_sync()
         self._refresh_status()
         self._refresh_banner()
         self._update_buttons()
@@ -2564,7 +2942,15 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 - API de Qt
         kind = event.type()
-        if kind == QEvent.Type.MouseButtonPress:
+        if kind == QEvent.Type.KeyPress and obj is self.sidebar:
+            # Lo anota antes de que la lista mueva su fila: ``_on_sidebar_changed``
+            # sabrá que el cambio vino de las flechas.
+            self._sidebar_keys = event.key() in self._SIDEBAR_NAV_KEYS
+            if self._sidebar_keys:
+                # Si la tecla no movió la fila (ya estaba arriba), no cuenta para la próxima.
+                QTimer.singleShot(0, self, lambda: setattr(self, "_sidebar_keys", False))
+        elif kind == QEvent.Type.MouseButtonPress:
+            self._sidebar_keys = False
             if (event.button() == Qt.MouseButton.BackButton and isinstance(obj, QWidget)
                     and obj.window() is self):
                 self._go_back()
@@ -2595,13 +2981,311 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
         if event.type() == event.Type.ActivationChange and hasattr(self, "toasts"):
             self.toasts.set_inactive(not self.isActiveWindow())
+        elif event.type() == event.Type.WindowStateChange and hasattr(self, "band"):
+            # Minimizada nadie ve los aros: su temporizador se detiene.
+            self.band.set_window_shown(not self.isMinimized())
+            if self.isMinimized() and self._minimizes_to_tray():
+                # Fuera de este evento: ocultar desde dentro deja a Windows
+                # con un botón fantasma en la barra de tareas.
+                QTimer.singleShot(0, self._hide_minimized)
+
+    def nativeEvent(self, event_type, message):  # noqa: N802 - API de Qt
+        # Solo Windows: los clics en los botones de la miniatura de la barra
+        # de tareas llegan como mensajes a la ventana.
+        # ``message`` llega como VoidPtr, que es falso en un ``if``: hay que
+        # mirar su dirección. La implementación de Qt no hace nada más que
+        # devolver "no atendido", así que no se la llama.
+        bar = self.thumbbar
+        if bar is not None and bar.active and event_type == b"windows_generic_MSG":
+            address = int(message)
+            if address:
+                msg = wintypes.MSG.from_address(address)
+                if bar.handle(int(msg.hWnd or 0), msg.message, msg.wParam or 0, msg.lParam or 0):
+                    return True, 0
+        return False, 0
+
+    # -------------------------------------------------------------- escritorio
+    def _setup_desktop(self) -> None:
+        self.setWindowIcon(app_icon())
+        if TrayIcon.available():
+            tray = self.tray = TrayIcon(self)
+            tray.show_requested.connect(self.bring_to_front)
+            tray.toggle_requested.connect(self.player.toggle_pause)
+            tray.next_requested.connect(self.player.next_track)
+            tray.previous_requested.connect(self.player.previous_track)
+            tray.mini_requested.connect(self.show_mini)
+            tray.quit_requested.connect(self.quit_app)
+            tray.show()
+        self.thumbbar = ThumbBar(self)
+        self.thumbbar.clicked.connect(self._on_thumb_button)
+        self.mpv.set_normalization("loudnorm" if self.equalize_action.isChecked() else None)
+
+    def tray_ready(self) -> bool:
+        """¿Hay icono en la bandeja? (Sin él, ocultar la ventana la perdería.)"""
+        return self.tray is not None and self.tray.is_visible()
+
+    def _hides_on_close(self) -> bool:
+        return self.tray_ready() and self.close_to_tray_action.isChecked()
+
+    def _minimizes_to_tray(self) -> bool:
+        return self.tray_ready() and self.minimize_to_tray_action.isChecked()
+
+    def _hide_minimized(self) -> None:
+        if self.isMinimized() and self._minimizes_to_tray():
+            self.hide()
+
+    def _hide_to_tray(self) -> None:
+        self.hide()
+        if self.tray is not None and not self.db.get_bool("tray_hint_shown"):
+            self.db.set_setting("tray_hint_shown", "1")
+            self.tray.notify(
+                "La música sigue sonando",
+                "YT Music Nativo queda en la bandeja. Para cerrarlo del todo, "
+                "usa «Salir definitivamente» en el menú de este icono.",
+            )
+
+    def bring_to_front(self) -> None:
+        """Vuelve la ventana (desde la bandeja, el mini reproductor o al abrir
+        la app otra vez) y la pone delante."""
+        if self.mini is not None and self.mini.isVisible():
+            self.mini.close_quietly()
+        state = self.windowState() & ~Qt.WindowState.WindowMinimized
+        self.setWindowState(state | Qt.WindowState.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        """Salir de verdad: cierra todo aunque la opción de la bandeja esté activa."""
+        self._quitting = True
+        self.close()
+        self._exit_app()
+
+    def _sync_tray_track(self) -> None:
+        if self.tray is None:
+            return
+        track = self.player.current_track()
+        self.tray.set_track(track, self._tray_cover() if track is not None else None)
+
+    def _sync_tray_cover(self) -> None:
+        if self.tray is not None and self.player.current_track() is not None:
+            self.tray.set_cover(self._tray_cover())
+
+    def _tray_cover(self) -> Optional[QPixmap]:
+        if not self._now_art:
+            return None
+        return self.art.pixmap(self._now_art, 32, radius=theme.R_THUMB, dpr=self.devicePixelRatioF())
+
+    def _on_thumb_button(self, action: str) -> None:
+        {"previous": self.player.previous_track, "toggle": self.player.toggle_pause,
+         "next": self.player.next_track}[action]()
+
+    def _set_autostart(self, enabled: bool) -> None:
+        done = self.autostart.enable() if enabled else self.autostart.disable()
+        if not done:
+            self.autostart_action.blockSignals(True)
+            self.autostart_action.setChecked(not enabled)
+            self.autostart_action.blockSignals(False)
+            self._notice("No se pudo cambiar el inicio con Windows.", "error")
+            return
+        self.db.set_setting("autostart_with_windows", "1" if enabled else "0")
+
+    def _set_equalize(self, enabled: bool) -> None:
+        self.db.set_setting("equalize_volume", "1" if enabled else "0")
+        self.mpv.set_normalization("loudnorm" if enabled else None)
+
+    # -- mini reproductor ---------------------------------------------------
+    def show_mini(self) -> None:
+        if self.mini is None:
+            self.mini = MiniPlayer(self.player, self.art, self.db)
+            self.mini.restore_requested.connect(self.bring_to_front)
+            self.mini.set_ink(QColor(self._ink.value))
+        self.mini.place()
+        self.mini.show()
+        self.mini.raise_()
+        self.mini.activateWindow()
+        self.hide()
+
+    def toggle_mini(self) -> None:
+        if self.mini is not None and self.mini.isVisible():
+            self.bring_to_front()
+        else:
+            self.show_mini()
+
+    # -- temporizador de apagado -------------------------------------------
+    def _ask_sleep_minutes(self) -> None:
+        minutes, ok = QInputDialog.getInt(
+            self, "Temporizador de apagado", "Parar la música dentro de (minutos):", 90, 1, 600, 5)
+        if ok:
+            self.sleep.start_minutes(minutes)
+
+    def _on_sleep_changed(self) -> None:
+        active = self.sleep.active
+        self.sleep_cancel_action.setEnabled(active)
+        if not active:
+            self.sleep_btn.hide()
+            self.sleep_twin.hide()
+            return
+        metrics = QFontMetrics(theme.ui_font(13, QFont.Weight.Medium, tabular=True))
+        if self.sleep.mode == TRACK:
+            self.sleep_btn.set_label("Al acabar", "sleep")
+            self.sleep_btn.setToolTip("La música se parará al terminar esta canción. Pulsa para cancelar.")
+            template = "Al acabar"
+        else:
+            left = self.sleep.remaining_seconds() or 0
+            self.sleep_btn.set_label(format_time(left), "sleep")
+            ends = time.strftime("%H:%M", time.localtime(time.time() + left))
+            self.sleep_btn.setToolTip(f"La música se parará a las {ends}. Pulsa para posponer o cancelar.")
+            template = "8:88:88" if left >= 3600 else "88:88"
+        # Ancho fijo para la cuenta atrás: la barra no se recoloca cada segundo.
+        width = metrics.horizontalAdvance(template) + 22 + 2 * PillButton.PAD
+        self.sleep_btn.setFixedWidth(width)
+        self.sleep_twin.setFixedWidth(width)
+        self.sleep_btn.show()
+        self.sleep_twin.show()
+
+    def _on_sleep_remaining(self, seconds: int) -> None:
+        if self.sleep.mode == TIME:
+            if seconds in (3599, 3600):
+                self._on_sleep_changed()          # cambia el ancho al pasar de la hora
+            self.sleep_btn.setText(format_time(seconds))
+            self.sleep_btn.update()
+
+    def _open_sleep_badge_menu(self) -> None:
+        menu = rounded_menu(QMenu(self))
+        if self.sleep.mode == TIME:
+            menu.addAction("Posponer 10 minutos", lambda: self.sleep.postpone(10))
+        menu.addAction("Cancelar el temporizador", self.sleep.cancel)
+        menu.popup(self.sleep_btn.mapToGlobal(QPoint(0, -menu.sizeHint().height() - 4)))
+
+    def _on_sleep_expired(self) -> None:
+        if self.sleep_quit_action.isChecked():
+            self.quit_app()
+            return
+        self._notice("Temporizador de apagado: la música se detuvo.")
+
+    # -- copia de seguridad -------------------------------------------------
+    def _backup_folder(self) -> str:
+        documents = Path.home() / "Documents"
+        return str(documents if documents.is_dir() else Path.home())
+
+    def _export_backup(self) -> None:
+        suggested = Path(self._backup_folder()) / f"YT Music Nativo {time.strftime('%Y-%m-%d')}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar copia de seguridad", str(suggested), "Copia de seguridad (*.json)")
+        if not path:
+            return
+
+        def work():
+            try:
+                return backup.export_backup(self.db, path)
+            finally:
+                self.db.close_thread_connection()
+
+        def done(result, error) -> None:
+            if error is not None:
+                log.warning("no se pudo exportar la copia", exc_info=error)
+                self._notice(f"No se pudo guardar la copia: {error}", "error")
+            else:
+                self._notice(f"Copia guardada: {result.summary()}.")
+
+        run_async(work, done)
+
+    def _import_backup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Importar copia de seguridad", self._backup_folder(),
+            "Copia de seguridad (*.json);;Todos los archivos (*)")
+        if path:
+            run_async(lambda: backup.read_backup(path), self._on_backup_read)
+
+    def _on_backup_read(self, data: Optional[backup.Backup], error) -> None:
+        if error is not None:
+            message = str(error) if isinstance(error, backup.BackupError) else "No se pudo leer la copia."
+            self._notice(message, "error")
+            return
+        strategy = self._ask_backup_strategy(data)
+        if strategy is None:
+            return
+
+        def work():
+            try:
+                return backup.import_backup(self.db, data, strategy)
+            finally:
+                self.db.close_thread_connection()
+
+        run_async(work, self._on_backup_imported)
+
+    def _ask_backup_strategy(self, data: backup.Backup) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Importar copia de seguridad")
+        box.setText(f"La copia tiene {data.summary()}.")
+        box.setInformativeText(
+            "Fusionar añade lo que falta sin borrar nada ni repetir canciones. "
+            "Sobrescribir deja tus listas locales, el historial y las preferencias "
+            "como estaban en la copia (las listas de tu cuenta no se tocan)."
+        )
+        merge = box.addButton("Fusionar", QMessageBox.ButtonRole.AcceptRole)
+        replace = box.addButton("Sobrescribir", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(merge)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is merge:
+            return backup.MERGE
+        if clicked is replace:
+            return backup.REPLACE
+        return None
+
+    def _on_backup_imported(self, report: Optional[backup.ImportReport], error) -> None:
+        if error is not None:
+            log.warning("no se pudo importar la copia", exc_info=error)
+            self._notice("No se pudo importar la copia: no se cambió nada.", "error")
+            return
+        self._apply_saved_preferences()
+        self._refresh_after_sync()
+        if self._view_key == HISTORY_KEY:
+            self._show_view(HISTORY_KEY, force=True)
+        self._notice(f"Copia importada: {report.summary()}.")
+
+    def _apply_saved_preferences(self) -> None:
+        """Lo que trae una copia importada se ve enseguida, sin reiniciar."""
+        db = self.db
+        self.history_action.setChecked(db.get_bool(play_history.ENABLED_KEY, True))
+        self.autoplay_action.setChecked(db.get_bool("autoplay_radio", False))
+        self.resume_action.setChecked(db.get_bool(play_session.ENABLED_KEY, True))
+        self.equalize_action.setChecked(db.get_bool("equalize_volume", False))
+        self.collapse_action.setChecked(db.get_bool("sidebar_collapsed"))
+        self.close_to_tray_action.setChecked(db.get_bool("tray_close_to_tray", True))
+        self.minimize_to_tray_action.setChecked(db.get_bool("tray_minimize_to_tray", False))
+        self.sleep_quit_action.setChecked(db.get_bool("sleep_quit_app", False))
+        if self.volume_slider.value() > 0:
+            self.volume_slider.setValue(saved_volume(db))
 
     # ------------------------------------------------------------------ cierre
     def closeEvent(self, event) -> None:  # noqa: N802 - API de Qt
+        if not self._quitting and self._hides_on_close():
+            # La X de la ventana no para la música: queda en la bandeja.
+            event.ignore()
+            self._hide_to_tray()
+            return
+        self._quitting = True
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        """Cierre ordenado. Se puede llamar más de una vez (al cerrar la
+        ventana y al terminar la aplicación, p. ej. al cerrar sesión en Windows)."""
+        if self._shut_down:
+            return
+        self._shut_down = True
         # Cada paso va por separado: si uno falla (la base bloqueada al
         # guardar la sesión), los demás siguen y mpv y yt-dlp no quedan vivos.
         for name, step in (
             ("temporizadores", self._stop_timers),
+            ("temporizador de apagado", self.sleep.cancel),
+            ("mini reproductor", self._close_mini_for_good),
+            ("bandeja", self._close_tray),
             ("guardar la sesión", self.session.save),
             ("detener la reproducción", self.player.stop),
             ("cerrar mpv", self.mpv.shutdown),
@@ -2611,7 +3295,18 @@ class MainWindow(QMainWindow):
                 step()
             except Exception:  # noqa: BLE001 - el cierre debe completarse igual
                 log.exception("al cerrar, falló: %s", name)
-        super().closeEvent(event)
+
+    def _close_mini_for_good(self) -> None:
+        mini, self.mini = self.mini, None
+        if mini is not None:
+            mini.close_quietly()
+            mini.deleteLater()
+
+    def _close_tray(self) -> None:
+        if self.thumbbar is not None:
+            self.thumbbar.close()
+        if self.tray is not None:
+            self.tray.close()
 
     def _stop_timers(self) -> None:
         self._tick.stop()

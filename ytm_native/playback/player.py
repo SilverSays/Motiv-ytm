@@ -42,6 +42,15 @@ log = logging.getLogger("ytmn.player")
 
 STOPPED, LOADING, PLAYING, PAUSED = "stopped", "loading", "playing", "paused"
 REPEAT_OFF, REPEAT_ALL, REPEAT_ONE = "off", "all", "one"
+DEFAULT_VOLUME = 80
+
+
+def saved_volume(db: Database) -> int:
+    """Volumen con el que arranca la app: el último audible que eligió el
+    usuario. Un 0 guardado (versiones anteriores lo guardaban al silenciar)
+    no se respeta: la app no debe abrirse muda sin decir por qué."""
+    volume = db.get_int("volume", DEFAULT_VOLUME)
+    return volume if 0 < volume <= 100 else DEFAULT_VOLUME
 
 
 @dataclass(eq=False)
@@ -62,6 +71,7 @@ class PlaybackController(QObject):
     track_flagged = Signal(str)               # cambió la disponibilidad de un videoId
     modes_changed = Signal(bool, str)         # aleatorio, repetir
     queue_changed = Signal()
+    halted_after_track = Signal()             # se paró al acabar la pista (temporizador)
     _job_done = Signal(object, object)
     _radio_done = Signal(int, object, object)  # token, pistas, error
 
@@ -82,11 +92,17 @@ class PlaybackController(QObject):
         self.autoplay = db.get_bool("autoplay_radio", False)
         self._radio_token = 0
         self._radio_pending = False
+        # Al acabar la pista que suena, parar en vez de seguir con la cola.
+        self.stop_after_current = False
         self.state = STOPPED
         self.shuffle = False
         self.repeat = REPEAT_OFF
         self._queue: list[Track] = []
         self._order: list[int] = []
+        # Orden lógico de la cola (el de la lista, con lo añadido donde se
+        # pidió). Sin aleatorio coincide con ``_order``; con él, es adonde
+        # vuelve todo al quitarlo.
+        self._base: list[int] = []
         self._pos = -1
         self._gen = 0
         self._job: Optional[_Job] = None          # resolución de la pista actual
@@ -191,6 +207,9 @@ class PlaybackController(QObject):
         self._order = list(order)
         self._pos = max(0, min(int(pos), n - 1))
         self.shuffle = bool(shuffle)
+        # La sesión guarda el orden en que suena, no el lógico: sin aleatorio
+        # son el mismo; con él, el lógico es el de la lista.
+        self._base = list(range(n)) if self.shuffle else list(self._order)
         self.repeat = repeat if repeat in (REPEAT_OFF, REPEAT_ALL, REPEAT_ONE) else REPEAT_OFF
         track = self.current_track()
         self._duration = float(track.duration_s or 0)
@@ -211,6 +230,7 @@ class PlaybackController(QObject):
         if not tracks:
             return
         self._queue = list(tracks)
+        self._base = list(range(len(tracks)))
         start_index = max(0, min(start_index, len(tracks) - 1))
         self._build_order(start_index)
         self._reset_failures()
@@ -225,18 +245,26 @@ class PlaybackController(QObject):
 
     def enqueue(self, track: Track) -> None:
         """Añade una pista al final de la cola."""
-        self._insert(track, len(self._order))
+        self._insert(track, len(self._order), next_up=False)
 
     def play_next(self, track: Track) -> None:
         """Inserta una pista justo después de la actual."""
-        self._insert(track, self._pos + 1 if self._pos >= 0 else 0)
+        self._insert(track, self._pos + 1 if self._pos >= 0 else 0, next_up=True)
 
-    def _insert(self, track: Track, at: int) -> None:
+    def _insert(self, track: Track, at: int, next_up: bool) -> None:
         if self.current_track() is None:
             self.play_tracks([track], 0)
             return
         self._queue.append(track)
-        self._order.insert(max(0, min(at, len(self._order))), len(self._queue) - 1)
+        index = len(self._queue) - 1
+        self._order.insert(max(0, min(at, len(self._order))), index)
+        # En el orden lógico, «a continuación» va tras la que suena y «a la
+        # cola», al final: al quitar el aleatorio cada una sigue en su sitio.
+        if next_up:
+            current = self._order[self._pos]
+            self._base.insert(self._base.index(current) + 1, index)
+        else:
+            self._base.append(index)
         self._replan_prefetch()           # puede haber cambiado la "siguiente"
         self.queue_changed.emit()
 
@@ -286,6 +314,7 @@ class PlaybackController(QObject):
             self.db.upsert_track(track)
             self._queue.append(track)
             self._order.append(len(self._queue) - 1)
+            self._base.append(len(self._queue) - 1)
         self._replan_prefetch()
         self.queue_changed.emit()
         if advance and self.state == STOPPED:
@@ -368,14 +397,17 @@ class PlaybackController(QObject):
     # -- orden de la cola ---------------------------------------------------
     def _build_order(self, current_index: int) -> None:
         n = len(self._queue)
+        if sorted(self._base) != list(range(n)):
+            self._base = list(range(n))       # nunca debería pasar: se rehace entero
         if self.shuffle:
-            rest = [i for i in range(n) if i != current_index]
+            rest = [i for i in self._base if i != current_index]
             self._rng.shuffle(rest)
             self._order = [current_index] + rest
             self._pos = 0
         else:
-            self._order = list(range(n))
-            self._pos = current_index
+            # De vuelta al orden lógico, con la que suena en su sitio.
+            self._order = list(self._base)
+            self._pos = self._order.index(current_index) if 0 <= current_index < n else 0
 
     def _recently_unavailable(self, track: Track) -> bool:
         row = self.db.get_track(track.video_id)
@@ -707,6 +739,14 @@ class PlaybackController(QObject):
         return True
 
     def _advance_auto(self) -> None:
+        if self.stop_after_current:
+            # Como al final de la cola: "Reproducir" vuelve a empezar esta pista.
+            self.stop_after_current = False
+            self._entry_id = None
+            self._last_pos = 0.0
+            self._set_state(STOPPED)
+            self.halted_after_track.emit()
+            return
         pos = self._next_pos(auto=True)
         if pos is None:
             # Fin de la cola: "Reproducir" vuelve a empezar la última pista.

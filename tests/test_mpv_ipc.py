@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 from pathlib import Path
@@ -226,3 +227,103 @@ def test_orders_without_connection_are_dropped_with_one_warning(qapp, caplog):
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1 and "loadfile" in warnings[0].getMessage()
     assert player._pending_loads == {}
+
+
+# -- volumen igualado (filtros de audio) ---------------------------------------
+
+
+def record_commands(player):
+    sent = []
+    original = player.command
+
+    def command(*args):
+        sent.append(args)
+        return original(*args)
+
+    player.command = command
+    return sent
+
+
+def filter_orders(sent):
+    return [args[2] for args in sent if args[:2] == ("set_property", "af")]
+
+
+def test_igualar_el_volumen_se_aplica_en_marcha_sin_cortar_la_pista(qapp, mpv, caplog):
+    sent = record_commands(mpv)
+    mpv.load("https://example.invalid/normal")
+    assert wait_until(qapp, lambda: ("pos", 0.5) in mpv.events), mpv.events
+    pid = mpv._proc.processId()
+    with caplog.at_level("WARNING", logger="ytmn.mpv"):
+        mpv.set_normalization("loudnorm")
+        mpv.set_normalization("loudnorm")                 # lo mismo otra vez: nada que enviar
+        mpv.set_normalization("dynaudnorm")
+        mpv.set_normalization(None)
+        assert wait_until(qapp, lambda: mpv._filter_request == -1)   # mpv contestó
+    assert filter_orders(sent) == ["loudnorm=I=-16:TP=-1.5:LRA=11", "dynaudnorm=f=150:g=15", ""]
+    assert not [r for r in caplog.records if "filtro" in r.getMessage()]
+    # Ni se relanzó mpv ni terminó la pista.
+    assert mpv._proc.processId() == pid and mpv.is_ready()
+    assert not any(e[0] in ("ended", "crashed") for e in mpv.events)
+
+
+def test_el_filtro_elegido_antes_de_conectar_se_aplica_al_conectar(qapp):
+    player = MpvPlayer(mpv_path=Path(sys.executable), pre_args=[FAKE])
+    sent = record_commands(player)
+    player.set_normalization("loudnorm")
+    assert filter_orders(sent) == []                       # sin conexión no se pierde ni se avisa
+    player.start()
+    try:
+        assert wait_until(qapp, player.is_ready)
+        assert filter_orders(sent) == ["loudnorm=I=-16:TP=-1.5:LRA=11"]
+    finally:
+        player.shutdown()
+
+
+def test_un_mpv_relanzado_recupera_el_filtro(qapp, mpv):
+    mpv.set_normalization("loudnorm")
+    sent = record_commands(mpv)
+    mpv.load("https://example.invalid/crash")
+    assert wait_until(qapp, lambda: mpv.events.count(("ready",)) == 2), mpv.events
+    assert filter_orders(sent) == ["loudnorm=I=-16:TP=-1.5:LRA=11"]
+
+
+def test_la_opcion_del_menu_guarda_y_aplica_el_filtro(window, db):
+    assert not window.equalize_action.isChecked()          # desactivado por defecto
+    assert window.mpv.audio_filter == ""
+    window.equalize_action.setChecked(True)
+    assert db.get_bool("equalize_volume") and window.mpv.audio_filter.startswith("loudnorm=")
+    window.equalize_action.setChecked(False)
+    assert not db.get_bool("equalize_volume", True) and window.mpv.audio_filter == ""
+
+
+REAL_MPV = Path(os.environ.get("LOCALAPPDATA", "")) / "YTMusicNativo" / "bin" / "mpv.exe"
+
+
+@pytest.mark.skipif(not REAL_MPV.is_file(), reason="sin mpv instalado")
+def test_mpv_real_acepta_los_filtros_y_sigue_sonando(qapp, caplog):
+    """Con el mpv de verdad, en silencio (--ao=null) y un tono generado."""
+    player = MpvPlayer(mpv_path=REAL_MPV, pre_args=["--ao=null"])
+    positions = []
+    ended = []
+    player.position_changed.connect(positions.append)
+    player.file_ended.connect(lambda *a: ended.append(a))
+    player.start()
+    try:
+        assert wait_until(qapp, player.is_ready, timeout=15)
+        player.load("av://lavfi:sine=frequency=440:duration=60")
+        assert wait_until(qapp, lambda: positions and positions[-1] > 0.5, timeout=15)
+        with caplog.at_level("WARNING", logger="ytmn.mpv"):
+            for mode in ("loudnorm", "dynaudnorm", None):
+                player.set_normalization(mode)
+                assert wait_until(qapp, lambda: player._filter_request == -1, timeout=10)
+                before = positions[-1]
+                assert wait_until(qapp, lambda: positions[-1] > before + 0.5, timeout=10)
+            assert not [r for r in caplog.records if "filtro" in r.getMessage()]
+            # Un filtro que no existe sí se rechaza (y la comprobación no es de adorno).
+            player._audio_filter = "filtro_que_no_existe"
+            player._apply_audio_filter()
+            assert wait_until(qapp, lambda: player._filter_request == -1, timeout=10)
+        assert any("rechazó el filtro" in r.getMessage() for r in caplog.records)
+        assert not ended
+    finally:
+        player.shutdown()

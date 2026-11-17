@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 from ytm_native.services.discover import PlaylistCard, Shelf
 from . import theme
 from .art import ArtLoader, neutral_tint, placeholder_pixmap, sized_url, square_pixmap
-from .components import PillButton, Reveal, _alpha, _Pressable, note_launch
+from .components import PillButton, Reveal, _alpha, _Pressable, note_launch, window_sliding
 from .motion import CARD_STAGGER, EASE, FADE_MS, STAGGER_CAP, Tween, mix
 
 CardSpec = tuple[str, str, str, object]   # título, nota, URL de la carátula, lo que representa
@@ -272,6 +272,10 @@ class CardGrid(QWidget):
         self._cards: list[SleeveCard] = []
         self._count = 0
         self._shown = 0
+        self._plan: tuple = ()          # el último reparto aplicado
+        self._deferred = False          # un reajuste espera al fin del deslizamiento
+        self.relayouts = 0              # reajustes hechos (para medir)
+        self.relayouts_skipped = 0
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(0)
 
@@ -306,12 +310,21 @@ class CardGrid(QWidget):
     def columns(self) -> int:
         return max(2, (self.width() + self.GAP) // (self.MIN_CARD + self.GAP))
 
-    def _relayout(self) -> None:
+    def _relayout(self, force: bool = False) -> None:
         cols = self.columns()
         width = max(SleeveCard.PAD * 2 + 40,
                     min(self.MAX_CARD, (self.width() - self.GAP * (cols - 1)) // cols))
         height = SleeveCard.height_for(width)
         shown = min(self._count, cols * self._max_rows)
+        # Mismas columnas, mismo tamaño de tarjeta y mismas tarjetas: no hay
+        # nada que mover. Se evita invalidar el diseño del área que la
+        # contiene y avisar de nuevo (cada aviso recoloca más cosas).
+        plan = (cols, width, shown, self._count)
+        if plan == self._plan and not force:
+            self.relayouts_skipped += 1
+            return
+        self._plan = plan
+        self.relayouts += 1
         for i, card in enumerate(self._cards):
             if i < shown:
                 row, col = divmod(i, cols)
@@ -322,10 +335,23 @@ class CardGrid(QWidget):
         self._shown = shown
         self.fitted.emit(shown, self._count)
 
+    def settle(self) -> None:
+        """Fin de un deslizamiento de panel: el reajuste que se aplazó."""
+        if self._deferred:
+            self._deferred = False
+            self._relayout()
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        if event.size().width() != event.oldSize().width():
-            self._relayout()
+        if event.size().width() == event.oldSize().width():
+            return
+        if window_sliding(self):
+            # Un panel se está deslizando: el ancho cambia en cada fotograma.
+            # Recolocar todas las tarjetas en cada paso era lo que daba
+            # tirones; se hace una sola vez cuando el panel termina.
+            self._deferred = True
+            return
+        self._relayout()
 
 
 class ShelfSection(QWidget):

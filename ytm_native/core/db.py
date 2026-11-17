@@ -236,6 +236,10 @@ class Database:
     def _tx(self) -> "_Tx":
         return _Tx(self)
 
+    def transaction(self) -> "_Tx":
+        """Varias escrituras juntas o ninguna (``with db.transaction() as c``)."""
+        return _Tx(self)
+
     def close_thread_connection(self) -> None:
         conn = getattr(self._local, "conn", None)
         if conn is not None:

@@ -7,6 +7,11 @@ Reglas que sigue toda la interfaz:
 - Lo que se repite cientos de veces al día (teclas, navegar la lista, el hover
   de las filas) no se anima.
 - Nada dura más de 300 ms y lo que entra usa una curva que arranca rápido.
+  La única excepción es un movimiento continuo y lento ligado a lo que suena
+  (los aros de la cabecera): gira solo mientras hay música, cambia de ritmo en
+  ``SPIN_MS`` y se detiene del todo en reposo. Lo mismo vale para el título
+  del mini reproductor que no cabe: se desliza despacio, descansa en cada
+  vuelta y no se mueve si el texto cabe o la ventana no se ve.
 - Salir es más rápido que entrar.
 - Si Windows tiene desactivadas las animaciones, el movimiento desaparece y solo
   quedan los fundidos de color y opacidad.
@@ -50,6 +55,10 @@ REVEAL_MS = 300     # una fila o una tarjeta que aparece barriendo de izquierda 
 ROW_STAGGER = 28    # retraso entre una fila y la siguiente
 CARD_STAGGER = 40   # y entre una tarjeta y la de su derecha
 STAGGER_CAP = 14    # pasado este número, las demás llegan a la vez que la última
+SPIN_MS = 300       # los aros de la cabecera cogen velocidad o frenan hasta pararse
+FRAME_MS = 16       # un fotograma a 60 por segundo, para lo que se mueve sin parar
+MARQUEE_PX_S = 30   # velocidad del texto que no cabe y se desliza
+MARQUEE_REST_MS = 1800   # pausa al principio de cada vuelta, para poder leerlo quieto
 
 _reduced: Optional[bool] = None
 

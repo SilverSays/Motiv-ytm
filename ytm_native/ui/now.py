@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QFrame,
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from ytm_native.core.db import Track
 from ytm_native.services.discover import NowInfo
 from . import theme
-from .art import ArtLoader, Tint, neutral_tint, placeholder_pixmap, sized_url, square_pixmap, track_art_url
+from .art import BAR_ART_PX, ArtLoader, Tint, neutral_tint, placeholder_pixmap, sized_url, square_pixmap, track_art_url
 from .components import CoverLabel, ElidedLabel, IconButton, PillButton, Reveal, _alpha, _Pressable
 from .motion import EASE, EASE_OUT, FADE_MS, Tween, mix
 
@@ -74,22 +74,62 @@ class BigCover(QWidget):
         self._fade = Tween(self, 1.0, lambda _v: self.update(), ms=FADE_MS + 40, curve=EASE)
         self._grow = Tween(self, 1.0, lambda _v: self.update(), ms=240, curve=EASE_OUT, movement=True)
         self._held = False      # la imagen está de viaje: aquí no se pinta
+        self._waiting = False   # la anterior sigue a la vista hasta que llegue la nueva
+        self._serial = 0
+        # La carátula pequeña del reproductor (ya descargada): se enseña
+        # ampliada mientras llega la grande, en vez de la funda vacía.
+        self._fallback = ""
+        self._pix_source = ""
+        self._span: Optional[int] = None
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(200)
         loader.loaded.connect(self._on_loaded)
 
-    def _side(self) -> int:
-        return max(40, min(self.MAX_SIDE, self.width() - self.SHADOW))
+    def _side(self, width: Optional[int] = None) -> int:
+        if width is None:
+            width = self._span if self._span is not None else self.width()
+        return max(40, min(self.MAX_SIDE, width - self.SHADOW))
 
-    def _art_height(self) -> int:
+    def set_span(self, span: int) -> None:
+        """Ancho fijo del que dispone la imagen (lo decide el panel): no varía
+        con la barra de desplazamiento."""
+        if span != self._span:
+            self._span = span
+            self._fit_height()
+            self.update()
+
+    def _art_height(self, side: Optional[int] = None) -> int:
         """Alto de la imagen: cuadrada, o apaisada si es la miniatura de un vídeo."""
-        side = self._side()
+        side = self._side() if side is None else side
+        return max(40, round(side / self.aspect())) if self._wide else side
+
+    def aspect(self) -> float:
+        """Proporción (ancho / alto) con la que se pinta la imagen."""
         if not self._wide:
-            return side
+            return 1.0
+        image = self._source_image()
+        if image is None:
+            return 16 / 9
+        if image.width() <= image.height():
+            return 1.0
+        return image.width() / image.height()
+
+    def _source_image(self):
+        """La imagen grande si ya está; si no, la del reproductor ampliada."""
         image = self._loader.image(self._url) if self._url else None
-        if image is None or image.width() <= image.height():
-            return round(side * 9 / 16) if image is None else side
-        return max(40, round(side * image.height() / image.width()))
+        if image is None and self._fallback:
+            image = self._loader.image(self._fallback)
+        return image
+
+    def art_rect_for(self, width: int) -> QRectF:
+        """Dónde se pintará la imagen cuando disponga de ``width`` de ancho."""
+        side = self._side(width)
+        return QRectF(0, 0, side, self._art_height(side))
+
+    def prepare(self, side: int) -> None:
+        """Deja hecha la imagen a ese tamaño: al llegar la copia que vuela se
+        pinta en el acto, sin escalarla en ese fotograma."""
+        self._current(int(side))
 
     def _fit_height(self) -> None:
         self.setFixedHeight(self._art_height() + self.SHADOW)
@@ -98,22 +138,50 @@ class BigCover(QWidget):
         super().resizeEvent(event)
         self._fit_height()
 
-    def set_url(self, url: str, wide: bool = False) -> None:
+    def set_url(self, url: str, wide: bool = False, fallback: str = "") -> None:
         """``wide``: la imagen es la miniatura de un vídeo y se enseña entera,
-        sin recortarla a un cuadrado (se perdería medio fotograma)."""
+        sin recortarla a un cuadrado (se perdería medio fotograma).
+        ``fallback``: la misma carátula en pequeño, para mientras llega."""
         if url == self._url and wide == self._wide:
+            self._fallback = fallback or self._fallback
             return
         self._previous = self._current()
         self._url = url
         self._wide = wide
+        self._fallback = fallback
         self._pix = None
         self._fit_height()
+        self._serial += 1
+        self._waiting = False
         if self._previous is not None and self.isVisible():
             self._fade.set(0.0)
-            self._fade.to(1.0)
+            if url and self._current() is None and not self._loader.failed(url):
+                # La nueva aún no ha llegado: la anterior se queda entera hasta
+                # que llegue (o hasta que se canse de esperar), y entonces se
+                # funde una sola vez. Sin el paso intermedio por la funda vacía.
+                self._waiting = True
+                serial = self._serial
+                QTimer.singleShot(CoverLabel.HOLD_MS, self, lambda: self._stop_waiting(serial))
+            else:
+                self._fade.to(1.0)
         else:
             self._fade.set(1.0)
         self.update()
+
+    def _stop_waiting(self, serial: int) -> None:
+        if serial == self._serial and self._waiting:
+            self._waiting = False
+            self._fade.to(1.0)
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.DevicePixelRatioChange:
+            # Otra pantalla, otra escala: la imagen se rehace a la densidad
+            # nueva (la clave de ``_current`` incluye la escala) sin fundido.
+            self._pix = None
+            self._previous = None
+            self._fade.set(1.0)
+            self.update()
+        return super().event(event)
 
     def set_shadow_color(self, color: QColor) -> None:
         self._shadow = QColor(color)
@@ -133,27 +201,45 @@ class BigCover(QWidget):
         return QRectF(0, 0, self._side(), self._art_height())
 
     def flight_image(self):
-        """La imagen original, para la copia que viaja (``None`` si aún no ha llegado)."""
-        return self._loader.image(self._url) if self._url else None
+        """La imagen que se verá al aterrizar, para la copia que viaja
+        (``None`` si no hay ninguna todavía)."""
+        return self._source_image()
 
-    def _current(self) -> Optional[QPixmap]:
-        side, dpr = self._side(), self.devicePixelRatioF()
-        key = (self._url, side, self._wide, round(dpr, 2))
+    def _current(self, side: Optional[int] = None) -> Optional[QPixmap]:
+        side, dpr = (self._side() if side is None else side), self.devicePixelRatioF()
+        image = self._loader.image(self._url) if self._url else None
+        source = self._url
+        if image is None and self._fallback:
+            image, source = self._loader.image(self._fallback), self._fallback
+        key = (source, side, self._wide, round(dpr, 2))
         if self._pix is None or self._pix_key != key:
-            image = self._loader.image(self._url) if self._url else None
             if image is None:
                 return None
             radius = theme.R_COVER + 2
             if self._wide and image.width() > image.height():
-                self._pix = whole_pixmap(image, side, self._art_height(), radius, dpr)
+                self._pix = whole_pixmap(image, side, self._art_height(side), radius, dpr)
             else:
                 self._pix = square_pixmap(image, side, radius, dpr)
             self._pix_key = key
+            self._pix_source = source
         return self._pix
 
     def _on_loaded(self, url: str) -> None:
         if url and url == self._url:
+            stand_in = self._pix if self._pix_source == self._fallback and self._fallback else None
             self._pix = None
+            self._fit_height()
+            if self._waiting:
+                self._waiting = False
+                self._fade.to(1.0)
+            elif stand_in is not None and self.isVisible() and not self._held:
+                # Llega la grande sobre la pequeña ampliada: misma imagen, más
+                # nítida. Se funde para que no se note el cambio.
+                self._previous = stand_in
+                self._fade.set(0.0)
+                self._fade.to(1.0)
+            self.update()
+        elif url and url == self._fallback and self._pix is None:
             self._fit_height()
             self.update()
 
@@ -180,6 +266,9 @@ class BigCover(QWidget):
                                 radius, radius)
         painter.setPen(Qt.PenStyle.NoPen)
         pixmap = self._current()
+        if pixmap is None and self._waiting and self._previous is not None:
+            painter.drawPixmap(area, self._previous, QRectF(self._previous.rect()))
+            return
         if pixmap is None:
             if self._wide:
                 painter.setBrush(QColor(theme.RELIEVE))
@@ -504,6 +593,31 @@ class NowPanel(QFrame):
         outer.addWidget(self.scroll, 1)
         self.show_idle()
 
+    # -- geometría proyectada -----------------------------------------------
+    def projected_cover_rect(self, width: int, height: int) -> QRectF:
+        """Dónde se pintará la carátula, en coordenadas del panel, cuando el
+        panel mida ``width`` x ``height``. Se calcula con los márgenes del
+        diseño, no midiendo los widgets: mientras el panel se abre su ancho
+        cambia en cada fotograma y lo medido en vivo es un blanco móvil."""
+        frame = self.frameWidth()
+        head = self.layout().itemAt(0).sizeHint().height()
+        margins = self.scroll.widget().layout().contentsMargins()
+        art = self.cover.art_rect_for(self._cover_span(width))
+        return art.translated(frame + margins.left(), frame + head + margins.top())
+
+    def _cover_span(self, width: int) -> int:
+        """Ancho del que dispone la carátula con el panel a ``width``. Siempre
+        descuenta la barra de desplazamiento, esté o no: si dependiera de ella,
+        la carátula cambiaría de tamaño cuando llegan los datos del artista y
+        la página crece (justo al acabar de abrirse el panel)."""
+        margins = self.scroll.widget().layout().contentsMargins()
+        bar = self.scroll.verticalScrollBar().sizeHint().width()
+        return width - 2 * self.frameWidth() - margins.left() - margins.right() - bar
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - API de Qt
+        super().resizeEvent(event)
+        self.cover.set_span(self._cover_span(self.width()))
+
     # -- estados ------------------------------------------------------------
     def show_idle(self) -> None:
         self._info = None
@@ -517,7 +631,8 @@ class NowPanel(QFrame):
         self.body.show()
         # La miniatura de un vídeo es apaisada: se enseña entera, no recortada.
         self.cover.set_url(track_art_url(track.video_id, track.thumb_url, 544),
-                           wide="i.ytimg.com/vi" in (track.thumb_url or ""))
+                           wide="i.ytimg.com/vi" in (track.thumb_url or ""),
+                           fallback=track_art_url(track.video_id, track.thumb_url, BAR_ART_PX))
         self.title.setText(track.title)
         self.artists.setText(track.artists)
         self.scroll.verticalScrollBar().setValue(0)
