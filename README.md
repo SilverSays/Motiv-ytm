@@ -40,6 +40,25 @@ interface, with each playlist's color pulled from its cover art. The app's inter
   preloading of the next tracks so there's no waiting. When you open the app,
   the queue and the song come back at the second you left them, stopped (this can
   be turned off in the **⋯** menu).
+- **Loudness equalization (volume normalization)**: optional audio normalization
+  using `mpv`'s `loudnorm` (EBU R128) or `dynaudnorm` filters, switchable on the fly
+  without interrupting playback.
+- **Sleep timer**: schedule playback to stop after 15, 30, 45, 60 minutes or when the
+  current song ends. Gently fades out volume over the last 12 seconds and restores your
+  listening volume once stopped. Can optionally exit the app.
+- **System tray & background playback**: closing the window minimizes to the system tray
+  by default so music never stops. Includes a rich context menu with playback controls,
+  mini player toggle, and an optional "Start with Windows" setting. Single-instance
+  support restores the existing window when launched again.
+- **Taskbar thumbnail toolbar**: hover over the taskbar button to access playback
+  controls (Previous, Play/Pause, Next) directly within Windows' thumbnail preview,
+  adapting cleanly to light and dark themes.
+- **Compact mini player**: a floating, frameless always-on-top window (332×104 px)
+  with smooth marquee title scrolling, cover art, seek bar, and screen clamping so it
+  never gets lost off-screen (`Ctrl+M`).
+- **Backup and restore**: export your local playlists, listening history, and settings
+  to an atomic JSON backup file. Import back with options to merge or replace. Private
+  by design: never exports credentials, session tokens, or cookies.
 - **Resilience**: if YouTube changes something and playback breaks, the app updates
   `yt-dlp` by itself, checks that the new version works and rolls back if it doesn't.
 - **Windows media controls**: the media keys on your keyboard or headphones work
@@ -58,9 +77,12 @@ interface, with each playlist's color pulled from its cover art. The app's inter
 | Ctrl+F | Search |
 | Ctrl+L | Show lyrics |
 | Ctrl+I | Show "Now playing" |
+| Ctrl+M | Toggle mini player |
 | Ctrl+B | Collapse or expand the sidebar |
 | Ctrl+N | New local playlist |
+| F5 | Sync library with account |
 | Alt+← | Back to the previous view |
+| Ctrl+Q | Exit application |
 
 ## Installation
 
@@ -147,8 +169,8 @@ ytm_native/
 ├── __main__.py, app.py   Startup: creates the database, the player and the window
 ├── core/                 The base everything else uses
 ├── playback/             Everything that makes a song play
-├── services/             YouTube Music and LRCLIB data
-├── ui/                   The Qt interface
+├── services/             YouTube Music, LRCLIB data, and local backups
+├── ui/                   The Qt interface, system tray, mini player, and taskbar
 └── tools/                Development tools (not part of the app)
 tests/                    Automated tests (no network, with a fake mpv and yt-dlp)
 instalar.bat, iniciar.bat Install and launch on Windows
@@ -162,26 +184,30 @@ instalar.bat, iniciar.bat Install and launch on Windows
 | `config.py` | Constants: timeouts, request limits, sync cadence. |
 | `db.py` | SQLite database: tracks, playlists, local playlists, settings and caches. |
 | `errors.py` | Classifies `yt-dlp` errors (blocked, network, expired session, unavailable…) and their messages. |
+| `instance.py` | Single-instance lock via local IPC socket and window foreground activation. |
+| `proc_guard.py` | Windows Job Objects for process tree management and synchronous I/O cancellation. |
 
 **`playback/`: playback**
 
 | File | What it does |
 | :--- | :--- |
 | `extractor.py` | The audio *fetcher*: runs `yt-dlp` to get each song's URL, keeps a URL cache and updates `yt-dlp` with rollback if the new version fails. |
-| `mpv_ipc.py` | Launches `mpv` as a separate process and controls it through its IPC pipe. |
+| `mpv_ipc.py` | Launches `mpv` as a separate process, controls it through IPC, and applies audio normalization filters. |
 | `history.py` | Decides when a song counts as listened and records it in listening history. |
 | `player.py` | The player: queue, shuffle, repeat, radio, preloading and error recovery. |
+| `sleep_timer.py` | Sleep timer with smooth volume fade-out and track-completion stopping. |
 | `session.py` | Saves the queue and the current second, and restores them on startup. |
 | `bootstrap.py` | Downloads and installs `yt-dlp`, `deno` and `mpv`. |
 | `media_controls.py` | Publishes what's playing to Windows (title, artist, cover art) and handles its buttons. |
 
-**`services/`: online data**
+**`services/`: online data and backups**
 
 | File | What it does |
 | :--- | :--- |
 | `sync.py` | Syncs the account's library with `ytmusicapi`, manages the session and searches the local library. |
 | `discover.py` | Search, suggestions, home recommendations, other people's playlists, artist pages and the "Now playing" info. |
 | `lyrics.py` | LRCLIB lyrics and which line is the current one. |
+| `backup.py` | Atomic export and import of local playlists, listening history, and preferences. |
 
 **`ui/`: interface**
 
@@ -195,6 +221,9 @@ instalar.bat, iniciar.bat Install and launch on Windows
 | `search.py` | Search parts: tabs and results grid. |
 | `artist.py` | The artist page. |
 | `now.py` | The "Now playing" panel. |
+| `mini_player.py` | Compact floating mini player with smooth marquee text and screen clamping. |
+| `tray.py` | System tray icon with multi-resolution vector rendering and Windows autostart. |
+| `taskbar.py` | Native Windows COM (`ITaskbarList3`) thumbnail toolbar controls. |
 | `widgets.py` | The track table model and the account dialog. |
 | `art.py` | Cover art download and cache, and the color pulled from each one. |
 | `chrome.py`, `focus.py` | Window-wide details: title bar, menus and a keyboard-only focus ring. |
