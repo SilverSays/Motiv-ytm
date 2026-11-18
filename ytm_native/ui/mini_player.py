@@ -77,6 +77,10 @@ class MarqueeLabel(QWidget):
         self._cache = None
         self.update()
 
+    def retheme(self, previous: str) -> None:
+        self._background = QColor(theme.PANEL)
+        self.set_color(theme.translate(self._color, previous))
+
     def overflows(self) -> bool:
         return self._text_width > self.width()
 

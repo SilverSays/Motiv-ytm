@@ -94,6 +94,26 @@ CREATE TABLE IF NOT EXISTS plays (
 );
 CREATE INDEX IF NOT EXISTS idx_plays_at ON plays (played_at);
 CREATE INDEX IF NOT EXISTS idx_plays_video ON plays (video_id);
+-- Lo que la cuenta de YouTube Music dice de cada canción (me gusta y
+-- biblioteca), solo de las que la app cambió o consultó. NULL = no se sabe.
+CREATE TABLE IF NOT EXISTS account_marks (
+    video_id   TEXT PRIMARY KEY,
+    rating     TEXT,
+    in_library INTEGER,
+    updated_at REAL NOT NULL
+);
+-- Archivos de música del disco. La pista vive en ``tracks`` con el id
+-- ``local:<sha1 de la ruta>``; aquí, dónde está y cómo era al leerla (si
+-- tamaño y fecha no cambian, no se vuelve a leer).
+CREATE TABLE IF NOT EXISTS local_files (
+    video_id   TEXT PRIMARY KEY,
+    path       TEXT NOT NULL,
+    folder     TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime      REAL NOT NULL,
+    scanned_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_local_files_folder ON local_files (folder);
 """
 
 
@@ -557,7 +577,9 @@ class Database:
             ).fetchone()
         if row is None:
             return ""
-        return row["thumb_url"] or f"https://i.ytimg.com/vi/{row['video_id']}/mqdefault.jpg"
+        if row["thumb_url"] or row["video_id"].startswith(LOCAL_PREFIX):
+            return row["thumb_url"] or ""         # un archivo del disco no tiene miniatura en YouTube
+        return f"https://i.ytimg.com/vi/{row['video_id']}/mqdefault.jpg"
 
     def delete_playlists_not_in(self, keep_ids: Iterable[str]) -> int:
         keep = list(keep_ids)
@@ -666,6 +688,126 @@ class Database:
                 "INSERT OR REPLACE INTO lyrics (video_id, fetched_at, payload) VALUES (?, ?, ?)",
                 (video_id, time.time(), payload),
             )
+
+    # -- estado en la cuenta de YouTube Music --------------------------------
+    def get_account_mark(self, video_id: str) -> tuple[Optional[str], Optional[bool]]:
+        """(valoración, en la biblioteca) que se sabe de la cuenta; None = no se sabe."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT rating, in_library FROM account_marks WHERE video_id=?", (video_id,)
+            ).fetchone()
+        if row is None:
+            return None, None
+        in_library = row["in_library"]
+        return row["rating"], None if in_library is None else bool(in_library)
+
+    def set_account_rating(self, video_id: str, rating: Optional[str], now: Optional[float] = None) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO account_marks (video_id, rating, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(video_id) DO UPDATE SET rating=excluded.rating, updated_at=excluded.updated_at",
+                (video_id, rating, time.time() if now is None else now),
+            )
+
+    def set_account_library(self, video_id: str, in_library: Optional[bool],
+                            now: Optional[float] = None) -> None:
+        value = None if in_library is None else int(bool(in_library))
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO account_marks (video_id, in_library, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(video_id) DO UPDATE SET in_library=excluded.in_library, "
+                "updated_at=excluded.updated_at",
+                (video_id, value, time.time() if now is None else now),
+            )
+
+    def playlist_set_video_id(self, playlist_id: str, video_id: str) -> Optional[str]:
+        """El ``setVideoId`` (copia concreta en la lista de la cuenta) de una canción."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT set_video_id FROM playlist_tracks WHERE playlist_id=? AND video_id=? "
+                "AND set_video_id IS NOT NULL ORDER BY position LIMIT 1",
+                (playlist_id, video_id),
+            ).fetchone()
+        return row["set_video_id"] if row else None
+
+    def remove_playlist_entry(self, playlist_id: str, video_id: str, set_video_id: Optional[str] = None) -> bool:
+        """Quita una canción de la copia local de una lista de la cuenta (tras
+        quitarla en la cuenta), sin esperar a la próxima sincronización."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT video_id, set_video_id FROM playlist_tracks WHERE playlist_id=? ORDER BY position",
+                (playlist_id,),
+            ).fetchall()
+            keep = [(r["video_id"], r["set_video_id"]) for r in rows]
+            for i, (vid, set_vid) in enumerate(keep):
+                if vid == video_id and (set_video_id is None or set_vid == set_video_id):
+                    del keep[i]
+                    break
+            else:
+                return False
+            c.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
+            c.executemany(
+                "INSERT INTO playlist_tracks (playlist_id, position, video_id, set_video_id) VALUES (?, ?, ?, ?)",
+                [(playlist_id, i, vid, set_vid) for i, (vid, set_vid) in enumerate(keep)],
+            )
+        return True
+
+    # -- archivos de música del disco ---------------------------------------
+    def local_file_path(self, video_id: str) -> Optional[str]:
+        with self._tx() as c:
+            row = c.execute("SELECT path FROM local_files WHERE video_id=?", (video_id,)).fetchone()
+        return row["path"] if row else None
+
+    def local_file_index(self, folder: str) -> dict[str, tuple[str, int, float]]:
+        """Lo que se leyó de la carpeta: ruta -> (id, tamaño, fecha de modificación)."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT video_id, path, size, mtime FROM local_files WHERE folder=?", (folder,)
+            ).fetchall()
+        return {r["path"]: (r["video_id"], r["size"], r["mtime"]) for r in rows}
+
+    def save_local_files(self, folder: str, found: Iterable[tuple[Track, str, int, float]],
+                         gone: Iterable[str] = (), now: Optional[float] = None) -> None:
+        """Guarda lo leído de la carpeta en una sola transacción. Los datos del
+        archivo mandan: pisan título, artistas, álbum, duración y carátula."""
+        now = time.time() if now is None else now
+        with self._tx() as c:
+            for track, path, size, mtime in found:
+                c.execute(
+                    "INSERT INTO tracks (video_id, title, artists, album, duration_s, thumb_url) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, "
+                    "artists=excluded.artists, album=excluded.album, duration_s=excluded.duration_s, "
+                    "thumb_url=excluded.thumb_url, unavailable_since=NULL, unavailable_reason=NULL",
+                    _track_params(track),
+                )
+                c.execute(
+                    "INSERT INTO local_files (video_id, path, folder, size, mtime, scanned_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(video_id) DO UPDATE SET path=excluded.path, "
+                    "folder=excluded.folder, size=excluded.size, mtime=excluded.mtime, "
+                    "scanned_at=excluded.scanned_at",
+                    (track.video_id, path, folder, int(size), float(mtime), now),
+                )
+            c.executemany("DELETE FROM local_files WHERE video_id=?", [(vid,) for vid in gone])
+
+    def forget_local_folder(self, keep_folder: Optional[str] = None) -> int:
+        """Olvida los archivos de otras carpetas (al cambiar de carpeta)."""
+        with self._tx() as c:
+            if keep_folder is None:
+                return c.execute("DELETE FROM local_files").rowcount
+            return c.execute("DELETE FROM local_files WHERE folder<>?", (keep_folder,)).rowcount
+
+    def local_tracks(self) -> list[Track]:
+        """Las canciones del disco, por artista, álbum y título."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT t.* FROM local_files lf JOIN tracks t ON t.video_id = lf.video_id "
+                "ORDER BY t.artists COLLATE NOCASE, t.album COLLATE NOCASE, lf.path COLLATE NOCASE"
+            ).fetchall()
+        return [self._track(r) for r in rows]
+
+    def local_track_count(self) -> int:
+        with self._tx() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM local_files").fetchone()["n"]
 
     # -- historial de escucha ----------------------------------------------
     def log_play(self, video_id: str, now: Optional[float] = None) -> None:

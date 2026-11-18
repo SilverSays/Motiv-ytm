@@ -51,6 +51,9 @@ PREFERENCE_KEYS = (
     "tray_close_to_tray",
     "tray_minimize_to_tray",
     "sleep_quit_app",
+    # Fase 8: el tema sí. Los cambios en la cuenta no (se activan solo tras
+    # su aviso) ni la carpeta de música (es de este equipo).
+    "app_theme",
 )
 
 _VIDEO_ID = re.compile(r"^[\w\-.]{1,64}$", re.ASCII)

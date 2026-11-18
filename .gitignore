@@ -17,6 +17,10 @@ credenciales/
 fase0/
 bin/
 
+# Salida del empaquetado (PyInstaller e Inno Setup)
+build/
+dist/
+
 # Notas de desarrollo que no se publican
 notas-locales/
 

@@ -91,12 +91,13 @@ def glyph_pixmap(name: str, size: int, color: str, dpr: float = 1.0) -> QPixmap:
 
 
 def paint_reveal(painter: QPainter, rect: QRectF, progress: float, left: float, width: float,
-                 base: str = theme.PANEL) -> None:
+                 base: Optional[str] = None) -> None:
     """Tapa con el color del panel lo que aún no ha aparecido: un borde suave
     que barre de izquierda a derecha entre ``left`` y ``left + width``. Es un
     fundido, no un desplazamiento: con las animaciones reducidas también vale."""
     if progress >= 1.0:
         return
+    base = base or theme.PANEL           # el del tema en uso (claro u oscuro)
     soft = max(24.0, width * 0.45)
     edge = left - soft + progress * (width + soft)
     gradient = QLinearGradient(edge, 0, edge + soft, 0)
@@ -423,6 +424,10 @@ class IconButton(_Pressable):
         self.setFixedSize(size, size)
         self.setToolTip(tooltip)
         self.setAccessibleName(tooltip)
+
+    def retheme(self, previous: str) -> None:
+        self._ink = theme.translate(self._ink, previous)
+        self.update()
 
     def set_glyph(self, name: str) -> None:
         if name != self._glyph:
@@ -782,6 +787,9 @@ class ElidedLabel(QWidget):
         self._color = QColor(color)
         self.update()
 
+    def retheme(self, previous: str) -> None:
+        self.set_color(theme.translate(self._color, previous))
+
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(QFontMetrics(self._font).horizontalAdvance(self._text) + 2, self.height())
 
@@ -892,6 +900,14 @@ class CoverLabel(QWidget):
 
     def set_shadow_color(self, color: QColor) -> None:
         self._shadow_color = color
+        self.update()
+
+    def retheme(self, previous: str) -> None:
+        """La funda vacía y la sombra se pintan con colores del tema."""
+        self._shadow_color = theme.translate(self._shadow_color, previous)
+        self._shown = self._resolve()
+        self._previous = None
+        self._fade.set(1.0)
         self.update()
 
     def set_round(self, round_art: bool) -> None:
@@ -1377,6 +1393,12 @@ class PlaylistBand(QWidget):
     RING_PEN = 1.5
     GOLD_PEN = 3.0
 
+    def retheme(self, previous: str) -> None:
+        """Los aros toman la luz del tema (en el oscuro, más suave)."""
+        self._pen_inner.setColor(QColor(*theme.AROS, 120))
+        self._pen_outer.setColor(QColor(*theme.AROS, 120 if theme.is_dark() else 170))
+        self.update()
+
     def _init_rings(self) -> None:
         self._playing = False
         self._window_shown = True
@@ -1396,8 +1418,8 @@ class PlaylistBand(QWidget):
         self._ring_timer.setInterval(FRAME_MS)
         self._ring_timer.timeout.connect(self._ring_tick)
         # Lo que no cambia de un fotograma a otro se prepara una vez.
-        self._pen_inner = QPen(QColor(255, 255, 255, 120), self.RING_PEN)
-        self._pen_outer = QPen(QColor(255, 255, 255, 170), self.RING_PEN)
+        self._pen_inner = QPen(QColor(*theme.AROS, 120), self.RING_PEN)
+        self._pen_outer = QPen(QColor(*theme.AROS, 170 if not theme.is_dark() else 120), self.RING_PEN)
         self._pen_gold = QPen(QColor(theme.ORO), self.GOLD_PEN)
         self._pen_gold.setCapStyle(Qt.PenCapStyle.RoundCap)
         self._band_path = QPainterPath()
@@ -1811,6 +1833,12 @@ class TrackTable(QTableView):
         self.setColumnWidth(1, album)
         self.setColumnWidth(2, self.DURATION_WIDTH)
 
+    def retheme(self, previous: str) -> None:
+        delegate = self.itemDelegate()
+        if hasattr(delegate, "retheme"):
+            delegate.retheme(previous)
+        self.viewport().update()
+
     # -- ecualizador --------------------------------------------------------
     def set_playing(self, playing: bool) -> None:
         self.playing = playing
@@ -1925,6 +1953,14 @@ class TrackDelegate(QStyledItemDelegate):
         self._on_veil = QColor(theme.SOBRE_SOLIDO)
         self._play_pen = QPen(self._on_veil, 1.4)
         self._play_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+
+    def retheme(self, previous: str) -> None:
+        self.ink = theme.translate(self.ink, previous)
+        self._papel = QColor(theme.PAPEL)
+        self._humo = QColor(theme.HUMO)
+        self._dim = QColor(theme.TENUE)
+        self._on_veil = QColor(theme.SOBRE_SOLIDO)
+        self._play_pen.setColor(self._on_veil)
 
     def _elide(self, font: QFont, text: str, width: int) -> str:
         return self._metrics[id(font)].elidedText(text, Qt.TextElideMode.ElideRight, width)
@@ -2115,9 +2151,16 @@ class SidebarFooter(QWidget):
         lay.setSpacing(4)
         self.status = ElidedLabel(theme.ui_font(12), theme.HUMO)
         self.menu_btn = IconButton("more", "Menú de la aplicación", size=36, glyph_px=16, quiet=True)
+        # Versión nueva de la app: un enlace discreto que abre su página en el
+        # navegador (no descarga ni instala nada). Oculto mientras no haya.
+        self.update_btn = PillButton("", "quiet", glyph="window")
+        self.update_btn.setFixedHeight(30)
+        self.update_btn.hide()
         lay.addWidget(self.status, 1)
+        lay.addWidget(self.update_btn)
         lay.addWidget(self.menu_btn)
         self._detail = ""
+        self._collapsed = False
 
     def set_status(self, text: str, alert: bool = False, detail: str = "") -> None:
         self.status.setText(text)
@@ -2128,8 +2171,20 @@ class SidebarFooter(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         """Barra lateral contraída: solo cabe el botón del menú, centrado. El
         estado sigue disponible al pasar el ratón por encima."""
+        self._collapsed = collapsed
         self.status.setVisible(not collapsed)
+        self.update_btn.setVisible(not collapsed and bool(self.update_btn.text()))
         self.layout().setContentsMargins(*((14, 6, 14, 6) if collapsed else (16, 6, 6, 6)))
+
+    def set_update(self, version: str) -> None:
+        """Enseña (o quita, con ``""``) el enlace a la versión nueva."""
+        if version:
+            self.update_btn.set_label(version, "window")
+            self.update_btn.setToolTip(f"Versión {version} disponible: abre su página en el navegador")
+            self.update_btn.setAccessibleName(f"Versión {version} disponible")
+        else:
+            self.update_btn.set_label("", "window")
+        self.update_btn.setVisible(bool(version) and not self._collapsed)
 
 
 _launch: Optional[tuple] = None
@@ -2474,6 +2529,16 @@ class LyricsPanel(QFrame):
 
     def set_ink(self, color: QColor) -> None:
         self._delegate.ink = QColor(color)
+        self.list.viewport().update()
+
+    def retheme(self, previous: str) -> None:
+        self._delegate.ink = theme.translate(self._delegate.ink, previous)
+        self._delegate.rest = QColor(theme.TENUE)
+        for row in range(self.list.count()):
+            item = self.list.item(row)
+            brush = item.data(Qt.ItemDataRole.ForegroundRole)
+            if isinstance(brush, QBrush):
+                item.setForeground(theme.translate(brush.color(), previous))
         self.list.viewport().update()
 
     # -- línea actual -------------------------------------------------------

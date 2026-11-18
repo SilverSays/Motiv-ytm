@@ -615,6 +615,52 @@ def test_vuelo_de_la_caratula_va_a_un_destino_fijo_y_proyectado(window, net, mon
     assert abs(real.width() - end.width()) <= 1 and abs(real.height() - end.height()) <= 1
 
 
+def test_vuelo_con_el_panel_desplazado_no_salta(window, net, monkeypatch):
+    """Abrir el panel con el desplazamiento de la vez anterior hacía aterrizar
+    la copia entera sobre el título y saltar luego a la carátula medio tapada;
+    al cerrarlo, la copia salía de encima de la cabecera."""
+    from ytm_native.ui.art import BAR_ART_PX, track_art_url
+
+    _slide_ready(window, monkeypatch)
+    window.resize(1180, 520)                   # baja: el panel tiene que desplazarse
+    thumb = "https://lh3.googleusercontent.com/caratula=w120-h120"
+    track = Track("sonic", "His World", "Crush 40", thumb_url=thumb)
+    for px in (BAR_ART_PX, 544):
+        _art(window, track_art_url(track.video_id, thumb, px), "#2a5bd8")
+    monkeypatch.setattr(window.player, "current_track", lambda: track)
+    window._on_current_changed(track)
+    window.now_cover.clicked.emit()
+    assert wait_until(lambda: window._flight is None and not window.is_sliding()
+                      and window.now_panel.info() is not None, timeout_ms=motion.FLIGHT_MS + 1500)
+    panel = window.now_panel
+    bar = panel.scroll.verticalScrollBar()
+    assert bar.maximum() > panel.cover.height() // 2
+    bar.setValue(bar.maximum())                # la carátula queda fuera de la vista
+    assert not panel.cover_in_view()
+
+    # Cerrar: sin vuelo, porque la carátula no se ve.
+    window.now_cover.clicked.emit()
+    assert window._flight is None
+    assert wait_until(lambda: not panel.isVisible() and not window.is_sliding(),
+                      timeout_ms=motion.FLIGHT_MS + 600)
+
+    # Abrir otra vez: el panel empieza arriba y la copia aterriza donde está la carátula.
+    window.now_cover.clicked.emit()
+    flight = window._flight
+    assert flight is not None and bar.value() == 0
+    end = flight.end_rect()
+    assert wait_until(lambda: window._flight is None and not window.is_sliding(),
+                      timeout_ms=motion.FLIGHT_MS + 600)
+    assert bar.value() == 0 and panel.cover_in_view()
+    real = _host_rect(window, panel.cover)
+    assert abs(real.x() - end.x()) <= 1 and abs(real.y() - end.y()) <= 1
+    assert abs(real.width() - end.width()) <= 1 and abs(real.height() - end.height()) <= 1
+
+    # Con la carátula a la vista, cerrar sí vuela.
+    window.now_cover.clicked.emit()
+    assert window._flight is not None and not window._flight.opening
+
+
 def test_caratula_grande_usa_la_pequena_mientras_llega(window, net, monkeypatch):
     from ytm_native.ui.art import BAR_ART_PX, track_art_url
 

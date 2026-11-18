@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPainterPath, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 from ytm_native.core import paths
@@ -47,7 +47,9 @@ def sized_url(url: str, px: int) -> str:
 def track_art_url(video_id: str, thumb_url: str, px: int) -> str:
     if thumb_url:
         return sized_url(thumb_url, px)
-    return f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else ""
+    if not video_id or video_id.startswith("local:"):
+        return ""                  # un archivo del disco sin carátula incrustada
+    return f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
 
 
 @dataclass(frozen=True)
@@ -66,8 +68,9 @@ def neutral_tint() -> Tint:
 def tint_from_image(image: QImage) -> Tint:
     """Tono dominante de la carátula, ponderado por saturación.
 
-    La banda usa ese tono pastel, muy claro (la tinta pizarra siempre se lee
-    encima), y la tinta, el mismo tono hondo para resaltar sobre el panel claro.
+    En el tema claro la banda usa ese tono pastel, muy claro (la tinta pizarra
+    siempre se lee encima), y la tinta, el mismo tono hondo para resaltar sobre
+    el panel. En el oscuro, al revés: banda honda y tinta clara.
     """
     if image.isNull():
         return neutral_tint()
@@ -96,38 +99,64 @@ def tint_from_image(image: QImage) -> Tint:
     return Tint(band, ink)
 
 
-# Fondo más oscuro sobre el que se lee la tinta: la fila que suena seleccionada
-# (la tinta al 17 % sobre el panel). El texto de la banda es el más tenue que
-# se pinta encima de ella.
+# Fondo sobre el que se lee la tinta: la fila que suena seleccionada (la tinta
+# al 17 % sobre el panel). El texto de la banda es el más tenue que se pinta
+# encima de ella (cambia con el tema: ver ``on_theme_changed``).
 INK_ROW_ALPHA = 0.17
-BAND_TEXT = QColor(24, 38, 46, round(0.80 * 255))
 
 
-def readable_ink(hue: float, sat: float, lightness: float = 0.33) -> QColor:
-    """Tinta honda del tono de la carátula que se lee con contraste AA sobre
-    el panel y sobre la fila que suena. Los amarillos, verdes y cianes son
-    mucho más luminosos que un azul con la misma luminosidad HSL: para ellos
-    se baja la luminosidad hasta llegar al contraste mínimo."""
+def band_text() -> QColor:
+    r, g, b = theme.BANDA_TINTA
+    return QColor(r, g, b, round(0.80 * 255))
+
+
+BAND_TEXT = band_text()
+
+
+def on_theme_changed() -> None:
+    """Tras ``theme.use_scheme``: el texto de la banda y las fundas sin carátula."""
+    global BAND_TEXT
+    BAND_TEXT = band_text()
+    _PLACEHOLDERS.clear()
+
+
+def readable_ink(hue: float, sat: float, lightness: Optional[float] = None) -> QColor:
+    """Tinta del tono de la carátula que se lee con contraste AA sobre el
+    panel y sobre la fila que suena. Los amarillos, verdes y cianes son mucho
+    más luminosos que un azul con la misma luminosidad HSL: en el tema claro
+    se oscurece hasta llegar al contraste mínimo; en el oscuro, se aclara."""
     panel = QColor(theme.PANEL)
+    dark = theme.is_dark()
+    if lightness is None:
+        lightness = 0.66 if dark else 0.33
+    step = 0.01 if dark else -0.01
     while True:
         ink = QColor.fromHslF(hue, sat, lightness)
         tinted = QColor(ink)
         tinted.setAlphaF(INK_ROW_ALPHA)
         row = theme.composite(tinted, panel)
-        if lightness <= 0.12 or min(theme.contrast_ratio(ink, panel),
-                                    theme.contrast_ratio(ink, row)) >= theme.MIN_TEXT_CONTRAST:
+        limit = lightness >= 0.95 if dark else lightness <= 0.12
+        if limit or min(theme.contrast_ratio(ink, panel),
+                        theme.contrast_ratio(ink, row)) >= theme.MIN_TEXT_CONTRAST:
             return ink
-        lightness -= 0.01
+        lightness += step
 
 
-def readable_band(hue: float, sat: float, lightness: float = 0.86) -> QColor:
-    """Banda pastel sobre la que el texto más tenue de la cabecera se lee con
-    contraste AA; si no llega, se aclara."""
+def readable_band(hue: float, sat: float, lightness: Optional[float] = None) -> QColor:
+    """Banda sobre la que el texto más tenue de la cabecera se lee con
+    contraste AA: pastel que se aclara (tema claro) u honda que se oscurece
+    (tema oscuro) hasta llegar."""
+    dark = theme.is_dark()
+    if lightness is None:
+        lightness = 0.22 if dark else 0.86
+    step = -0.01 if dark else 0.01
+    text = band_text()
     while True:
         band = QColor.fromHslF(hue, sat, lightness)
-        if lightness >= 0.97 or theme.contrast_ratio(BAND_TEXT, band) >= theme.MIN_TEXT_CONTRAST:
+        limit = lightness <= 0.05 if dark else lightness >= 0.97
+        if limit or theme.contrast_ratio(text, band) >= theme.MIN_TEXT_CONTRAST:
             return band
-        lightness += 0.01
+        lightness += step
 
 
 def square_pixmap(image: QImage, size: int, radius: float, dpr: float = 1.0) -> QPixmap:
@@ -197,6 +226,7 @@ class ArtLoader(QObject):
     # carátulas que hace más tiempo que no se usan.
     DISK_LIMIT_BYTES = 200 * 1024 * 1024
     PRUNE_EVERY = 200      # escrituras entre una poda y la siguiente
+    LOCAL_ART_PX = 640     # lado máximo al leer la carátula de un archivo del disco
 
     def __init__(self, parent: Optional[QObject] = None, cache_dir: Optional[Path] = None):
         super().__init__(parent)
@@ -227,6 +257,20 @@ class ArtLoader(QObject):
         image = self._images.get(url)
         if image is not None:
             self._images.move_to_end(url)
+            return image
+        if url.startswith("file:"):
+            # Carátula de un archivo del disco: se lee de su sitio, sin red ni
+            # copia en caché, y ya reducida (las incrustadas pueden medir 3000 px).
+            reader = QImageReader(QUrl(url).toLocalFile())
+            size = reader.size()
+            if size.isValid() and max(size.width(), size.height()) > self.LOCAL_ART_PX:
+                reader.setScaledSize(size.scaled(self.LOCAL_ART_PX, self.LOCAL_ART_PX,
+                                                 Qt.AspectRatioMode.KeepAspectRatio))
+            image = reader.read()
+            if image.isNull():
+                self._failed.add(url)
+                return None
+            self._remember(url, image)
             return image
         path = self._path(url)
         if path.is_file():
@@ -281,6 +325,10 @@ class ArtLoader(QObject):
             self._frame.start()
         else:
             self._budget = self.DECODES_PER_FRAME
+
+    def forget_tints(self) -> None:
+        """Al cambiar de tema: los tonos se recalculan para el esquema nuevo."""
+        self._tints.clear()
 
     def tint(self, url: str) -> Optional[Tint]:
         cached = self._tints.get(url)

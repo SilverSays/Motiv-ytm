@@ -180,6 +180,8 @@ LYRICS_NEGATIVE_CACHE_S = 7 * 86400   # "sin letra" se vuelve a consultar pasada
 # que debe quedar para lanzar otra.
 LYRICS_BUDGET_S = 15.0
 LYRICS_MIN_REQUEST_S = 1.0
+# Lo más que se espera a YouTube Music (segunda fuente) dentro de ese total.
+LYRICS_YTMUSIC_TIMEOUT_S = 8.0
 RADIO_LIMIT = 25
 MPV_MAX_RESTARTS_PER_MIN = 3
 # Controles multimedia de Windows: cada cuánto se le dice por dónde va la pista
@@ -189,6 +191,68 @@ MEDIA_TIMELINE_INTERVAL_S = 5.0
 # garantía de parecer "humano", solo acota el volumen).
 MAX_RESOLVES_PER_HOUR = 60
 DAILY_RESOLVE_SOFT_CAP = 250
+
+# --- Integraciones opcionales (Fase 7) --------------------------------------
+# Todas vienen apagadas: nada sale hacia Discord ni Last.fm hasta que el
+# usuario lo activa.
+#
+# Discord: el id de la aplicación registrada en discord.com/developers (su
+# nombre es lo que Discord enseña tras «Escuchando»). Vacío = se pide al
+# activar la opción. Discord admite 5 cambios de actividad cada 20 s: entre
+# dos envíos pasa al menos esto. Sin Discord abierto se reintenta conectar
+# con estas esperas crecientes (la última se repite).
+DISCORD_CLIENT_ID = ""
+DISCORD_MIN_UPDATE_S = 4.0
+DISCORD_RETRY_DELAYS_S = (15, 30, 60, 120, 300)
+# Un salto en la barra mayor que esto se le cuenta a Discord (lo demás es el
+# avance normal, que Discord ya calcula con las marcas de inicio y fin).
+DISCORD_SEEK_TOLERANCE_S = 2.0
+#
+# Last.fm: clave y secreto de la aplicación registrada en last.fm/api. Vacíos =
+# se piden al conectar (también valen YTMN_LASTFM_API_KEY / _SECRET).
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_AUTH_URL = "https://www.last.fm/api/auth/"
+LASTFM_API_KEY = ""
+LASTFM_API_SECRET = ""
+LASTFM_TIMEOUT_S = 15
+# Reglas de Last.fm: una pista de más de 30 s se registra al sonar la mitad o
+# 4 minutos, lo que llegue antes. Tandas de 50 como máximo, y no acepta
+# escuchas de hace más de 14 días.
+LASTFM_MIN_TRACK_S = 30
+LASTFM_SCROBBLE_MAX_S = 240
+LASTFM_BATCH = 50
+LASTFM_MAX_AGE_S = 14 * 86400
+LASTFM_QUEUE_MAX = 5000
+LASTFM_MAX_ATTEMPTS = 10              # rechazos (no cortes de red) antes de tirar una escucha
+LASTFM_RETRY_DELAYS_S = (60, 300, 900, 1800)
+#
+# Aviso de versión nueva de la app: una consulta a GitHub al día como mucho.
+# Nunca se descarga ni se instala nada: solo se enseña un enlace a la página.
+APP_UPDATE_CHECK_INTERVAL_S = 86400
+APP_UPDATE_TIMEOUT_S = 10
+APP_UPDATE_STARTUP_DELAY_S = 90
+APP_RELEASES_API = "https://api.github.com/repos/SilverSays/Proyecto-YT-Music-Nativo/releases/latest"
+# Solo se abren enlaces que empiecen así (lo que diga la respuesta no manda).
+APP_RELEASES_PAGE = "https://github.com/SilverSays/Proyecto-YT-Music-Nativo/releases"
+
+# --- Cuenta, sesión y contenido (Fase 8) ------------------------------------
+# Cambios en la cuenta de YouTube Music (me gusta, biblioteca, listas): todo
+# apagado por defecto. Con el conmutador apagado no sale ninguna petición de
+# escritura. Entre dos cambios seguidos pasa al menos este tiempo, para que
+# una ráfaga de clics no parezca un robot.
+ACCOUNT_MUTATIONS_KEY = "allow_account_mutations"
+ACCOUNT_HISTORY_KEY = "report_history_to_youtube"
+ACCOUNT_MIN_INTERVAL_S = 1.5
+ACCOUNT_STATUS_DELAY_MS = 1500        # pausa antes de preguntar el estado de la pista que suena
+#
+# Música del disco: formatos que se leen y lo más que se recorre de una vez.
+LOCAL_MUSIC_DIR_KEY = "local_music_dir"
+LOCAL_AUDIO_EXTENSIONS = (".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav")
+LOCAL_SCAN_MAX_FILES = 50000
+LOCAL_ART_MAX_BYTES = 8 * 1024 * 1024  # carátula incrustada más grande que esto: se ignora
+#
+# Tema: "system" (sigue a Windows), "light" o "dark".
+THEME_KEY = "app_theme"
 
 # --- Criterios de la Fase 0 (definidos ANTES de correr la prueba) ----------
 FASE0_MIN_DAYS = 3

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QFrame,
@@ -183,6 +183,13 @@ class BigCover(QWidget):
             self.update()
         return super().event(event)
 
+    def retheme(self, previous: str) -> None:
+        self._shadow = theme.translate(self._shadow, previous)
+        self._pix = None                  # la funda vacía se vuelve a pintar con el tema nuevo
+        self._previous = None
+        self._fade.set(1.0)
+        self.update()
+
     def set_shadow_color(self, color: QColor) -> None:
         self._shadow = QColor(color)
         self.update()
@@ -296,6 +303,10 @@ class ClampText(QWidget):
         self.clipped = False
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(0)
+
+    def retheme(self, previous: str) -> None:
+        self._color = theme.translate(self._color, previous)
+        self.update()
 
     def setText(self, text: str) -> None:  # noqa: N802
         self._text = " ".join((text or "").split())
@@ -617,6 +628,22 @@ class NowPanel(QFrame):
     def resizeEvent(self, event) -> None:  # noqa: N802 - API de Qt
         super().resizeEvent(event)
         self.cover.set_span(self._cover_span(self.width()))
+
+    # -- desplazamiento -----------------------------------------------------
+    def scroll_to_top(self) -> None:
+        """Al abrir, el panel empieza por la carátula. La proyección del vuelo
+        (``projected_cover_rect``) la da por arriba del todo: si el panel
+        conservara el desplazamiento de la última vez, la copia aterrizaría
+        entera sobre el título y saltaría a la carátula medio tapada."""
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def cover_in_view(self) -> bool:
+        """¿La carátula se ve entera, sin que el desplazamiento la corte?"""
+        if self.body.isHidden():
+            return False
+        viewport = self.scroll.viewport()
+        art = self.cover.art_rect().translated(QPointF(self.cover.mapTo(viewport, QPoint(0, 0))))
+        return QRectF(viewport.rect()).contains(art)
 
     # -- estados ------------------------------------------------------------
     def show_idle(self) -> None:

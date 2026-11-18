@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtGui import QAction, QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMenu
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QLabel, QMainWindow, QMenu, QVBoxLayout, QWidget, QWidgetAction,
+)
 
 from . import focus, theme
 from .components import glyph_pixmap
@@ -22,20 +24,132 @@ def rounded_menu(menu: QMenu) -> QMenu:
     return menu
 
 
-def show_check(action: QAction, dpr: float = 1.0) -> QAction:
-    """Marca de verificación propia para una acción con casilla.
+def menu_section(menu: QMenu, title: str, note: str = "", first: bool = False) -> QWidgetAction:
+    """Rótulo de un grupo de opciones dentro de un menú.
 
-    La columna del icono se reserva siempre (con una imagen vacía cuando está
-    desmarcada), así el texto no cambia de sitio de una apertura a otra.
+    Ordena, no se elige: va desactivado, así que ni el ratón lo resalta ni las
+    flechas se paran en él. Sale hacia la izquierda, a la altura de las
+    casillas, y el texto de sus opciones queda sangrado debajo. Entre grupos
+    separa el aire de encima, no una raya. ``note`` es una línea de ayuda bajo
+    el rótulo, para los submenús cuyas opciones no se explican solas.
     """
-    checked = QIcon(glyph_pixmap("check", 16, theme.PAPEL, dpr))
+    box = QWidget()
+    box.setObjectName("menuSectionBox")
+    lay = QVBoxLayout(box)
+    # El aire de arriba lo pone el QSS (``#menuSection``): así se aprieta
+    # con el menú cuando la pantalla es baja (``compact``).
+    lay.setContentsMargins(4, 0, 12, 0)
+    lay.setSpacing(1)
+    label = QLabel(title)
+    label.setObjectName("menuSection")
+    label.setProperty("first", first)
+    lay.addWidget(label)
+    if note:
+        hint = QLabel(note)
+        hint.setObjectName("menuNote")
+        lay.addWidget(hint)
+        lay.addSpacing(4)
+    action = QWidgetAction(menu)
+    action.setText(title)
+    action.setDefaultWidget(box)
+    action.setEnabled(False)
+    menu.addAction(action)
+    return action
+
+
+_CHECK_ICONS: dict[tuple, QIcon] = {}
+_CHECKS: list = []        # (acción, cómo repintar su marca): se repintan al cambiar de tema
+
+
+def _check_icon(dpr: float) -> QIcon:
+    key = ("check", theme.scheme(), round(dpr, 2))
+    icon = _CHECK_ICONS.get(key)
+    if icon is None:
+        icon = _CHECK_ICONS[key] = QIcon(glyph_pixmap("check", 16, theme.PAPEL, dpr))
+    return icon
+
+
+def _box_icon(on: bool, dpr: float) -> QIcon:
+    """Casilla de un interruptor: hueca si está apagado, llena de tinta con la
+    marca en el color del panel si está encendido. Así un interruptor se
+    distingue de una acción aunque esté apagado."""
+    key = ("box", on, theme.scheme(), round(dpr, 2))
+    icon = _CHECK_ICONS.get(key)
+    if icon is None:
+        side = max(1, round(16 * dpr))
+        pix = QPixmap(side, side)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.scale(dpr, dpr)
+        frame = QRectF(1.5, 1.5, 13.0, 13.0)
+        if on:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(theme.PAPEL))
+            painter.drawRoundedRect(frame, 3.5, 3.5)
+            pen = QPen(QColor(theme.PANEL), 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(QPolygonF([QPointF(4.6, 8.2), QPointF(7.0, 10.5), QPointF(11.5, 5.6)]))
+        else:
+            painter.setPen(QPen(QColor(theme.TENUE), 1.3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(frame.adjusted(0.3, 0.3, -0.3, -0.3), 3.5, 3.5)
+        painter.end()
+        pix.setDevicePixelRatio(dpr)
+        icon = _CHECK_ICONS[key] = QIcon(pix)
+    return icon
+
+
+def _blank_icon(dpr: float) -> QIcon:
     blank_pixmap = QPixmap(max(1, round(16 * dpr)), max(1, round(16 * dpr)))
     blank_pixmap.fill(Qt.GlobalColor.transparent)
     blank_pixmap.setDevicePixelRatio(dpr)
-    blank = QIcon(blank_pixmap)
-    action.toggled.connect(lambda on: action.setIcon(checked if on else blank))
-    action.setIcon(checked if action.isChecked() else blank)
+    return QIcon(blank_pixmap)
+
+
+def _track_icon(action: QAction, paint) -> QAction:
+    action.toggled.connect(paint)
+    paint(action.isChecked())
+    _CHECKS.append((action, paint))
     return action
+
+
+def show_check(action: QAction, dpr: float = 1.0) -> QAction:
+    """Casilla propia para una acción que se enciende y se apaga.
+
+    Se ve siempre, también apagada: lo que tiene casilla es un interruptor y
+    lo que no la tiene, una acción. La columna del icono es la misma en los
+    dos estados, así el texto no cambia de sitio de una apertura a otra.
+    """
+    return _track_icon(action, lambda on: action.setIcon(_box_icon(on, dpr)))
+
+
+def show_choice(action: QAction, dpr: float = 1.0) -> QAction:
+    """Marca para una opción de un grupo excluyente (el tema): solo la elegida
+    lleva marca; las demás reservan el hueco con una imagen vacía."""
+    blank = _blank_icon(dpr)
+    return _track_icon(action, lambda on: action.setIcon(_check_icon(dpr) if on else blank))
+
+
+def refresh_checks() -> None:
+    """Tras cambiar de tema: las marcas toman la tinta nueva."""
+    alive = []
+    for action, paint in _CHECKS:
+        try:
+            paint(action.isChecked())
+        except RuntimeError:          # la acción ya no existe
+            continue
+        alive.append((action, paint))
+    _CHECKS[:] = alive
+
+
+def apply_theme(app: QApplication) -> None:
+    """Paleta y hoja de estilos del esquema en uso (``theme.use_scheme``)."""
+    app.setPalette(theme.palette())
+    app.setStyleSheet(theme.QSS)
 
 
 class _Chrome(QObject):
@@ -67,8 +181,7 @@ class _Chrome(QObject):
 
 def install(app: QApplication) -> None:
     app.setStyle("Fusion")
-    app.setPalette(theme.palette())
-    app.setStyleSheet(theme.QSS)
+    apply_theme(app)
     chrome = _Chrome(app)
     app.installEventFilter(chrome)
     app._ytmn_chrome = chrome  # noqa: SLF001 - referencia viva mientras exista la aplicación

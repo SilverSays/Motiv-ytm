@@ -124,9 +124,7 @@ def build(app: QApplication) -> MainWindow:
     window = MainWindow(db, extractor, mpv, player, sync, bridge)
     # La sesión multimedia de Windows la publica la app (con artista y
     # carátula); si no se puede, queda la básica de mpv.
-    controls = MediaControls(
-        player, window, art_url=lambda track: track_art_url(track.video_id, track.thumb_url, 300)
-    )
+    controls = MediaControls(player, window, art_url=_media_art_url)
     mpv.set_media_controls(not controls.active)
     app.aboutToQuit.connect(controls.close)
     # La ventana ya los cierra al cerrarse; esto cubre las salidas que no pasan
@@ -140,6 +138,13 @@ def build(app: QApplication) -> MainWindow:
     # Referencias vivas mientras exista la ventana.
     window._keep = (db, bridge, extractor, mpv, player, sync, controls)  # noqa: SLF001
     return window
+
+
+def _media_art_url(track) -> str:
+    """Carátula para los controles de Windows: solo direcciones web (la de un
+    archivo del disco no la acepta)."""
+    url = track_art_url(track.video_id, track.thumb_url, 300)
+    return "" if url.startswith("file:") else url
 
 
 def _child_stopper(mpv: MpvPlayer, extractor: ExtractorManager):
@@ -172,6 +177,12 @@ def main() -> int:
         log.info("la app ya estaba abierta: se le pasa el foco y esta sale")
         return 0
     try:
+        # Ya como única instancia: nadie más usa las credenciales ni el perfil
+        # de Firefox del inicio de sesión mientras se migran o se borran.
+        try:
+            paths.secure_credentials()
+        except Exception:  # noqa: BLE001 - se reintenta en el próximo arranque
+            log.exception("no se pudieron asegurar las credenciales al arrancar")
         chrome.install(app)
         window = build(app)
         # Abrir la app otra vez (con esta en la bandeja o en el mini

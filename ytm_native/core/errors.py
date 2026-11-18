@@ -7,6 +7,14 @@ Comparar texto de ``stderr`` es frágil, así que:
   o un fallo de extracción pueden ser consecuencia de un bloqueo, y en ese caso
   el culpable no es ni la pista ni el binario.
 * Lo que no encaja en ningún patrón cae en ``UNKNOWN`` (con reintentos acotados).
+
+Contingencia de PO tokens (Tarea 8.7, ``docs/diseno_po_tokens.md``): la señal
+para activar un proveedor de PO tokens es que ``BOT_BLOCK`` y ``EXTRACTION``
+(en especial "n challenge", "challenge solving failed", "requested format is
+not available" y "sabr") se repitan a la vez en todos los clientes primarios,
+con sesión y sin ella, durante días. Lo que es ``NETWORK``, ``UNAVAILABLE``,
+``NEEDS_LOGIN`` o ``RUNTIME_MISSING`` no cuenta. Mientras no se cumpla, no hay
+código de PO tokens: estas categorías solo deciden reintentos y pausas.
 """
 
 from __future__ import annotations

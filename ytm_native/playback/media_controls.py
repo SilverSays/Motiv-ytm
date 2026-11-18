@@ -144,6 +144,8 @@ def open_windows_session(on_button: Callable[[str], None],
 
 
 def default_art_url(track: Track) -> str:
+    if track.thumb_url.startswith("file:") or (not track.thumb_url and track.video_id.startswith("local:")):
+        return ""          # Windows solo acepta aquí direcciones web
     return track.thumb_url or f"https://i.ytimg.com/vi/{track.video_id}/mqdefault.jpg"
 
 

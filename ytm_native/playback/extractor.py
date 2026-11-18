@@ -39,7 +39,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
-from ytm_native.core import config, paths, proc_guard
+from ytm_native.core import config, credentials, paths, proc_guard
 from ytm_native.core.db import Database
 from ytm_native.core.errors import MESSAGES_ES, ErrorKind, classify, cookies_look_invalid, summarize
 
@@ -373,11 +373,17 @@ class WarmProcess:
     termina sin URL (y borra su carpeta temporal).
     """
 
-    def __init__(self, args: list[str], key: tuple):
+    def __init__(self, args: list[str], key: tuple, on_exit: Optional[Callable[[], None]] = None):
         self.key = key                    # (con cookies, nivel): con qué opciones arrancó
         self.born = time.monotonic()
         self.reaper: Optional[threading.Thread] = None
         self.proc = _spawn(args, subprocess.PIPE)
+        if on_exit is not None:
+            # Las cookies efímeras de este proceso viven lo que vive él, salga
+            # como salga (usado, descartado, matado o caducado).
+            threading.Thread(
+                target=_after_exit, args=(self.proc, on_exit), name="yt-dlp-cookies", daemon=True
+            ).start()
 
     def usable(self, key: tuple) -> bool:
         return (
@@ -416,6 +422,13 @@ class WarmProcess:
         except subprocess.TimeoutExpired:
             kill_tree(self.proc)
         _close_pipes(self.proc)
+
+
+def _after_exit(proc: subprocess.Popen, on_exit: Callable[[], None]) -> None:
+    try:
+        proc.wait()
+    finally:
+        on_exit()
 
 
 def probe_url(url: str, user_agent: str = "", timeout: float = 6.0) -> int:
@@ -492,7 +505,9 @@ class ExtractorManager:
         self.db = db
         self.ytdlp = Path(ytdlp) if ytdlp else paths.ytdlp_exe()
         self.deno = Path(deno) if deno else paths.deno_exe()
+        # Cifrado en disco: yt-dlp nunca lo recibe; recibe una copia efímera.
         self.cookies = Path(cookies) if cookies else paths.cookies_txt()
+        self._cookies_checked: Optional[tuple] = None    # (firma del archivo, ¿se pudo leer?)
         self.cache = Path(cache) if cache else paths.cache_dir() / "yt-dlp"
         self.bak = self.ytdlp.with_name("yt-dlp.bak")
         # Existe mientras dura ``yt-dlp -U``: si sigue ahí al arrancar, la
@@ -551,7 +566,41 @@ class ExtractorManager:
         """Las cookies solo se pasan a yt-dlp si existen Y el usuario aceptó el
         riesgo de forma explícita (yt-dlp advierte que usar una cuenta puede
         acabar en un baneo temporal o permanente)."""
-        return self.cookies.is_file() and self.db.get_bool("cookies_risk_accepted")
+        return (
+            self.cookies.is_file()
+            and self.db.get_bool("cookies_risk_accepted")
+            and self._cookies_readable()
+        )
+
+    def _cookies_readable(self) -> bool:
+        """¿Se puede descifrar ``cookies.txt``? Se comprueba una vez por versión
+        del archivo. Si no (de otro usuario de Windows, dañado), es como no
+        tener cookies: la app sigue en modo anónimo y avisa una vez."""
+        try:
+            stat = self.cookies.stat()
+        except OSError:
+            return False
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if self._cookies_checked is None or self._cookies_checked[0] != signature:
+            ok = credentials.readable(self.cookies)
+            self._cookies_checked = (signature, ok)
+            if not ok:
+                self._notice("Las cookies guardadas no se pueden descifrar: vuelve a importarlas "
+                             "o inicia sesión otra vez. Mientras, se reproduce sin cuenta.")
+        return self._cookies_checked[1]
+
+    def _ephemeral_cookies(self, use_cookies: bool) -> Optional[credentials.EphemeralCookies]:
+        """La copia legible de las cookies para un proceso de yt-dlp, o
+        ``None`` si no se usan o no se pueden descifrar."""
+        if not use_cookies:
+            return None
+        session = credentials.EphemeralCookies(self.cookies)
+        try:
+            session.open()
+        except (OSError, credentials.CredentialError) as exc:
+            log.warning("no se pudieron preparar las cookies para yt-dlp: %s", type(exc).__name__)
+            return None
+        return session
 
     def _default_use_cookies(self) -> bool:
         if not self.cookies_usable():
@@ -638,10 +687,18 @@ class ExtractorManager:
                 if self._warm.usable(key):
                     return
                 stale, self._warm = self._warm, None
-            try:
-                self._warm = WarmProcess(self.warm_args(*key), key)
-            except OSError as exc:
-                log.warning("no se pudo precalentar yt-dlp: %s", exc)
+            jar = self._ephemeral_cookies(key[0])
+            # Sin cookies legibles no se precalienta ese modo.
+            if not key[0] or jar is not None:
+                try:
+                    self._warm = WarmProcess(
+                        self.warm_args(key[0], key[1], jar.path if jar else None), key,
+                        on_exit=jar.close if jar else None,
+                    )
+                except OSError as exc:
+                    log.warning("no se pudo precalentar yt-dlp: %s", exc)
+                    if jar is not None:
+                        jar.close()
         if stale is not None:
             self._discard_async(stale)
 
@@ -719,9 +776,12 @@ class ExtractorManager:
             log.warning("al cerrar quedaron %d yt-dlp sin terminar", pending)
 
     # -- línea de comandos --------------------------------------------------
-    def base_args(self, use_cookies: bool, tier: str = "default") -> list[str]:
+    def base_args(self, use_cookies: bool, tier: str = "default", cookie_file: Optional[Path] = None) -> list[str]:
         """``tier``: "fast" (solo el cliente rápido), "default" (los clientes
-        que elija yt-dlp) o "full" (además, sin recortar manifiestos)."""
+        que elija yt-dlp) o "full" (además, sin recortar manifiestos).
+
+        Con cookies, ``cookie_file`` es la copia efímera y legible: el
+        ``cookies.txt`` guardado está cifrado y yt-dlp lo reescribiría al salir."""
         args = [
             str(self.ytdlp),
             "--ignore-config",
@@ -744,11 +804,13 @@ class ExtractorManager:
             # Ruta explícita: no se depende de que yt-dlp encuentre deno solo.
             args += ["--js-runtimes", f"deno:{self.deno}"]
         if use_cookies:
-            args += ["--cookies", str(self.cookies)]
+            if cookie_file is None:
+                raise ValueError("con cookies hace falta su copia efímera")
+            args += ["--cookies", str(cookie_file)]
         return args
 
-    def warm_args(self, use_cookies: bool, tier: str = "default") -> list[str]:
-        return self.base_args(use_cookies, tier) + ["-f", config.AUDIO_FORMAT, "--dump-json", "-a", "-"]
+    def warm_args(self, use_cookies: bool, tier: str = "default", cookie_file: Optional[Path] = None) -> list[str]:
+        return self.base_args(use_cookies, tier, cookie_file) + ["-f", config.AUDIO_FORMAT, "--dump-json", "-a", "-"]
 
     def _extract_once(
         self,
@@ -812,8 +874,15 @@ class ExtractorManager:
                         self._reapers = [r for r in self._reapers if r.is_alive()] + [process.reaper]
         was_warm = run is not None
         if run is None:
-            args = self.base_args(use_cookies, tier) + ["-f", config.AUDIO_FORMAT, "--dump-json", "--", url]
-            run = self._runner(args, config.RESOLVE_TIMEOUT_S, should_stop)
+            jar = self._ephemeral_cookies(use_cookies)
+            try:
+                args = self.base_args(jar is not None, tier, jar.path if jar else None)
+                args += ["-f", config.AUDIO_FORMAT, "--dump-json", "--", url]
+                run = self._runner(args, config.RESOLVE_TIMEOUT_S, should_stop)
+            finally:
+                # La copia legible existe solo mientras corre este yt-dlp.
+                if jar is not None:
+                    jar.close()
         log.info(
             "yt-dlp %s: %.2f s (%s, %s, rc=%s)", video_id, run.elapsed,
             "precalentado" if was_warm else "en frío",

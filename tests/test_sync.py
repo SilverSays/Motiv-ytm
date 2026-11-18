@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from ytm_native.core import config
+from ytm_native.core import config, credentials
 from ytm_native.services import sync as sync_module
 from ytm_native.services.sync import (
     CookieKeeper,
@@ -458,13 +458,15 @@ def test_rotated_cookies_are_synced_to_disk_before_replacing(tmp_path, monkeypat
     write_browser_json(path)
     synced = []
     real_fsync = os.fsync
-    monkeypatch.setattr(sync_module.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
+    monkeypatch.setattr(credentials.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
     keeper = CookieKeeper(path, baseline=SESSION)
     keeper.set_cookies = ["SID=2; Path=/; Secure"]
     assert keeper.persist() == ["SID"]
     assert len(synced) == 1
-    assert json.loads(path.read_text(encoding="utf-8"))["Cookie"].startswith("SID=2;")
-    assert not path.with_name("browser.json.tmp").exists()
+    assert credentials.is_sealed_file(path)                 # siempre cifrado (DPAPI)
+    assert json.loads(credentials.read_text(path))["Cookie"].startswith("SID=2;")
+    assert b"SAPISID" not in path.read_bytes()
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_a_failed_replace_keeps_the_file_and_removes_the_temporary(tmp_path, monkeypatch):
@@ -474,12 +476,12 @@ def test_a_failed_replace_keeps_the_file_and_removes_the_temporary(tmp_path, mon
     def locked(src, dst):
         raise PermissionError("el archivo está en uso")
 
-    monkeypatch.setattr(sync_module.os, "replace", locked)
+    monkeypatch.setattr(credentials.os, "replace", locked)
     keeper = CookieKeeper(path, baseline=SESSION)
     keeper.set_cookies = ["SID=2; Path=/"]
     assert keeper.persist() == []
     assert json.loads(path.read_text(encoding="utf-8"))["Cookie"] == SESSION
-    assert not path.with_name("browser.json.tmp").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_cookies_of_an_old_session_do_not_overwrite_new_credentials(tmp_path):
@@ -490,7 +492,7 @@ def test_cookies_of_an_old_session_do_not_overwrite_new_credentials(tmp_path):
     new = "SID=nueva; SAPISID=otra; __Secure-3PSID=y"
     write_browser_json(path, new)              # el usuario importó cabeceras a mitad de sincronización
     assert keeper.persist() == []
-    assert json.loads(path.read_text(encoding="utf-8"))["Cookie"] == new
+    assert json.loads(credentials.read_text(path))["Cookie"] == new
 
 
 def test_search_uses_given_client_and_skips_items_without_id():

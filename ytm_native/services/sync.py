@@ -23,7 +23,6 @@ Decisiones tomadas a partir de las observaciones del plan:
 from __future__ import annotations
 
 import logging
-import os
 import random
 import re
 import threading
@@ -33,7 +32,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from ytm_native.core import config, paths
+from ytm_native.core import config, credentials, paths
+from ytm_native.core.crypto import CryptoError
 from ytm_native.core.db import Database, Playlist, Track
 
 log = logging.getLogger("ytmn.sync")
@@ -262,14 +262,14 @@ class CookieKeeper:
         return response
 
     def persist(self) -> list[str]:
-        """Escribe las cookies rotadas. Devuelve los nombres actualizados."""
+        """Escribe las cookies rotadas, siempre cifradas (DPAPI) y de forma
+        atómica. Devuelve los nombres actualizados."""
         import json
 
         if not self.set_cookies:
             return []
-        tmp = self.path.with_name(self.path.name + ".tmp")
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(credentials.read_text(self.path))
             if not isinstance(data, dict):
                 return []
             key = next((k for k in data if k.lower() == "cookie"), None)
@@ -283,18 +283,12 @@ class CookieKeeper:
             if not changed or "SAPISID=" not in merged:
                 return []      # nunca se guarda una cabecera que perdió la sesión
             data[key] = merged
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(data, ensure_ascii=False, indent=1))
-                fh.flush()
-                os.fsync(fh.fileno())   # en disco antes de sustituir: un apagón no deja un archivo vacío
-            os.replace(tmp, self.path)
+            # Temporal, fsync y os.replace: un apagón no deja un archivo vacío,
+            # y un fallo deja el anterior intacto y sin temporales.
+            credentials.write_text(self.path, json.dumps(data, ensure_ascii=False, indent=1))
             return changed
-        except (OSError, ValueError) as exc:
-            log.warning("no se pudieron guardar las cookies renovadas: %s", exc)
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        except (OSError, ValueError, credentials.CredentialError, CryptoError) as exc:
+            log.warning("no se pudieron guardar las cookies renovadas: %s", type(exc).__name__)
             return []
 
 
@@ -306,7 +300,14 @@ def default_client_factory():
     from ytmusicapi import YTMusic  # import diferido: arranque más rápido
 
     path = paths.browser_json()
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(credentials.read_text(path))
+    except credentials.CredentialError as exc:
+        # De otro usuario de Windows, de otro equipo o dañado: para la app es
+        # una sesión caducada que hay que renovar, no un fallo.
+        raise SessionExpired("las credenciales guardadas no se pueden descifrar") from exc
+    if not isinstance(raw, dict):
+        raise SessionExpired("las credenciales guardadas no tienen el formato esperado")
     keeper = CookieKeeper(path, baseline=next((v for k, v in raw.items() if k.lower() == "cookie"), None))
     session = requests.Session()
     session.request = _with_timeout(session.request)
@@ -586,11 +587,8 @@ class LibrarySync:
         if is_auth_error(exc):
             report.state = SyncState.AUTH_EXPIRED
             report.message = "La sesión caducó: renueva las credenciales de la cuenta secundaria."
-            try:
-                if looks_device_bound(paths.browser_json().read_text(encoding="utf-8")):
-                    report.message += " " + DEVICE_BOUND_WARNING
-            except OSError:
-                pass
+            if looks_device_bound(credentials.read_text_or_empty(paths.browser_json())):
+                report.message += " " + DEVICE_BOUND_WARNING
         else:
             report.state = SyncState.ERROR
             report.message = f"Error de sincronización: {exc}"

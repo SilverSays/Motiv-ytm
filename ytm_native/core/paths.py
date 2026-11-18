@@ -84,6 +84,11 @@ def cookies_txt() -> Path:
     return cred_dir() / "cookies.txt"
 
 
+def firefox_login_profile() -> Path:
+    """Perfil de Firefox desechable del inicio de sesión asistido."""
+    return cache_dir() / "firefox_auth_profile"
+
+
 def ensure_dirs() -> None:
     dirs = [app_home(), cache_dir(), log_dir()]
     # Las carpetas redirigidas por variable de entorno son ajenas: no se crean.
@@ -93,3 +98,26 @@ def ensure_dirs() -> None:
         dirs.append(cred_dir())
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
+    # Cookies en claro que un cierre brusco dejó a medio borrar (las de un
+    # yt-dlp de la app que siga vivo no se tocan).
+    from ytm_native.core.credentials import cleanup_ephemeral
+
+    cleanup_ephemeral(cred_dir())
+
+
+def secure_credentials() -> None:
+    """Al arrancar: cifra las credenciales que sigan en claro y borra el perfil
+    de Firefox que un inicio de sesión interrumpido pudo dejar (tiene las
+    cookies de la cuenta en claro).
+
+    Con ``YTMN_CRED_DIR`` la carpeta es ajena (pruebas, otra instalación): se
+    lee pero no se reescribe."""
+    import shutil
+
+    from ytm_native.core.credentials import migrate_plaintext
+
+    if not os.environ.get("YTMN_CRED_DIR"):
+        migrate_plaintext([browser_json(), cookies_txt()])
+    leftover = firefox_login_profile()
+    if leftover.exists():
+        shutil.rmtree(leftover, ignore_errors=True)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import threading
 import time
 from datetime import datetime
@@ -26,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ytm_native.core import config, paths
+from ytm_native.core import config, credentials, paths
 from ytm_native.core.db import Database, Track
 
 
@@ -290,11 +289,33 @@ def _file_status(path: Path) -> str:
     if not path.is_file():
         return "No configurado"
     stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
-    return f"Configurado ({stamp})"
+    if not credentials.readable(path):
+        return f"No se puede leer ({stamp}): guárdalo de nuevo"
+    sealed = "cifrado para tu usuario de Windows" if credentials.is_sealed_file(path) else "aún sin cifrar"
+    return f"Configurado ({stamp}, {sealed})"
+
+
+def browser_headers_from_raw(raw: str) -> dict:
+    """Las cabeceras de ytmusicapi a partir del texto copiado del navegador,
+    ya saneadas y sin escribir nada en disco."""
+    import json
+
+    import ytmusicapi
+
+    from ytm_native.services.sync import sanitize_browser_headers
+
+    clean = sanitize_browser_headers(json.loads(ytmusicapi.setup(headers_raw=raw)))
+    if "cookie" not in {k.lower() for k in clean}:
+        raise ValueError(
+            "las cabeceras no incluyen la línea «cookie»: copia la sección Request "
+            "Headers completa de una petición «browse» con la sesión iniciada"
+        )
+    return clean
 
 
 class AccountDialog(QDialog):
     credentials_changed = Signal()
+    firefox_login_requested = Signal()
 
     def __init__(self, db: Database, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -341,6 +362,11 @@ class AccountDialog(QDialog):
         browser_note = QLabel(BROWSER_NOTE)
         browser_note.setWordWrap(True)
         lay.addWidget(browser_note)
+        firefox = QPushButton("Iniciar sesión con Firefox (recomendado)…")
+        firefox.setToolTip("Sin copiar cabeceras: inicias sesión en una ventana de Firefox aparte "
+                           "y la app recoge la sesión al cerrarla.")
+        firefox.clicked.connect(self._ask_firefox_login)
+        lay.addWidget(firefox, alignment=Qt.AlignmentFlag.AlignLeft)
 
         lay.addWidget(self._heading("Biblioteca (ytmusicapi)"))
         self.headers_status = QLabel()
@@ -388,32 +414,23 @@ class AccountDialog(QDialog):
         self.headers_status.setText(_file_status(paths.browser_json()))
         self.cookies_status.setText(_file_status(paths.cookies_txt()))
 
+    def _ask_firefox_login(self) -> None:
+        self.firefox_login_requested.emit()
+        self.accept()
+
     def _save_headers(self) -> None:
         raw = self.headers_edit.toPlainText().strip()
         if not raw:
             QMessageBox.information(self, "Cabeceras", "Pega primero las cabeceras de la petición.")
             return
         try:
-            import ytmusicapi
-
-            paths.cred_dir().mkdir(parents=True, exist_ok=True)
-            ytmusicapi.setup(filepath=str(paths.browser_json()), headers_raw=raw)
-            # Chrome copia entradas que no deben reenviarse (content-encoding,
-            # pseudo-cabeceras…): se guardan ya saneadas.
             import json
 
-            from ytm_native.services.sync import sanitize_browser_headers
-
-            target = paths.browser_json()
-            clean = sanitize_browser_headers(json.loads(target.read_text(encoding="utf-8")))
-            lowered = {k.lower() for k in clean}
-            if "cookie" not in lowered:
-                target.unlink(missing_ok=True)
-                raise ValueError(
-                    "las cabeceras no incluyen la línea «cookie»: copia la sección Request "
-                    "Headers completa de una petición «browse» con la sesión iniciada"
-                )
-            target.write_text(json.dumps(clean, ensure_ascii=False, indent=1), encoding="utf-8")
+            # Chrome copia entradas que no deben reenviarse (content-encoding,
+            # pseudo-cabeceras…): se guardan ya saneadas, y cifradas: el texto
+            # en claro nunca llega al disco.
+            clean = browser_headers_from_raw(raw)
+            credentials.write_text(paths.browser_json(), json.dumps(clean, ensure_ascii=False, indent=1))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Cabeceras", f"No se pudieron procesar las cabeceras:\n{exc}")
             return
@@ -434,28 +451,34 @@ class AccountDialog(QDialog):
         if not filename:
             return
         try:
-            head = Path(filename).read_text(encoding="utf-8", errors="replace")[:4000]
+            data = Path(filename).read_bytes()
         except OSError as exc:
             QMessageBox.warning(self, "Cookies", f"No se pudo leer el archivo:\n{exc}")
             return
+        whole = data.decode("utf-8", errors="replace")
+        head = whole[:4000]
         looks_netscape = "Netscape" in head or any(line.count("\t") >= 6 for line in head.splitlines())
         if not looks_netscape:
             QMessageBox.warning(
                 self, "Cookies", "El archivo no parece estar en formato Netscape (cookies.txt)."
             )
             return
-        paths.cred_dir().mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(filename, paths.cookies_txt())
+        try:
+            # Se guarda una copia cifrada; el archivo elegido no se toca.
+            credentials.write_bytes(paths.cookies_txt(), data)
+        except Exception as exc:  # noqa: BLE001 - p. ej. sin cifrado disponible
+            QMessageBox.warning(self, "Cookies", f"No se pudieron guardar las cookies:\n{exc}")
+            return
         self._refresh_status()
         self.credentials_changed.emit()
         from ytm_native.services.sync import DEVICE_BOUND_WARNING, looks_device_bound
 
-        try:
-            whole = Path(filename).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            whole = head
+        tail = ("\n\nSe guardó una copia cifrada: ya puedes borrar el archivo original "
+                f"({Path(filename).name}).")
         if looks_device_bound(whole):
-            QMessageBox.warning(self, "Cookies", "Cookies guardadas.\n\n" + DEVICE_BOUND_WARNING)
+            QMessageBox.warning(self, "Cookies", "Cookies guardadas.\n\n" + DEVICE_BOUND_WARNING + tail)
+        else:
+            QMessageBox.information(self, "Cookies", "Cookies guardadas." + tail)
 
     # -- pestaña de reproducción -------------------------------------------
     def _playback_tab(self) -> QWidget:

@@ -726,20 +726,28 @@ def test_warm_process_exits_by_itself_when_discarded():
 class FakeWarm:
     instances = []
 
-    def __init__(self, args, key):
+    def __init__(self, args, key, on_exit=None):
         self.args, self.key = args, key
         self.ran, self.discarded, self.reaper = [], False, None
+        self.on_exit = on_exit             # lo que el proceso real hace al terminar
         FakeWarm.instances.append(self)
+
+    def _exit(self):
+        on_exit, self.on_exit = self.on_exit, None
+        if on_exit is not None:
+            on_exit()
 
     def usable(self, key):
         return not self.ran and not self.discarded and self.key == key
 
     def run(self, url, timeout, should_stop=None):
         self.ran.append(url)
+        self._exit()
         return RunResult(0, stdout=ok_json(url.split("v=")[-1]), elapsed=0.1)
 
     def discard(self, wait=5.0):
         self.discarded = True
+        self._exit()
 
 
 @pytest.fixture

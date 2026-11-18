@@ -18,6 +18,9 @@
   ``start-file`` que llega después de que mpv confirme *esa* carga (y, si mpv
   lo dice, con el mismo ``playlist_entry_id``): con saltos rápidos, el inicio
   tardío de una pista anterior no se toma por el de la nueva.
+* **Archivos del disco**: una pista ``local:…`` se carga en mpv directamente
+  desde su archivo (``file:///…``), sin yt-dlp ni red; tampoco se resuelve por
+  adelantado ni siembra la radio automática.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from ytm_native.core import config
 from ytm_native.core.db import Database, Track
 from ytm_native.core.errors import ErrorKind
 from ytm_native.playback.extractor import ExtractorManager, ResolveResult
+from ytm_native.services import local_media
 from ytm_native.services.sync import radio_tracks
 
 log = logging.getLogger("ytmn.player")
@@ -82,12 +86,15 @@ class PlaybackController(QObject):
         mpv,
         parent: Optional[QObject] = None,
         radio_fetcher=radio_tracks,
+        local_resolver=None,
     ):
         super().__init__(parent)
         self.db = db
         self.extractor = extractor
         self.mpv = mpv
         self._radio_fetcher = radio_fetcher
+        # Ruta en disco de una pista ``local:`` (None si el archivo ya no está).
+        self._local_path = local_resolver or (lambda video_id: local_media.resolve_path(db, video_id))
         # Radio automática al terminar la cola (idea de JustAnotherMusicClient).
         self.autoplay = db.get_bool("autoplay_radio", False)
         self._radio_token = 0
@@ -284,6 +291,8 @@ class PlaybackController(QObject):
         self._request_radio(track, then_advance=False)
 
     def _request_radio(self, seed: Track, then_advance: bool) -> None:
+        if local_media.is_local(seed.video_id):
+            return                       # YouTube no conoce los archivos del disco
         self._radio_token += 1
         token = self._radio_token
         self._radio_pending = then_advance
@@ -513,6 +522,9 @@ class PlaybackController(QObject):
         track = self.current_track()
         if track is None:
             return
+        if local_media.is_local(track.video_id):
+            self._play_local(track)
+            return
         if force_fresh:
             self._cache.pop(track.video_id, None)   # esa URL ya falló
         else:
@@ -521,6 +533,22 @@ class PlaybackController(QObject):
                 self._play_result(cached)
                 return
         self._start_play_job(track.video_id)
+
+    def _play_local(self, track: Track) -> None:
+        """Archivo del disco: directo a mpv, sin ExtractorManager ni red."""
+        path = self._local_path(track.video_id)
+        if not path:
+            self._handle_failure(ResolveResult(
+                video_id=track.video_id, kind=ErrorKind.UNAVAILABLE,
+                message="El archivo ya no está en el disco.",
+            ))
+            return
+        now = time.time()
+        self._play_result(ResolveResult(
+            video_id=track.video_id, url=local_media.file_uri(path), format_desc="archivo local",
+            duration_s=float(track.duration_s) if track.duration_s else None,
+            resolved_at=now, expire_ts=now + 365 * 86400, ready=True,
+        ))
 
     # -- trabajos de resolución --------------------------------------------
     @staticmethod
@@ -604,8 +632,8 @@ class PlaybackController(QObject):
         now = time.time()
         for track in self._lookahead(config.PREFETCH_AHEAD):
             vid = track.video_id
-            if self._cached(vid) is not None:
-                continue
+            if local_media.is_local(vid) or self._cached(vid) is not None:
+                continue                 # un archivo del disco no se resuelve
             # Un intento por pista cada cierto tiempo, salga bien o mal: un
             # fallo (o una URL que caduca enseguida) no debe repetirse en bucle.
             if now - self._prefetch_tried.get(vid, 0.0) < config.PREFETCH_RETRY_AFTER_S:
