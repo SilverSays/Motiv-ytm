@@ -36,6 +36,7 @@ from PySide6.QtCore import QObject
 
 from ytm_native.core import config
 from ytm_native.core.db import Database, Track
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.discord")
 
@@ -67,12 +68,12 @@ def encode(op: int, payload: dict) -> bytes:
 def read_frame(transport, timeout: float = IO_TIMEOUT_S) -> tuple[int, dict]:
     op, length = struct.unpack("<II", transport.read(8, timeout))
     if length > _MAX_FRAME:
-        raise DiscordError("mensaje de Discord demasiado grande")
+        raise DiscordError(tr("mensaje de Discord demasiado grande"))
     body = transport.read(length, timeout) if length else b""
     try:
         data = json.loads(body.decode("utf-8")) if body else {}
     except (UnicodeDecodeError, ValueError) as exc:
-        raise DiscordError("mensaje de Discord ilegible") from exc
+        raise DiscordError(tr("mensaje de Discord ilegible")) from exc
     return op, data if isinstance(data, dict) else {}
 
 
@@ -87,12 +88,12 @@ def _fit(text: str, limit: int = 128) -> str:
 def build_activity(track: Track, art_url: str, playing: bool, position: float, duration: float,
                    now: float) -> dict:
     """La actividad de Discord para la canción que suena (o en pausa)."""
-    title = track.title.strip() or "Sin título"
-    artist = (track.artists or "").strip() or "Artista desconocido"
+    title = track.title.strip() or tr("Sin título")
+    artist = (track.artists or "").strip() or tr("Artista desconocido")
     activity: dict = {
         "type": ACTIVITY_LISTENING,
         "details": _fit(title),
-        "state": _fit(artist if playing else f"{artist} (en pausa)"),
+        "state": _fit(artist if playing else tr("{artist} (en pausa)", artist=artist)),
         "instance": False,
     }
     assets: dict = {}
@@ -124,14 +125,14 @@ class PipeTransport:
     @classmethod
     def open(cls) -> "PipeTransport":
         if sys.platform != "win32":
-            raise OSError("solo en Windows")
+            raise OSError(tr("solo en Windows"))
         last: Optional[OSError] = None
         for n in range(10):
             try:
                 return cls(open(rf"\\.\pipe\discord-ipc-{n}", "r+b", buffering=0))  # noqa: SIM115
             except OSError as exc:
                 last = exc
-        raise last or OSError("Discord no está abierto")
+        raise last or OSError(tr("Discord no está abierto"))
 
     def _available(self) -> int:
         import ctypes
@@ -143,7 +144,7 @@ class PipeTransport:
         if not ctypes.windll.kernel32.PeekNamedPipe(
             wintypes.HANDLE(handle), None, 0, None, ctypes.byref(avail), None
         ):
-            raise OSError("la tubería de Discord se cerró")
+            raise OSError(tr("la tubería de Discord se cerró"))
         return avail.value
 
     def read(self, size: int, timeout: float) -> bytes:
@@ -154,12 +155,12 @@ class PipeTransport:
             # parado para siempre.
             if self._available() == 0:
                 if time.monotonic() > deadline:
-                    raise TimeoutError("Discord no responde")
+                    raise TimeoutError(tr("Discord no responde"))
                 time.sleep(0.02)
                 continue
             chunk = self._fh.read(size - len(out))
             if not chunk:
-                raise OSError("la tubería de Discord se cerró")
+                raise OSError(tr("la tubería de Discord se cerró"))
             out += chunk
         return out
 
@@ -261,7 +262,7 @@ class _Link(threading.Thread):
             conn.write(encode(OP_HANDSHAKE, {"v": 1, "client_id": self.client_id}))
             op, data = read_frame(conn)
             if op == OP_CLOSE:
-                raise DiscordError(f"Discord rechazó la conexión: {data.get('message', '')}")
+                raise DiscordError(tr("Discord rechazó la conexión: {get}", get=data.get('message', '')))
         except BaseException:
             conn.close()
             raise
@@ -283,13 +284,13 @@ class _Link(threading.Thread):
                 conn.write(encode(OP_PONG, data))
                 continue
             if op == OP_CLOSE:
-                raise DiscordError("Discord cerró la conexión")
+                raise DiscordError(tr("Discord cerró la conexión"))
             if data.get("evt") == "ERROR":
                 # La actividad no gustó (p. ej. un campo no válido): la
                 # conexión sigue sirviendo, así que no se insiste con esta.
                 log.warning("Discord rechazó la actividad: %s", (data.get("data") or {}).get("message", ""))
             return
-        raise DiscordError("Discord no confirmó la actividad")
+        raise DiscordError(tr("Discord no confirmó la actividad"))
 
     def _drop(self) -> None:
         conn, self._conn = self._conn, None
@@ -331,7 +332,7 @@ class DiscordPresence(QObject):
     def set_client_id(self, client_id: str) -> None:
         client_id = client_id.strip()
         if not valid_client_id(client_id):
-            raise ValueError("el id de la aplicación de Discord son solo cifras")
+            raise ValueError(tr("el id de la aplicación de Discord son solo cifras"))
         self.db.set_setting(CLIENT_ID_KEY, client_id)
         if self._link is not None:
             self._stop_link()

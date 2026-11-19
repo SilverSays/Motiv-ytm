@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from ytm_native.core.i18n import tr
+
 
 class ErrorKind(str, Enum):
     BOT_BLOCK = "bot_block"            # Caso 4
@@ -175,16 +177,22 @@ def summarize(stderr: str, limit: int = 300) -> str:
     return tail[-1][:limit] if tail else ""
 
 
-MESSAGES_ES = {
-    ErrorKind.BOT_BLOCK: "YouTube pidió verificación anti-bot",
-    ErrorKind.NETWORK: "Sin conexión",
-    ErrorKind.RUNTIME_MISSING: "Falta el runtime de JavaScript (deno)",
-    ErrorKind.NEEDS_LOGIN: "La pista requiere iniciar sesión",
-    ErrorKind.UNAVAILABLE: "Pista no disponible",
-    ErrorKind.EXTRACTION: "yt-dlp no pudo extraer el audio",
-    ErrorKind.UNKNOWN: "Error desconocido de yt-dlp",
-    ErrorKind.CANCELLED: "Cancelado",
-    ErrorKind.PREEMPTED: "Interrumpido por una actualización",
-    ErrorKind.LOCAL_RATE_LIMIT: "Límite local de resoluciones por hora",
-    ErrorKind.BINARY_MISSING: "Falta yt-dlp en la carpeta bin",
-}
+def error_message(kind: ErrorKind) -> str:
+    """Lo que se le dice al usuario de un fallo, en el idioma activo.
+
+    Se traduce al pedirlo, no al importar el módulo: así no depende de si
+    el idioma ya estaba decidido cuando se cargó ``core.errors``."""
+    messages = {
+        ErrorKind.BOT_BLOCK: tr("YouTube pidió verificación anti-bot"),
+        ErrorKind.NETWORK: tr("Sin conexión"),
+        ErrorKind.RUNTIME_MISSING: tr("Falta el runtime de JavaScript (deno)"),
+        ErrorKind.NEEDS_LOGIN: tr("La pista requiere iniciar sesión"),
+        ErrorKind.UNAVAILABLE: tr("Pista no disponible"),
+        ErrorKind.EXTRACTION: tr("yt-dlp no pudo extraer el audio"),
+        ErrorKind.UNKNOWN: tr("Error desconocido de yt-dlp"),
+        ErrorKind.CANCELLED: tr("Cancelado"),
+        ErrorKind.PREEMPTED: tr("Interrumpido por una actualización"),
+        ErrorKind.LOCAL_RATE_LIMIT: tr("Límite local de resoluciones por hora"),
+        ErrorKind.BINARY_MISSING: tr("Falta yt-dlp en la carpeta bin"),
+    }
+    return messages.get(kind, kind.value)

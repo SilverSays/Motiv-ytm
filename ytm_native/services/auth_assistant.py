@@ -37,6 +37,7 @@ from typing import Callable, Optional
 from PySide6.QtCore import QObject, QProcess, Signal
 
 from ytm_native.core import credentials, paths
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.auth")
 
@@ -170,20 +171,20 @@ def read_cookies(profile: Path, now: Optional[float] = None) -> list[BrowserCook
     solo lectura (``mode=ro``: el archivo no se modifica)."""
     db_path = profile / "cookies.sqlite"
     if not db_path.is_file():
-        raise LoginError("Firefox no guardó ninguna cookie: inicia sesión antes de cerrar la ventana.")
+        raise LoginError(tr("Firefox no guardó ninguna cookie: inicia sesión antes de cerrar la ventana."))
     now = time.time() if now is None else now
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=5)
     except sqlite3.Error as exc:
-        raise LoginError("No se pudieron leer las cookies de Firefox.") from exc
+        raise LoginError(tr("No se pudieron leer las cookies de Firefox.")) from exc
     try:
         rows = conn.execute(
             "SELECT host, name, value, path, expiry, isSecure, isHttpOnly FROM moz_cookies "
             "WHERE host LIKE '%youtube.com'"
         ).fetchall()
     except sqlite3.Error as exc:
-        raise LoginError("No se pudieron leer las cookies de Firefox.") from exc
+        raise LoginError(tr("No se pudieron leer las cookies de Firefox.")) from exc
     finally:
         conn.close()
     found = []
@@ -243,8 +244,9 @@ def browser_headers(cookies: list[BrowserCookie], user_agent: str) -> dict:
     missing = [name for name in REQUIRED_COOKIES if name not in names]
     if missing:
         raise LoginError(
-            "No se encontró la sesión de Google en Firefox (falta " + ", ".join(missing) + "). "
-            "Inicia sesión en YouTube Music y espera a ver tu biblioteca antes de cerrar la ventana."
+            tr("No se encontró la sesión de Google en Firefox (falta {names}). Inicia sesión en "
+               "YouTube Music y espera a ver tu biblioteca antes de cerrar la ventana.",
+               names=", ".join(missing))
         )
     from ytmusicapi.helpers import get_authorization
 
@@ -293,10 +295,10 @@ def validate_session(headers: dict) -> str:
     try:
         info = YTMusic(auth=dict(headers)).get_account_info()
     except Exception as exc:  # noqa: BLE001 - cualquier fallo es «sesión no válida»
-        raise LoginError("YouTube Music no aceptó la sesión: vuelve a intentarlo.") from exc
+        raise LoginError(tr("YouTube Music no aceptó la sesión: vuelve a intentarlo.")) from exc
     name = info.get("accountName") if isinstance(info, dict) else None
     if not name:
-        raise LoginError("YouTube Music no reconoce una cuenta con esa sesión.")
+        raise LoginError(tr("YouTube Music no reconoce una cuenta con esa sesión."))
     return str(name)
 
 
@@ -353,14 +355,14 @@ class FirefoxLogin(QObject):
         if self.busy:
             return False
         if self.firefox is None:
-            self.finished.emit(False, "No se encontró Firefox en este equipo.")
+            self.finished.emit(False, tr("No se encontró Firefox en este equipo."))
             return False
         self._cancelled = False
         try:
             prepare_profile(self.profile)
         except OSError as exc:
             log.warning("no se pudo preparar el perfil de Firefox: %s", exc)
-            self.finished.emit(False, "No se pudo preparar la ventana de Firefox.")
+            self.finished.emit(False, tr("No se pudo preparar la ventana de Firefox."))
             return False
         process = (self._make_process or QProcess)(self)
         process.finished.connect(self._on_finished)
@@ -381,18 +383,18 @@ class FirefoxLogin(QObject):
             process.kill()
             process.waitForFinished(3000)
         if self.busy:                     # sin aviso de fin (ya estaba parado)
-            self._finish(False, "Inicio de sesión cancelado.")
+            self._finish(False, tr("Inicio de sesión cancelado."))
 
     def _on_error(self, error) -> None:
         if error == _FAILED_TO_START and self.busy:
             log.warning("Firefox no arrancó: %s", error)
-            self._finish(False, "No se pudo abrir Firefox.")
+            self._finish(False, tr("No se pudo abrir Firefox."))
 
     def _on_finished(self, *_args) -> None:
         if not self.busy:
             return
         if self._cancelled:
-            self._finish(False, "Inicio de sesión cancelado.")
+            self._finish(False, tr("Inicio de sesión cancelado."))
             return
         self.checking.emit()
         profile = self.profile
@@ -410,14 +412,14 @@ class FirefoxLogin(QObject):
 
     def _captured(self, session: Optional[CapturedSession], error) -> None:
         if error is None and session is not None:
-            who = f" como {session.account}" if session.account else ""
-            self._finish(True, f"Sesión iniciada{who}. Las credenciales se guardaron cifradas.")
+            who = tr(" como {account}", account=session.account) if session.account else ""
+            self._finish(True, tr("Sesión iniciada{who}. Las credenciales se guardaron cifradas.", who=who))
             return
         if isinstance(error, LoginError):
             message = str(error)
         else:
             log.warning("no se pudo completar el inicio de sesión con Firefox: %s", type(error).__name__)
-            message = "No se pudo guardar la sesión de Firefox."
+            message = tr("No se pudo guardar la sesión de Firefox.")
         self._finish(False, message)
 
     def _finish(self, ok: bool, message: str) -> None:

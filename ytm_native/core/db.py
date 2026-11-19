@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.db")
 
@@ -891,6 +892,21 @@ class Database:
                 (key, time.time() if now is None else now, payload),
             )
 
+    def purge_discover_language(self, prefixes: tuple[str, ...], language: str, unmarked: str) -> int:
+        """Borra las entradas de esos prefijos guardadas en un idioma que no
+        es ``language`` (el ``lang`` de su JSON; sin él, ``unmarked``). Una
+        entrada que ni es JSON tampoco sirve: se va con ellas."""
+        removed = 0
+        with self._tx() as c:
+            for prefix in prefixes:
+                removed += c.execute(
+                    "DELETE FROM discover_cache WHERE key LIKE ? ESCAPE '\\' AND "
+                    "CASE WHEN json_valid(payload) THEN COALESCE(json_extract(payload, '$.lang'), ?) "
+                    "ELSE '' END != ?",
+                    (_like_prefix(prefix), unmarked, language),
+                ).rowcount
+        return removed
+
     def purge_discover_cache(self, max_age_by_prefix: dict[str, float], now: Optional[float] = None) -> int:
         """Borra las entradas de cada prefijo más viejas que su plazo. Las
         claves que no empiezan por ninguno (la del inicio) no se tocan."""
@@ -940,8 +956,7 @@ class _Tx:
         conn = self._db.conn
         if not self._db._shared_lock.acquire(timeout=self._db.LOCK_TIMEOUT_S):
             raise DatabaseLockTimeout(
-                f"La base de datos lleva más de {self._db.LOCK_TIMEOUT_S:g} s "
-                "ocupada por otra operación"
+                tr("La base de datos lleva más de {LOCK_TIMEOUT_S:g} s ocupada por otra operación", LOCK_TIMEOUT_S=self._db.LOCK_TIMEOUT_S)
             )
         self._conn = conn
         return conn

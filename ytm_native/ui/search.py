@@ -22,6 +22,7 @@ from .art import ArtLoader, placeholder_pixmap, sized_url
 from .components import PillButton, _alpha, _draw_glyph, _Pressable
 from .home import CardGrid
 from .motion import mix
+from ytm_native.core.i18n import tr
 
 SONGS, PLAYLISTS, ARTISTS = "canciones", "listas", "artistas"
 
@@ -31,7 +32,7 @@ class ScopeBar(QWidget):
 
     changed = Signal(str)
 
-    LABELS = ((SONGS, "Canciones"), (PLAYLISTS, "Listas de la comunidad"), (ARTISTS, "Artistas"))
+    LABELS = ((SONGS, tr("Canciones")), (PLAYLISTS, tr("Listas de la comunidad")), (ARTISTS, tr("Artistas")))
 
     def __init__(self, parent: Optional[QWidget] = None,
                  labels: Optional[tuple[tuple[str, str], ...]] = None):
@@ -84,8 +85,8 @@ class ArtistStrip(_Pressable):
         self.card = card
         self._url = sized_url(card.thumb_url, 120) if card else ""
         if card is not None:
-            self.setAccessibleName(f"{card.name}. Abrir la página del artista")
-            self.setToolTip("Abrir la página del artista")
+            self.setAccessibleName(tr("{name}. Abrir la página del artista", name=card.name))
+            self.setToolTip(tr("Abrir la página del artista"))
         self.update()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
@@ -123,7 +124,7 @@ class ArtistStrip(_Pressable):
                          QFontMetrics(self._name_font).elidedText(self.card.name, Qt.TextElideMode.ElideRight, width))
         painter.setFont(self._note_font)
         painter.setPen(QColor(theme.HUMO))
-        note = "Artista" if self.card.note in ("", "Artista") else f"Artista con {self.card.note}"
+        note = tr("Artista") if self.card.note in ("", "Artista", tr("Artista")) else tr("Artista con {note}", note=self.card.note)
         painter.drawText(QRectF(left, 33, width, 18), flags, note)
         # Una flecha discreta dice que esto lleva a otra parte.
         arrow = _alpha(theme.PAPEL, 0.55 + 0.45 * hover)

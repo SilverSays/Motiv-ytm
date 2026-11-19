@@ -28,6 +28,7 @@ from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 from PySide6.QtNetwork import QLocalSocket
 
 from ytm_native.core import config, paths, proc_guard
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.mpv")
 
@@ -116,7 +117,7 @@ class MpvPlayer(QObject):
         if self._proc is not None:
             return
         if not self._mpv_path.is_file():
-            self.gave_up.emit(f"No se encontró {self._mpv_path.name} en la carpeta bin.")
+            self.gave_up.emit(tr("No se encontró {name} en la carpeta bin.", name=self._mpv_path.name))
             return
         self._shutting_down = False
         self._counter += 1
@@ -204,7 +205,7 @@ class MpvPlayer(QObject):
         if error == QProcess.ProcessError.FailedToStart:
             self._retry.stop()
             self._cleanup()
-            self.gave_up.emit("mpv no pudo iniciarse.")
+            self.gave_up.emit(tr("mpv no pudo iniciarse."))
 
     def _on_finished(self, *_args) -> None:
         self._retry.stop()
@@ -214,9 +215,9 @@ class MpvPlayer(QObject):
         now = time.monotonic()
         self._restarts = [t for t in self._restarts if now - t < 60] + [now]
         if len(self._restarts) > config.MPV_MAX_RESTARTS_PER_MIN:
-            self.gave_up.emit("mpv se cerró varias veces seguidas; no se reiniciará solo.")
+            self.gave_up.emit(tr("mpv se cerró varias veces seguidas; no se reiniciará solo."))
             return
-        self.crashed.emit("mpv se cerró de forma inesperada; reiniciando…")
+        self.crashed.emit(tr("mpv se cerró de forma inesperada; reiniciando…"))
         self._relaunch.start()      # temporizador propio: ``shutdown`` lo cancela
 
     # -- conexión IPC -------------------------------------------------------
@@ -258,7 +259,7 @@ class MpvPlayer(QObject):
             self._shutting_down = True
             if self._proc is not None:
                 self._proc.kill()
-            self.gave_up.emit("No se pudo conectar con mpv por IPC.")
+            self.gave_up.emit(tr("No se pudo conectar con mpv por IPC."))
 
     def _on_connected(self) -> None:
         self.last_time_pos = 0.0

@@ -22,6 +22,7 @@ from ytm_native.core.db import Track
 
 from . import theme
 from .chrome import rounded_menu
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.tray")
 
@@ -197,18 +198,18 @@ class TrayIcon(QObject):
         self._playing = False
         # El menú no cuelga de la ventana: con ella oculta debe seguir abriéndose.
         menu = self.menu = rounded_menu(QMenu())
-        self.track_action = QAction("Nada en reproducción", self)
+        self.track_action = QAction(tr("Nada en reproducción"), self)
         self.track_action.triggered.connect(self.show_requested.emit)
         menu.addAction(self.track_action)
         menu.addSeparator()
-        self.play_action = self._add("Reproducir", self.toggle_requested)
-        self.next_action = self._add("Siguiente", self.next_requested)
-        self.previous_action = self._add("Anterior", self.previous_requested)
+        self.play_action = self._add(tr("Reproducir"), self.toggle_requested)
+        self.next_action = self._add(tr("Siguiente"), self.next_requested)
+        self.previous_action = self._add(tr("Anterior"), self.previous_requested)
         menu.addSeparator()
-        self._add("Mostrar la ventana", self.show_requested)
-        self._add("Mini reproductor", self.mini_requested)
+        self._add(tr("Mostrar la ventana"), self.show_requested)
+        self._add(tr("Mini reproductor"), self.mini_requested)
         menu.addSeparator()
-        self._add("Salir definitivamente", self.quit_requested)
+        self._add(tr("Salir definitivamente"), self.quit_requested)
         self._tray.setContextMenu(menu)
         self.set_track(None)
 
@@ -240,7 +241,7 @@ class TrayIcon(QObject):
 
     def set_track(self, track: Optional[Track], cover: Optional[QPixmap] = None) -> None:
         if track is None:
-            self.track_action.setText("Nada en reproducción")
+            self.track_action.setText(tr("Nada en reproducción"))
             self.track_action.setIcon(QIcon())
             self.track_action.setEnabled(False)
             self._tray.setToolTip("YT Music Nativo")
@@ -261,7 +262,7 @@ class TrayIcon(QObject):
 
     def set_playing(self, playing: bool) -> None:
         self._playing = playing
-        self.play_action.setText("Pausar" if playing else "Reproducir")
+        self.play_action.setText(tr("Pausar") if playing else tr("Reproducir"))
 
     def notify(self, title: str, text: str) -> None:
         if self._tray.isVisible() and QSystemTrayIcon.supportsMessages():

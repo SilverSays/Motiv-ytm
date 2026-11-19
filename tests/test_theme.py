@@ -41,6 +41,19 @@ def test_text_on_solid_surfaces_and_tooltips_meets_aa(scheme):
     assert theme.contrast_ratio(c["PANEL"], c["PAPEL"]) >= theme.MIN_TEXT_CONTRAST       # ayudas emergentes
 
 
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_controls_and_marks_stand_out_from_the_panel(scheme):
+    """WCAG 1.4.11: un control encendido (lo sólido, el interruptor) y la
+    marca de la vista activa, a 3:1 o más de lo que tienen al lado."""
+    c = theme.SCHEMES[scheme]
+    assert theme.contrast_ratio(c["SOLIDO"], c["PANEL"]) >= 3.0
+    assert theme.contrast_ratio(c["MARCA"], c["PANEL"]) >= 3.0
+    assert theme.contrast_ratio(c["MARCA"], c["RELIEVE_2"]) >= 3.0      # sobre la fila elegida
+    # En oscuro el sólido no llega a 3:1 sobre el hover de la fila: el
+    # interruptor encendido lleva un filete CREMA, que sí.
+    assert theme.contrast_ratio(c["CREMA"], c["RELIEVE"]) >= 3.0
+
+
 @pytest.mark.parametrize("fg", ["PAPEL_SUAVE", "CREMA", "AVISO", "HUMO", "TENUE"])
 @pytest.mark.parametrize("bg", ["PANEL", "RELIEVE", "RELIEVE_2"])
 def test_dark_secondary_inks_meet_aa(fg, bg):
@@ -186,7 +199,7 @@ def test_switching_to_dark_recolors_without_touching_playback(window, db, qapp, 
     window.player.play_tracks([Track("PLuno-0", "Canción 0", "Artista")], 0)
     current = window.player.current_track()
     humo_before = QColor(theme.HUMO)
-    window._set_theme_mode("dark")
+    window.set_theme_mode("dark")
     assert theme.is_dark() and db.get_setting(config.THEME_KEY) == "dark"
     assert theme.DARK["PANEL"] in qapp.styleSheet()
     assert window.delegate._papel == QColor(theme.DARK["PAPEL"])
@@ -194,14 +207,14 @@ def test_switching_to_dark_recolors_without_touching_playback(window, db, qapp, 
     assert window.theme_actions["dark"].isChecked() and not window.theme_actions["light"].isChecked()
     # La música no se toca: ni se relanza mpv ni cambia la cola.
     assert restarts == [] and window.player.current_track() == current
-    window._set_theme_mode("light")
+    window.set_theme_mode("light")
     assert not theme.is_dark() and window.pos_label._color == QColor(theme.LIGHT["HUMO"])
 
 
 def test_system_mode_follows_windows_on_wm_settingchange(window, monkeypatch):
     from ctypes import wintypes
 
-    window._set_theme_mode("system")
+    window.set_theme_mode("system")
     assert not theme.is_dark()
     monkeypatch.setattr(theme, "system_prefers_dark", lambda: True)
     text = ctypes.create_unicode_buffer("ImmersiveColorSet")
@@ -212,7 +225,7 @@ def test_system_mode_follows_windows_on_wm_settingchange(window, monkeypatch):
     assert handled is False                       # Windows sigue repartiendo el aviso
     assert wait_until(lambda: theme.is_dark(), 2000)
     # Con el tema elegido a mano, Windows ya no manda.
-    window._set_theme_mode("light")
+    window.set_theme_mode("light")
     window.nativeEvent(b"windows_generic_MSG", ctypes.addressof(msg))
     wait_until(lambda: False, 400)
     assert not theme.is_dark()

@@ -28,6 +28,7 @@ from . import theme
 from .art import ArtLoader, neutral_tint, placeholder_pixmap, sized_url, square_pixmap
 from .components import PillButton, Reveal, _alpha, _Pressable, note_launch, window_sliding
 from .motion import CARD_STAGGER, EASE, FADE_MS, STAGGER_CAP, Tween, mix
+from ytm_native.core.i18n import tr
 
 CardSpec = tuple[str, str, str, object]   # título, nota, URL de la carátula, lo que representa
 
@@ -434,7 +435,7 @@ class HomePage(QScrollArea):
         head = QVBoxLayout()
         head.setContentsMargins(SleeveCard.PAD, 0, SleeveCard.PAD, 0)
         head.setSpacing(4)
-        title = QLabel("Inicio")
+        title = QLabel(tr("Inicio"))
         title.setObjectName("homeTitle")
         head.addWidget(title)
         self._facts_row = QHBoxLayout()
@@ -446,7 +447,7 @@ class HomePage(QScrollArea):
         lay.addSpacing(24)
 
         self.library = ShelfSection(loader, self.LIBRARY_ROWS)
-        self.library.set_head("Tus listas")
+        self.library.set_head(tr("Tus listas"))
         self.library.grid.opened.connect(lambda payload: self.open_library.emit(str(payload)))
         self.library.grid.play_requested.connect(lambda payload: self.play_library.emit(str(payload)))
         self.library.grid.fitted.connect(self._on_library_fitted)
@@ -466,7 +467,7 @@ class HomePage(QScrollArea):
         self._recent_gap.hide()
         lay.addWidget(self._recent_gap)
         self.recent = ShelfSection(loader)
-        self.recent.set_head("Escuchado hace poco")
+        self.recent.set_head(tr("Escuchado hace poco"))
         self.recent.grid.opened.connect(self.play_recent)
         self.recent.grid.play_requested.connect(self.play_recent)
         self.recent.hide()
@@ -483,8 +484,8 @@ class HomePage(QScrollArea):
         status.setSpacing(14)
         self.status = QLabel()
         self.status.setObjectName("homeStatus")
-        self.action = PillButton("Otras recomendaciones", "quiet", glyph="sync")
-        self.action.setToolTip("Busca otras listas de la comunidad a partir de tu música")
+        self.action = PillButton(tr("Otras recomendaciones"), "quiet", glyph="sync")
+        self.action.setToolTip(tr("Busca otras listas de la comunidad a partir de tu música"))
         self.action.clicked.connect(self.refresh_requested)
         status.addWidget(self.status)
         status.addWidget(self.action)
@@ -514,8 +515,8 @@ class HomePage(QScrollArea):
     def _on_library_fitted(self, shown: int, total: int) -> None:
         # Si no caben todas, se dice dónde está el resto en vez de esconderlo.
         self.library.set_head(
-            "Tus listas",
-            "Las que más escuchas van primero. El resto sigue en la barra lateral."
+            tr("Tus listas"),
+            tr("Las que más escuchas van primero. El resto sigue en la barra lateral.")
             if shown < total else "",
         )
 
@@ -578,5 +579,5 @@ class HomePage(QScrollArea):
         self.status.setVisible(bool(text))
         self.action.setVisible(bool(action))
         if action:
-            self.action.setText("Reintentar" if action == "retry" else "Otras recomendaciones")
+            self.action.setText(tr("Reintentar") if action == "retry" else tr("Otras recomendaciones"))
             self.action.updateGeometry()

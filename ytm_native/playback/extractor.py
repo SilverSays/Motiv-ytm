@@ -41,7 +41,8 @@ from typing import Callable, Optional
 
 from ytm_native.core import config, credentials, paths, proc_guard
 from ytm_native.core.db import Database
-from ytm_native.core.errors import MESSAGES_ES, ErrorKind, classify, cookies_look_invalid, summarize
+from ytm_native.core.errors import ErrorKind, classify, cookies_look_invalid, error_message, summarize
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.extractor")
 
@@ -207,7 +208,7 @@ def run_process(
     try:
         proc = _spawn(args, subprocess.DEVNULL)
     except OSError as exc:
-        return RunResult(returncode=-1, stderr=f"ERROR: no se pudo ejecutar {args[0]}: {exc}")
+        return RunResult(returncode=-1, stderr=tr("ERROR: no se pudo ejecutar {value}: {exc}", value=args[0], exc=exc))
     return _collect(proc, start, timeout, should_stop)
 
 
@@ -585,8 +586,8 @@ class ExtractorManager:
             ok = credentials.readable(self.cookies)
             self._cookies_checked = (signature, ok)
             if not ok:
-                self._notice("Las cookies guardadas no se pueden descifrar: vuelve a importarlas "
-                             "o inicia sesión otra vez. Mientras, se reproduce sin cuenta.")
+                self._notice(tr("Las cookies guardadas no se pueden descifrar: vuelve a importarlas "
+                             "o inicia sesión otra vez. Mientras, se reproduce sin cuenta."))
         return self._cookies_checked[1]
 
     def _ephemeral_cookies(self, use_cookies: bool) -> Optional[credentials.EphemeralCookies]:
@@ -978,7 +979,7 @@ class ExtractorManager:
         return ResolveResult(
             video_id=video_id,
             kind=kind,
-            message=message or MESSAGES_ES.get(kind, kind.value),
+            message=message or error_message(kind),
             used_cookies=used_cookies,
             blocked_until=blocked_until,
         )
@@ -1012,7 +1013,7 @@ class ExtractorManager:
             detail = summarize(att.stderr)
             log.warning("resolver %s falló (%s, cookies=%s): %s", video_id, kind.value, use_cookies, detail)
             if use_cookies and cookies_look_invalid(att.stderr):
-                self._notice("Las cookies de la cuenta ya no son válidas: renueva cookies.txt.")
+                self._notice(tr("Las cookies de la cuenta ya no son válidas: renueva cookies.txt."))
 
             # 1) Bloqueo anti-bot: nunca se culpa al binario ni a la pista.
             if kind is ErrorKind.BOT_BLOCK:
@@ -1060,7 +1061,7 @@ class ExtractorManager:
                 # El binario funciona: el problema es de esta pista.
                 return self._fail(
                     video_id, kind,
-                    message=f"{detail} (el vídeo de control sí funciona)",
+                    message=tr("{detail} (el vídeo de control sí funciona)", detail=detail),
                     used_cookies=use_cookies,
                 )
             ckind = control.kind or ErrorKind.UNKNOWN
@@ -1081,7 +1082,7 @@ class ExtractorManager:
                 continue
             return self._fail(
                 video_id, ErrorKind.EXTRACTION,
-                message=f"{detail} (el vídeo de control también falla)",
+                message=tr("{detail} (el vídeo de control también falla)", detail=detail),
                 used_cookies=use_cookies,
             )
 
@@ -1089,8 +1090,8 @@ class ExtractorManager:
         until = self._clock() + config.COOKIES_STICKY_S
         self.db.set_setting("cookies_sticky_until", until)
         self._notice(
-            "Bloqueo anti-bot en modo anónimo: se usarán las cookies de la cuenta "
-            f"secundaria durante {config.COOKIES_STICKY_S // 3600} h."
+            tr("Bloqueo anti-bot en modo anónimo: se usarán las cookies de la cuenta secundaria durante "
+               "{value} h.", value=config.COOKIES_STICKY_S // 3600)
         )
 
     def _enter_backoff(self, video_id: str, used_cookies: bool) -> ResolveResult:
@@ -1100,13 +1101,13 @@ class ExtractorManager:
         self.db.set_setting("bot_blocked_until", until)
         self.db.set_setting("bot_backoff_level", min(level + 1, len(steps) - 1))
         hint = (
-            "Revisa el estado de cookies.txt."
+            tr("Revisa el estado de cookies.txt.")
             if used_cookies
-            else "No hay cookies utilizables para el fallback."
+            else tr("No hay cookies utilizables para el fallback.")
         )
         return self._fail(
             video_id, ErrorKind.BOT_BLOCK,
-            message=f"Bloqueo anti-bot. Cola en pausa {steps[level] // 60} min. {hint}",
+            message=tr("Bloqueo anti-bot. Cola en pausa {value} min. {hint}", value=steps[level] // 60, hint=hint),
             used_cookies=used_cookies,
             blocked_until=until,
         )
@@ -1180,15 +1181,15 @@ class ExtractorManager:
     def deno_status(self) -> tuple[bool, str, str]:
         """(ok, versión, mensaje). Detecta deno ausente o anterior a la mínima."""
         if not self.deno.is_file():
-            return False, "", f"No se encontró {self.deno.name} en la carpeta bin."
+            return False, "", tr("No se encontró {name} en la carpeta bin.", name=self.deno.name)
         run = self._runner([str(self.deno), "--version"], 30, None)
         version = parse_version_tuple(run.stdout)
         text = ".".join(map(str, version))
         if run.returncode != 0 or not version:
-            return False, "", "deno no se pudo ejecutar."
+            return False, "", tr("deno no se pudo ejecutar.")
         if version < config.MIN_DENO_VERSION:
             minimum = ".".join(map(str, config.MIN_DENO_VERSION))
-            return False, text, f"deno {text} es anterior a la versión mínima {minimum}."
+            return False, text, tr("deno {text} es anterior a la versión mínima {minimum}.", text=text, minimum=minimum)
         return True, text, ""
 
     def diagnostics(self) -> dict:
@@ -1217,15 +1218,15 @@ class ExtractorManager:
         ``manual``/``force``: sin cooldown.
         """
         if not self.ytdlp.is_file():
-            return UpdateResult(UpdateStatus.BINARY_MISSING, message="Falta yt-dlp en bin.")
+            return UpdateResult(UpdateStatus.BINARY_MISSING, message=tr("Falta yt-dlp en bin."))
         if self._in_cooldown(reason, force):
             return UpdateResult(UpdateStatus.SKIPPED_COOLDOWN)
         if self._closed:
-            return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
+            return UpdateResult(UpdateStatus.FAILED, message=tr("La app se está cerrando."))
         self._enter_update(config.UPDATE_DRAIN_TIMEOUT_S)
         if self._closed:
             self._leave_update()
-            return UpdateResult(UpdateStatus.FAILED, message="La app se está cerrando.")
+            return UpdateResult(UpdateStatus.FAILED, message=tr("La app se está cerrando."))
         # Otra llamada pudo actualizar mientras esta esperaba su turno: se
         # vuelve a mirar el cooldown, ya con la exclusividad tomada.
         if self._in_cooldown(reason, force):
@@ -1279,9 +1280,9 @@ class ExtractorManager:
         if unverified and self.bak.is_file():
             if self._restore_backup():
                 self._clear_updating()
-                self.db.add_bad_version(unverified, "falló tras una actualización sin verificar")
+                self.db.add_bad_version(unverified, tr("falló tras una actualización sin verificar"))
                 self.db.set_setting("update_unverified", "")
-                self._notice(f"yt-dlp {unverified} falla: se restauró la versión anterior.")
+                self._notice(tr("yt-dlp {unverified} falla: se restauró la versión anterior.", unverified=unverified))
                 return True
             return False
         if self._in_cooldown("reactive", force=False):
@@ -1352,7 +1353,7 @@ class ExtractorManager:
             self._clear_updating()
             return True
         self._notice(
-            "No se pudo restaurar yt-dlp tras una actualización fallida; se reintentará al abrir la app."
+            tr("No se pudo restaurar yt-dlp tras una actualización fallida; se reintentará al abrir la app.")
         )
         return False
 
@@ -1361,7 +1362,7 @@ class ExtractorManager:
             # Con una restauración pendiente no se pisa el respaldo bueno.
             return UpdateResult(
                 UpdateStatus.FAILED,
-                message="Hay una actualización anterior sin deshacer y el respaldo no se pudo restaurar.",
+                message=tr("Hay una actualización anterior sin deshacer y el respaldo no se pudo restaurar."),
             )
         old_version = self.ytdlp_version()
 
@@ -1372,7 +1373,7 @@ class ExtractorManager:
                 self._stamp_update()
                 return UpdateResult(
                     UpdateStatus.SKIPPED_BAD_VERSION, old_version, latest,
-                    f"La última versión ({latest}) ya se descartó; se espera una más nueva.",
+                    tr("La última versión ({latest}) ya se descartó; se espera una más nueva.", latest=latest),
                 )
             if latest == old_version:
                 self._stamp_update()
@@ -1380,13 +1381,13 @@ class ExtractorManager:
 
         error = self._make_backup(old_version)
         if error:
-            return UpdateResult(UpdateStatus.FAILED, old_version, message=f"No se pudo crear el respaldo: {error}")
-        restored = self.db.get_setting("ytdlp_bak_version") or "la versión anterior"
+            return UpdateResult(UpdateStatus.FAILED, old_version, message=tr("No se pudo crear el respaldo: {error}", error=error))
+        restored = self.db.get_setting("ytdlp_bak_version") or tr("la versión anterior")
         try:
             self._mark_updating(old_version)
         except OSError as exc:
             return UpdateResult(
-                UpdateStatus.FAILED, old_version, message=f"No se pudo preparar la actualización: {exc}"
+                UpdateStatus.FAILED, old_version, message=tr("No se pudo preparar la actualización: {exc}", exc=exc)
             )
 
         run = self._runner([str(self.ytdlp), "--ignore-config", "-U"], config.UPDATE_TIMEOUT_S, None)
@@ -1398,19 +1399,19 @@ class ExtractorManager:
         if failed:
             detail = summarize(run.stderr) or run.returncode
             if self._undo_update():
-                return UpdateResult(UpdateStatus.FAILED, old_version, message=f"yt-dlp -U falló: {detail}")
+                return UpdateResult(UpdateStatus.FAILED, old_version, message=tr("yt-dlp -U falló: {detail}", detail=detail))
             return UpdateResult(
                 UpdateStatus.FAILED, old_version,
-                message=f"yt-dlp -U falló ({detail}) y no se pudo restaurar el respaldo.",
+                message=tr("yt-dlp -U falló ({detail}) y no se pudo restaurar el respaldo.", detail=detail),
             )
 
         new_version = self.ytdlp_version()
         if not new_version:
             if self._undo_update():
-                return UpdateResult(UpdateStatus.ROLLED_BACK, old_version, message="El binario nuevo no arranca.")
+                return UpdateResult(UpdateStatus.ROLLED_BACK, old_version, message=tr("El binario nuevo no arranca."))
             return UpdateResult(
                 UpdateStatus.FAILED, old_version,
-                message="El binario nuevo no arranca y no se pudo restaurar el respaldo.",
+                message=tr("El binario nuevo no arranca y no se pudo restaurar el respaldo."),
             )
         if new_version == old_version:
             self._clear_updating()
@@ -1420,7 +1421,7 @@ class ExtractorManager:
                 return UpdateResult(UpdateStatus.SKIPPED_BAD_VERSION, old_version, new_version)
             return UpdateResult(
                 UpdateStatus.FAILED, old_version, new_version,
-                f"Se instaló {new_version}, ya descartada, y no se pudo restaurar el respaldo.",
+                tr("Se instaló {new_version}, ya descartada, y no se pudo restaurar el respaldo.", new_version=new_version),
             )
 
         # Smoke test con el vídeo de control. Solo un fallo de EXTRACCIÓN culpa
@@ -1431,7 +1432,7 @@ class ExtractorManager:
         if smoke.ok:
             self._clear_updating()
             self.db.set_setting("update_unverified", "")
-            self._notice(f"yt-dlp actualizado a {new_version}.")
+            self._notice(tr("yt-dlp actualizado a {new_version}.", new_version=new_version))
             return UpdateResult(UpdateStatus.UPDATED, old_version, new_version)
 
         skind = smoke.kind or ErrorKind.UNKNOWN
@@ -1446,8 +1447,7 @@ class ExtractorManager:
             )
             return UpdateResult(
                 UpdateStatus.UPDATED_UNVERIFIED, old_version, new_version,
-                f"Actualizado a {new_version}; la verificación quedó pendiente "
-                f"({MESSAGES_ES.get(skind, skind.value)}).",
+                tr("Actualizado a {new_version}; la verificación quedó pendiente ({get}).", new_version=new_version, get=error_message(skind)),
             )
 
         undone = self._undo_update()
@@ -1456,11 +1456,11 @@ class ExtractorManager:
             if not undone:
                 return UpdateResult(
                     UpdateStatus.FAILED, old_version, new_version,
-                    "La versión nueva no encontró un runtime JS compatible y no se pudo restaurar el respaldo.",
+                    tr("La versión nueva no encontró un runtime JS compatible y no se pudo restaurar el respaldo."),
                 )
             return UpdateResult(
                 UpdateStatus.ROLLED_BACK, old_version, new_version,
-                "La versión nueva no encontró un runtime JS compatible; revisa deno.",
+                tr("La versión nueva no encontró un runtime JS compatible; revisa deno."),
             )
         self.db.add_bad_version(new_version, f"smoke test: {summarize(smoke.stderr)}")
         if not undone:
@@ -1468,12 +1468,12 @@ class ExtractorManager:
             self.db.set_setting("update_unverified", new_version)
             return UpdateResult(
                 UpdateStatus.FAILED, old_version, new_version,
-                f"La versión {new_version} no pasó el smoke test y no se pudo restaurar el respaldo.",
+                tr("La versión {new_version} no pasó el smoke test y no se pudo restaurar el respaldo.", new_version=new_version),
             )
-        self._notice(f"yt-dlp {new_version} no pasó la prueba: se restauró {restored}.")
+        self._notice(tr("yt-dlp {new_version} no pasó la prueba: se restauró {restored}.", new_version=new_version, restored=restored))
         return UpdateResult(
             UpdateStatus.ROLLED_BACK, old_version, new_version,
-            f"La versión {new_version} no pasó el smoke test; se restauró {restored}.",
+            tr("La versión {new_version} no pasó el smoke test; se restauró {restored}.", new_version=new_version, restored=restored),
         )
 
     def _restore_backup(self) -> bool:
@@ -1491,7 +1491,7 @@ class ExtractorManager:
             try:
                 shutil.copy2(self.bak, tmp)
                 if tmp.stat().st_size != self.bak.stat().st_size:
-                    raise OSError(f"copia incompleta de {self.bak.name}")
+                    raise OSError(tr("copia incompleta de {name}", name=self.bak.name))
                 os.replace(tmp, self.ytdlp)
                 return True
             except OSError as exc:

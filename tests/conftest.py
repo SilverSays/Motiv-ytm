@@ -5,6 +5,9 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Las pruebas comprueban los textos en español (los del código), sea cual
+# sea el idioma de Windows de quien las ejecuta.
+os.environ["YTMN_LANG"] = "es"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 

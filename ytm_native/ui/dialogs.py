@@ -8,26 +8,27 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ytm_native.services.auth_assistant import FirefoxLogin
+from ytm_native.core.i18n import tr
 
 STEPS = (
-    "1. Pulsa «Abrir Firefox». Se abre una ventana de Firefox aparte, vacía: no ve tus "
+    tr("1. Pulsa «Abrir Firefox». Se abre una ventana de Firefox aparte, vacía: no ve tus "
     "pestañas, cuentas ni extensiones.\n"
     "2. Inicia sesión en YouTube Music con la cuenta secundaria y espera a ver tu biblioteca.\n"
     "3. Cierra esa ventana de Firefox. La app recoge la sesión, comprueba que funciona, la "
-    "guarda cifrada para tu usuario de Windows y borra del disco todo lo de esa ventana."
+    "guarda cifrada para tu usuario de Windows y borra del disco todo lo de esa ventana.")
 )
 
 WHY_NOT_CHROME = (
-    "¿Por qué Firefox y no Chrome? Las versiones recientes de Chrome ligan la sesión al "
+    tr("¿Por qué Firefox y no Chrome? Las versiones recientes de Chrome ligan la sesión al "
     "dispositivo (Device Bound Session Credentials: cookies que caducan en minutos y solo "
     "ese Chrome puede renovar) y cifran sus cookies con una clave que solo Chrome puede usar "
     "(cifrado «app-bound» de DPAPI v20). Una sesión sacada de Chrome deja de valer en pocas "
-    "horas fuera de él."
+    "horas fuera de él.")
 )
 
 NO_FIREFOX = (
-    "No se encontró Firefox en este equipo. Instálalo desde mozilla.org (no hace falta que "
-    "sea tu navegador habitual) o usa la importación manual de cabeceras."
+    tr("No se encontró Firefox en este equipo. Instálalo desde mozilla.org (no hace falta que "
+    "sea tu navegador habitual) o usa la importación manual de cabeceras.")
 )
 
 
@@ -39,7 +40,7 @@ class FirefoxLoginDialog(QDialog):
 
     def __init__(self, login: Optional[FirefoxLogin] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("Iniciar sesión con Firefox")
+        self.setWindowTitle(tr("Iniciar sesión con Firefox"))
         self.setMinimumWidth(560)
         self.login = login or FirefoxLogin(parent=self)
         self.login.waiting.connect(self._on_waiting)
@@ -49,7 +50,7 @@ class FirefoxLoginDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
-        title = QLabel("Inicia sesión sin copiar cabeceras")
+        title = QLabel(tr("Inicia sesión sin copiar cabeceras"))
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
         steps = QLabel(STEPS)
@@ -66,13 +67,13 @@ class FirefoxLoginDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.open_btn = QPushButton("Abrir Firefox")
+        self.open_btn = QPushButton(tr("Abrir Firefox"))
         self.open_btn.setDefault(True)
         self.open_btn.clicked.connect(self._start)
-        self.manual_btn = QPushButton("Importar cabeceras a mano…")
-        self.manual_btn.setToolTip("Para usuarios avanzados o equipos sin Firefox.")
+        self.manual_btn = QPushButton(tr("Importar cabeceras a mano…"))
+        self.manual_btn.setToolTip(tr("Para usuarios avanzados o equipos sin Firefox."))
         self.manual_btn.clicked.connect(self._manual)
-        self.close_btn = QPushButton("Cerrar")
+        self.close_btn = QPushButton(tr("Cerrar"))
         self.close_btn.clicked.connect(self.reject)
         row.addWidget(self.open_btn)
         row.addWidget(self.manual_btn)
@@ -87,28 +88,28 @@ class FirefoxLoginDialog(QDialog):
 
     # -- pasos ------------------------------------------------------------
     def _start(self) -> None:
-        self.status.setText("Abriendo Firefox…")
+        self.status.setText(tr("Abriendo Firefox…"))
         self.login.start()
 
     def _on_waiting(self) -> None:
         self.open_btn.setEnabled(False)
         self.manual_btn.setEnabled(False)
-        self.close_btn.setText("Cancelar")
-        self.status.setText("Inicia sesión en la ventana de Firefox y ciérrala cuando veas tu biblioteca. "
-                            "Cerrar este cuadro cancela el inicio de sesión.")
+        self.close_btn.setText(tr("Cancelar"))
+        self.status.setText(tr("Inicia sesión en la ventana de Firefox y ciérrala cuando veas tu biblioteca. "
+                            "Cerrar este cuadro cancela el inicio de sesión."))
 
     def _on_checking(self) -> None:
         self.close_btn.setEnabled(False)
-        self.status.setText("Comprobando la sesión…")
+        self.status.setText(tr("Comprobando la sesión…"))
 
     def _on_finished(self, ok: bool, message: str) -> None:
         self.status.setText(message)
         self.open_btn.setEnabled(self.login.available)
         self.manual_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
-        self.close_btn.setText("Cerrar")
+        self.close_btn.setText(tr("Cerrar"))
         if ok:
-            self.open_btn.setText("Volver a iniciar sesión")
+            self.open_btn.setText(tr("Volver a iniciar sesión"))
             self.credentials_changed.emit()
 
     def _manual(self) -> None:

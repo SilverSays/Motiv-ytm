@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional
 from ytm_native.core import config, credentials, paths
 from ytm_native.core.crypto import CryptoError
 from ytm_native.core.db import Database, Playlist, Track
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.sync")
 
@@ -177,9 +178,9 @@ def _parse_duration(text: str) -> Optional[int]:
 DEVICE_BOUND_COOKIES = ("__Secure-1PSIDRTS", "__Secure-3PSIDRTS")
 
 DEVICE_BOUND_WARNING = (
-    "Esta sesión viene de un navegador que la liga al dispositivo (Chrome en Windows). "
+    tr("Esta sesión viene de un navegador que la liga al dispositivo (Chrome en Windows). "
     "Fuera de ese navegador deja de valer en pocas horas. Para una sesión duradera, "
-    "repite el proceso en una ventana privada de Firefox."
+    "repite el proceso en una ventana privada de Firefox.")
 )
 
 
@@ -305,9 +306,9 @@ def default_client_factory():
     except credentials.CredentialError as exc:
         # De otro usuario de Windows, de otro equipo o dañado: para la app es
         # una sesión caducada que hay que renovar, no un fallo.
-        raise SessionExpired("las credenciales guardadas no se pueden descifrar") from exc
+        raise SessionExpired(tr("las credenciales guardadas no se pueden descifrar")) from exc
     if not isinstance(raw, dict):
-        raise SessionExpired("las credenciales guardadas no tienen el formato esperado")
+        raise SessionExpired(tr("las credenciales guardadas no tienen el formato esperado"))
     keeper = CookieKeeper(path, baseline=next((v for k, v in raw.items() if k.lower() == "cookie"), None))
     session = requests.Session()
     session.request = _with_timeout(session.request)
@@ -377,7 +378,7 @@ class LibrarySync:
     ) -> SyncReport:
         """Sincroniza (bloqueante; llamar desde un hilo de trabajo)."""
         if not self._lock.acquire(blocking=False):
-            return SyncReport(state=SyncState.SYNCING, message="Ya hay una sincronización en curso.")
+            return SyncReport(state=SyncState.SYNCING, message=tr("Ya hay una sincronización en curso."))
         try:
             return self._run(force_all, only_playlist, cancel or threading.Event())
         finally:
@@ -388,7 +389,7 @@ class LibrarySync:
         report = SyncReport()
         if not self._credentials_present():
             report.state = SyncState.NO_CREDENTIALS
-            report.message = "Faltan las cabeceras de ytmusicapi (browser.json)."
+            report.message = tr("Faltan las cabeceras de ytmusicapi (browser.json).")
             self._set_state(report.state)
             return report
 
@@ -407,13 +408,13 @@ class LibrarySync:
         if not remote and self._looks_logged_out(client):
             # ytmusicapi no lanza error con la sesión cerrada: devuelve una
             # biblioteca vacía. Una cuenta con sesión siempre trae alguna lista.
-            return self._fail(report, SessionExpired("la sesión está cerrada (logged out)"))
+            return self._fail(report, SessionExpired(tr("la sesión está cerrada (logged out)")))
 
         if not remote and local:
             report.state = SyncState.ERROR
             report.message = (
-                "La biblioteca remota llegó vacía; no se borró nada. "
-                "Puede que la sesión haya caducado: revisa las credenciales."
+                tr("La biblioteca remota llegó vacía; no se borró nada. "
+                "Puede que la sesión haya caducado: revisa las credenciales.")
             )
             self._set_state(report.state)
             return report
@@ -449,8 +450,9 @@ class LibrarySync:
 
         report.state = SyncState.IDLE
         report.message = " ".join(
-            [f"{report.playlists_downloaded} lista(s) actualizadas de {report.playlists_seen}."]
-            + ([f"{len(report.errors)} con errores."] if report.errors else [])
+            [tr("{downloaded} lista(s) actualizadas de {seen}.", downloaded=report.playlists_downloaded,
+                seen=report.playlists_seen)]
+            + ([tr("{n} con errores.", n=len(report.errors))] if report.errors else [])
             + report.warnings
         )
         self._set_state(SyncState.IDLE)
@@ -477,7 +479,7 @@ class LibrarySync:
         try:
             data = client.get_playlist(pid, limit=None)
             if not isinstance(data, dict):
-                raise ValueError("la respuesta no trae la lista")
+                raise ValueError(tr("la respuesta no trae la lista"))
             raw_tracks = data.get("tracks") or []
             items = [t for t in (track_from_item(i) for i in raw_tracks if isinstance(i, dict)) if t]
         except Exception as exc:  # noqa: BLE001 - una lista rota no debe frenar al resto
@@ -532,11 +534,11 @@ class LibrarySync:
         if expected is not None:
             if expected == 0 or received >= expected * config.SYNC_TRUNCATED_RATIO:
                 return ""
-            return (f"llegaron {received} de las {expected} canciones que dice tener; "
-                    "no se borró nada y se reintentará")
+            return (tr("llegaron {received} de las {expected} canciones que dice tener; no se borró nada y "
+                       "se reintentará", received=received, expected=expected))
         if playable > 0:
             return ""
-        return f"llegó vacía y tenía {had} canciones; no se borró nada y se reintentará"
+        return tr("llegó vacía y tenía {had} canciones; no se borró nada y se reintentará", had=had)
 
     def _remove_missing(self, remote: list[dict], local: dict[str, Playlist], report: SyncReport) -> None:
         """Borra las listas que ya no están en la cuenta, salvo que falten
@@ -550,8 +552,8 @@ class LibrarySync:
             if self.db.get_setting(SHRINK_KEY) != signature:
                 self.db.set_setting(SHRINK_KEY, signature)
                 warning = (
-                    f"La cuenta devolvió {len(remote_ids)} listas de las {len(local)} guardadas; "
-                    "no se borró ninguna. Si las quitaste tú, desaparecerán en la próxima sincronización."
+                    tr("La cuenta devolvió {n} listas de las {n2} guardadas; no se borró ninguna. Si las "
+                       "quitaste tú, desaparecerán en la próxima sincronización.", n=len(remote_ids), n2=len(local))
                 )
                 log.warning("biblioteca remota sospechosamente corta: %s", warning)
                 report.warnings.append(warning)
@@ -586,12 +588,12 @@ class LibrarySync:
     def _fail(self, report: SyncReport, exc: BaseException) -> SyncReport:
         if is_auth_error(exc):
             report.state = SyncState.AUTH_EXPIRED
-            report.message = "La sesión caducó: renueva las credenciales de la cuenta secundaria."
+            report.message = tr("La sesión caducó: renueva las credenciales de la cuenta secundaria.")
             if looks_device_bound(credentials.read_text_or_empty(paths.browser_json())):
                 report.message += " " + DEVICE_BOUND_WARNING
         else:
             report.state = SyncState.ERROR
-            report.message = f"Error de sincronización: {exc}"
+            report.message = tr("Error de sincronización: {exc}", exc=exc)
         log.warning("sincronización falló (%s): %s", report.state.value, exc)
         self._set_state(report.state)
         return report

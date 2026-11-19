@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from ytm_native.core import config, credentials, paths
 from ytm_native.core.db import Database, Track
+from ytm_native.core.i18n import tr
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +86,15 @@ def format_time(seconds: Optional[float]) -> str:
 
 def format_ago(ts: Optional[float]) -> str:
     if not ts:
-        return "nunca"
+        return tr("nunca")
     delta = max(0, time.time() - ts)
     if delta < 90:
-        return "hace un momento"
+        return tr("hace un momento")
     if delta < 3600:
-        return f"hace {int(delta // 60)} min"
+        return tr("hace {int} min", int=int(delta // 60))
     if delta < 86400:
-        return f"hace {int(delta // 3600)} h"
-    return f"hace {int(delta // 86400)} d"
+        return tr("hace {int} h", int=int(delta // 3600))
+    return tr("hace {int} d", int=int(delta // 86400))
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,7 @@ class TrackModel(QAbstractTableModel):
     Una vista puede cambiar el álbum por una nota suya por pista (el historial
     pone cuándo se escuchó o cuántas veces), con su propio título de columna."""
 
-    HEADERS = ("Título", "Álbum", "Duración")
+    HEADERS = (tr("Título"), tr("Álbum"), tr("Duración"))
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -243,8 +244,8 @@ class TrackModel(QAbstractTableModel):
                 since = datetime.fromtimestamp(track.unavailable_since).strftime("%d/%m/%Y")
                 days = config.UNAVAILABLE_RECHECK_S // 86400
                 return (
-                    f"No disponible desde el {since}. Se reintentará sola pasados {days} días; "
-                    "un doble clic la reintenta ahora."
+                    tr("No disponible desde el {since}. Se reintentará sola pasados {days} días; un doble "
+                       "clic la reintenta ahora.", since=since, days=days)
                 )
             if col == 0:
                 return f"{track.title}\n{track.artists}" if track.artists else track.title
@@ -255,12 +256,12 @@ class TrackModel(QAbstractTableModel):
 # Diálogo de cuenta: credenciales y modo de reproducción
 # ---------------------------------------------------------------------------
 BROWSER_NOTE = (
-    "Usa Firefox para este paso. Chrome en Windows liga la sesión al dispositivo y, copiada "
-    "a esta app, deja de valer en pocas horas."
+    tr("Usa Firefox para este paso. Chrome en Windows liga la sesión al dispositivo y, copiada "
+    "a esta app, deja de valer en pocas horas.")
 )
 
 HEADER_STEPS = (
-    "1. Abre una ventana privada nueva de Firefox, inicia sesión en YouTube con la cuenta "
+    tr("1. Abre una ventana privada nueva de Firefox, inicia sesión en YouTube con la cuenta "
     "secundaria y entra en https://music.youtube.com.\n"
     "2. Pulsa F12, abre la pestaña Red y escribe «browse» en el filtro.\n"
     "3. La lista empieza vacía: solo registra lo que ocurre con el panel abierto. Haz clic en "
@@ -268,31 +269,31 @@ HEADER_STEPS = (
     "4. Busca una fila con método POST y dominio music.youtube.com. Las GET no sirven; si "
     "solo ves GET, sigue navegando.\n"
     "5. Clic derecho sobre esa fila → Copiar valor → Copiar cabeceras de la petición, y "
-    "pégalas abajo."
+    "pégalas abajo.")
 )
 
 COOKIE_STEPS = (
-    "1. En esa misma ventana privada ve a https://www.youtube.com/robots.txt (debe ser la "
+    tr("1. En esa misma ventana privada ve a https://www.youtube.com/robots.txt (debe ser la "
     "única pestaña privada abierta).\n"
     "2. Exporta las cookies de youtube.com en formato Netscape con una extensión de "
     "exportación de cookies.\n"
     "3. Cierra la ventana privada sin cerrar sesión y no vuelvas a abrir esa sesión en el "
-    "navegador: YouTube rota las cookies de las pestañas abiertas."
+    "navegador: YouTube rota las cookies de las pestañas abiertas.")
 )
 
 CLOSE_NOTE = (
-    "Aunque no exportes cookies, al terminar cierra la ventana privada sin cerrar sesión."
+    tr("Aunque no exportes cookies, al terminar cierra la ventana privada sin cerrar sesión.")
 )
 
 
 def _file_status(path: Path) -> str:
     if not path.is_file():
-        return "No configurado"
-    stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+        return tr("No configurado")
+    stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime(tr("%d/%m/%Y %H:%M"))
     if not credentials.readable(path):
-        return f"No se puede leer ({stamp}): guárdalo de nuevo"
-    sealed = "cifrado para tu usuario de Windows" if credentials.is_sealed_file(path) else "aún sin cifrar"
-    return f"Configurado ({stamp}, {sealed})"
+        return tr("No se puede leer ({stamp}): guárdalo de nuevo", stamp=stamp)
+    sealed = tr("cifrado para tu usuario de Windows") if credentials.is_sealed_file(path) else tr("aún sin cifrar")
+    return tr("Configurado ({stamp}, {sealed})", stamp=stamp, sealed=sealed)
 
 
 def browser_headers_from_raw(raw: str) -> dict:
@@ -307,8 +308,8 @@ def browser_headers_from_raw(raw: str) -> dict:
     clean = sanitize_browser_headers(json.loads(ytmusicapi.setup(headers_raw=raw)))
     if "cookie" not in {k.lower() for k in clean}:
         raise ValueError(
-            "las cabeceras no incluyen la línea «cookie»: copia la sección Request "
-            "Headers completa de una petición «browse» con la sesión iniciada"
+            tr("las cabeceras no incluyen la línea «cookie»: copia la sección Request "
+            "Headers completa de una petición «browse» con la sesión iniciada")
         )
     return clean
 
@@ -320,7 +321,7 @@ class AccountDialog(QDialog):
     def __init__(self, db: Database, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.db = db
-        self.setWindowTitle("Cuenta y reproducción")
+        self.setWindowTitle(tr("Cuenta y reproducción"))
         # El contenido se desplaza: el diálogo cabe también en pantallas de 768 px de alto.
         self.setMinimumSize(620, 480)
         self.resize(720, 760)
@@ -328,12 +329,12 @@ class AccountDialog(QDialog):
         layout.setContentsMargins(16, 10, 16, 14)
         layout.setSpacing(12)
         tabs = QTabWidget()
-        tabs.addTab(self._scrolled(self._credentials_tab()), "Credenciales")
-        tabs.addTab(self._scrolled(self._playback_tab()), "Reproducción")
+        tabs.addTab(self._scrolled(self._credentials_tab()), tr("Credenciales"))
+        tabs.addTab(self._scrolled(self._playback_tab()), tr("Reproducción"))
         layout.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.accept)
-        buttons.button(QDialogButtonBox.StandardButton.Close).setText("Cerrar")
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText(tr("Cerrar"))
         layout.addWidget(buttons)
 
     @staticmethod
@@ -352,8 +353,8 @@ class AccountDialog(QDialog):
         lay.setSpacing(10)
 
         note = QLabel(
-            "Usa siempre la cuenta secundaria. Los archivos se guardan en "
-            f"{paths.cred_dir()} (fuera de la carpeta del proyecto)."
+            tr("Usa siempre la cuenta secundaria. Los archivos se guardan en {cred_dir} (fuera de la "
+               "carpeta del proyecto).", cred_dir=paths.cred_dir())
         )
         note.setObjectName("mutedLabel")
         note.setWordWrap(True)
@@ -362,13 +363,13 @@ class AccountDialog(QDialog):
         browser_note = QLabel(BROWSER_NOTE)
         browser_note.setWordWrap(True)
         lay.addWidget(browser_note)
-        firefox = QPushButton("Iniciar sesión con Firefox (recomendado)…")
-        firefox.setToolTip("Sin copiar cabeceras: inicias sesión en una ventana de Firefox aparte "
-                           "y la app recoge la sesión al cerrarla.")
+        firefox = QPushButton(tr("Iniciar sesión con Firefox (recomendado)…"))
+        firefox.setToolTip(tr("Sin copiar cabeceras: inicias sesión en una ventana de Firefox aparte "
+                           "y la app recoge la sesión al cerrarla."))
         firefox.clicked.connect(self._ask_firefox_login)
         lay.addWidget(firefox, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        lay.addWidget(self._heading("Biblioteca (ytmusicapi)"))
+        lay.addWidget(self._heading(tr("Biblioteca (ytmusicapi)")))
         self.headers_status = QLabel()
         self.headers_status.setObjectName("mutedLabel")
         lay.addWidget(self.headers_status)
@@ -376,24 +377,24 @@ class AccountDialog(QDialog):
         steps.setWordWrap(True)
         lay.addWidget(steps)
         self.headers_edit = QPlainTextEdit()
-        self.headers_edit.setPlaceholderText("Pega aquí las cabeceras de la petición…")
+        self.headers_edit.setPlaceholderText(tr("Pega aquí las cabeceras de la petición…"))
         self.headers_edit.setFixedHeight(96)
         # Tab pasa al siguiente control: las cabeceras se pegan, no se teclean
         # tabuladores a mano, y sin esto el foco quedaba atrapado en el campo.
         self.headers_edit.setTabChangesFocus(True)
         lay.addWidget(self.headers_edit)
-        save = QPushButton("Guardar cabeceras")
+        save = QPushButton(tr("Guardar cabeceras"))
         save.clicked.connect(self._save_headers)
         lay.addWidget(save, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        lay.addWidget(self._heading("Reproducción (cookies.txt para yt-dlp)"))
+        lay.addWidget(self._heading(tr("Reproducción (cookies.txt para yt-dlp)")))
         self.cookies_status = QLabel()
         self.cookies_status.setObjectName("mutedLabel")
         lay.addWidget(self.cookies_status)
         csteps = QLabel(COOKIE_STEPS)
         csteps.setWordWrap(True)
         lay.addWidget(csteps)
-        pick = QPushButton("Seleccionar cookies.txt…")
+        pick = QPushButton(tr("Seleccionar cookies.txt…"))
         pick.clicked.connect(self._pick_cookies)
         lay.addWidget(pick, alignment=Qt.AlignmentFlag.AlignLeft)
         close_note = QLabel(CLOSE_NOTE)
@@ -421,7 +422,7 @@ class AccountDialog(QDialog):
     def _save_headers(self) -> None:
         raw = self.headers_edit.toPlainText().strip()
         if not raw:
-            QMessageBox.information(self, "Cabeceras", "Pega primero las cabeceras de la petición.")
+            QMessageBox.information(self, tr("Cabeceras"), tr("Pega primero las cabeceras de la petición."))
             return
         try:
             import json
@@ -432,7 +433,7 @@ class AccountDialog(QDialog):
             clean = browser_headers_from_raw(raw)
             credentials.write_text(paths.browser_json(), json.dumps(clean, ensure_ascii=False, indent=1))
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Cabeceras", f"No se pudieron procesar las cabeceras:\n{exc}")
+            QMessageBox.warning(self, tr("Cabeceras"), tr("No se pudieron procesar las cabeceras:\n{exc}", exc=exc))
             return
         from ytm_native.services.sync import DEVICE_BOUND_WARNING, looks_device_bound
 
@@ -440,45 +441,46 @@ class AccountDialog(QDialog):
         self._refresh_status()
         self.credentials_changed.emit()
         if looks_device_bound(raw):
-            QMessageBox.warning(self, "Cabeceras", "Cabeceras guardadas.\n\n" + DEVICE_BOUND_WARNING)
+            QMessageBox.warning(self, tr("Cabeceras"), tr("Cabeceras guardadas.\n\n") + DEVICE_BOUND_WARNING)
         else:
-            QMessageBox.information(self, "Cabeceras", "Cabeceras guardadas.")
+            QMessageBox.information(self, tr("Cabeceras"), tr("Cabeceras guardadas."))
 
     def _pick_cookies(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar cookies.txt", str(Path.home()), "Cookies (*.txt);;Todos (*.*)"
+            self, tr("Seleccionar cookies.txt"), str(Path.home()), tr("Cookies (*.txt);;Todos (*.*)")
         )
         if not filename:
             return
         try:
             data = Path(filename).read_bytes()
         except OSError as exc:
-            QMessageBox.warning(self, "Cookies", f"No se pudo leer el archivo:\n{exc}")
+            QMessageBox.warning(self, tr("Cookies"), tr("No se pudo leer el archivo:\n{exc}", exc=exc))
             return
         whole = data.decode("utf-8", errors="replace")
         head = whole[:4000]
         looks_netscape = "Netscape" in head or any(line.count("\t") >= 6 for line in head.splitlines())
         if not looks_netscape:
             QMessageBox.warning(
-                self, "Cookies", "El archivo no parece estar en formato Netscape (cookies.txt)."
+                self, tr("Cookies"), tr("El archivo no parece estar en formato Netscape (cookies.txt).")
             )
             return
         try:
             # Se guarda una copia cifrada; el archivo elegido no se toca.
             credentials.write_bytes(paths.cookies_txt(), data)
         except Exception as exc:  # noqa: BLE001 - p. ej. sin cifrado disponible
-            QMessageBox.warning(self, "Cookies", f"No se pudieron guardar las cookies:\n{exc}")
+            QMessageBox.warning(self, tr("Cookies"), tr("No se pudieron guardar las cookies:\n{exc}", exc=exc))
             return
         self._refresh_status()
         self.credentials_changed.emit()
         from ytm_native.services.sync import DEVICE_BOUND_WARNING, looks_device_bound
 
-        tail = ("\n\nSe guardó una copia cifrada: ya puedes borrar el archivo original "
-                f"({Path(filename).name}).")
+        tail = (tr("\n"
+                   "\n"
+                   "Se guardó una copia cifrada: ya puedes borrar el archivo original ({name}).", name=Path(filename).name))
         if looks_device_bound(whole):
-            QMessageBox.warning(self, "Cookies", "Cookies guardadas.\n\n" + DEVICE_BOUND_WARNING + tail)
+            QMessageBox.warning(self, tr("Cookies"), tr("Cookies guardadas.\n\n") + DEVICE_BOUND_WARNING + tail)
         else:
-            QMessageBox.information(self, "Cookies", "Cookies guardadas." + tail)
+            QMessageBox.information(self, tr("Cookies"), tr("Cookies guardadas.") + tail)
 
     # -- pestaña de reproducción -------------------------------------------
     def _playback_tab(self) -> QWidget:
@@ -486,14 +488,14 @@ class AccountDialog(QDialog):
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(4, 16, 12, 8)
         lay.setSpacing(10)
-        lay.addWidget(self._heading("Modo de resolución de yt-dlp"))
+        lay.addWidget(self._heading(tr("Modo de resolución de yt-dlp")))
 
         self.mode_buttons: dict[str, QRadioButton] = {}
         options = (
-            ("hybrid", "Híbrido (recomendado): anónimo, y cookies solo ante un bloqueo anti-bot "
-                       "o una restricción de edad."),
-            ("cookies", "Siempre con cookies de la cuenta secundaria."),
-            ("anon", "Siempre anónimo: nunca pasa cookies a yt-dlp."),
+            ("hybrid", tr("Híbrido (recomendado): anónimo, y cookies solo ante un bloqueo anti-bot "
+                       "o una restricción de edad.")),
+            ("cookies", tr("Siempre con cookies de la cuenta secundaria.")),
+            ("anon", tr("Siempre anónimo: nunca pasa cookies a yt-dlp.")),
         )
         current = self.db.get_setting("playback_mode", "hybrid")
         for key, text in options:
@@ -504,16 +506,16 @@ class AccountDialog(QDialog):
             lay.addWidget(radio)
 
         lay.addSpacing(8)
-        lay.addWidget(self._heading("Riesgo de la cuenta"))
+        lay.addWidget(self._heading(tr("Riesgo de la cuenta")))
         warn = QLabel(
-            "yt-dlp advierte que usar una cuenta puede llevar a un baneo temporal o permanente "
+            tr("yt-dlp advierte que usar una cuenta puede llevar a un baneo temporal o permanente "
             "de esa cuenta. La cuenta secundaria limita el impacto, pero no lo elimina, y este "
             "uso va contra los términos de servicio de YouTube. Mientras no marques la casilla, "
-            "yt-dlp nunca recibirá las cookies (la app funcionará solo en modo anónimo)."
+            "yt-dlp nunca recibirá las cookies (la app funcionará solo en modo anónimo).")
         )
         warn.setWordWrap(True)
         lay.addWidget(warn)
-        self.risk_check = QCheckBox("Acepto el riesgo de usar las cookies de la cuenta secundaria con yt-dlp")
+        self.risk_check = QCheckBox(tr("Acepto el riesgo de usar las cookies de la cuenta secundaria con yt-dlp"))
         self.risk_check.setChecked(self.db.get_bool("cookies_risk_accepted"))
         self.risk_check.toggled.connect(
             lambda checked: self.db.set_setting("cookies_risk_accepted", "1" if checked else "0")

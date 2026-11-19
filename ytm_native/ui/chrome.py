@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
 )
 
 from . import focus, theme
-from .components import glyph_pixmap
 from .motion import EASE_OUT, Tween
 
 MENU_FADE_MS = 120
@@ -61,14 +60,6 @@ _CHECK_ICONS: dict[tuple, QIcon] = {}
 _CHECKS: list = []        # (acción, cómo repintar su marca): se repintan al cambiar de tema
 
 
-def _check_icon(dpr: float) -> QIcon:
-    key = ("check", theme.scheme(), round(dpr, 2))
-    icon = _CHECK_ICONS.get(key)
-    if icon is None:
-        icon = _CHECK_ICONS[key] = QIcon(glyph_pixmap("check", 16, theme.PAPEL, dpr))
-    return icon
-
-
 def _box_icon(on: bool, dpr: float) -> QIcon:
     """Casilla de un interruptor: hueca si está apagado, llena de tinta con la
     marca en el color del panel si está encendido. Así un interruptor se
@@ -103,13 +94,6 @@ def _box_icon(on: bool, dpr: float) -> QIcon:
     return icon
 
 
-def _blank_icon(dpr: float) -> QIcon:
-    blank_pixmap = QPixmap(max(1, round(16 * dpr)), max(1, round(16 * dpr)))
-    blank_pixmap.fill(Qt.GlobalColor.transparent)
-    blank_pixmap.setDevicePixelRatio(dpr)
-    return QIcon(blank_pixmap)
-
-
 def _track_icon(action: QAction, paint) -> QAction:
     action.toggled.connect(paint)
     paint(action.isChecked())
@@ -125,13 +109,6 @@ def show_check(action: QAction, dpr: float = 1.0) -> QAction:
     dos estados, así el texto no cambia de sitio de una apertura a otra.
     """
     return _track_icon(action, lambda on: action.setIcon(_box_icon(on, dpr)))
-
-
-def show_choice(action: QAction, dpr: float = 1.0) -> QAction:
-    """Marca para una opción de un grupo excluyente (el tema): solo la elegida
-    lleva marca; las demás reservan el hueco con una imagen vacía."""
-    blank = _blank_icon(dpr)
-    return _track_icon(action, lambda on: action.setIcon(_check_icon(dpr) if on else blank))
 
 
 def refresh_checks() -> None:

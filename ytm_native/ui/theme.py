@@ -52,7 +52,10 @@ LIGHT = {
     "SOLIDO": "#14545a",       # superficies sólidas: reproducir, botón principal
     "SOLIDO_HOVER": "#1b6a71", # su hover
     "SOBRE_SOLIDO": "#f3f7f7", # texto e iconos sobre lo sólido y sobre los velos
-    "ORO": "#e0ac2e",          # acento: marca de la vista activa
+    "ORO": "#e0ac2e",          # acento: aros de la banda, icono de la bandeja
+    # La marca de la vista activa y de la pestaña elegida: el oro, más denso
+    # para que se distinga del panel (4,1:1) y de la fila elegida (3,4:1).
+    "MARCA": "#a06e08",
     "HALO": "#45d3d8",         # halo de lo que suena
     "VELO": QColor(16, 34, 42, 150),   # velo sobre una carátula para pintar encima
     # Texto sobre la banda de la cabecera (pastel claro): la tinta pizarra.
@@ -75,10 +78,14 @@ DARK = {
     "PAPEL_SUAVE": "#d0dade",
     "CREMA": "#5fcac3",        # aguamarina clara: la tinta sin carátula
     "AVISO": "#f08a82",
-    "SOLIDO": "#15625f",       # aguamarina profunda para lo sólido
-    "SOLIDO_HOVER": "#1a6f6b",
+    # Aguamarina para lo sólido: 3,2:1 sobre PANEL (un control encendido se
+    # distingue del fondo) y el texto encima a 4,8:1. El hover, un punto más
+    # claro sin bajar el texto de 4,5:1.
+    "SOLIDO": "#1d7a76",
+    "SOLIDO_HOVER": "#1f7e79",
     "SOBRE_SOLIDO": "#f3f7f7",
     "ORO": "#e0ac2e",
+    "MARCA": "#e0ac2e",        # 7,8:1 sobre PANEL, 5,7:1 sobre RELIEVE_2
     "HALO": "#45d3d8",
     "VELO": QColor(6, 12, 16, 165),
     "BANDA_TINTA": (240, 244, 246),
@@ -91,7 +98,7 @@ _scheme = "light"
 
 FONDO = PANEL = RELIEVE = RELIEVE_2 = LINEA = LINEA_CLARA = BANDA_NEUTRA = ""
 PAPEL = HUMO = TENUE = PAPEL_SUAVE = CREMA = AVISO = SOLIDO = SOLIDO_HOVER = ""
-SOBRE_SOLIDO = ORO = HALO = ""
+SOBRE_SOLIDO = ORO = MARCA = HALO = ""
 VELO = QColor()
 BANDA_TINTA = (0, 0, 0)
 BANDA_CAMPO = ""
@@ -104,7 +111,7 @@ QSS = ""
 # de esta lista cuyo valor coincida (los de texto antes que los de superficie).
 _ROLE_ORDER = ("PAPEL", "HUMO", "TENUE", "PAPEL_SUAVE", "AVISO", "CREMA", "PANEL", "RELIEVE", "RELIEVE_2",
                "LINEA", "LINEA_CLARA", "FONDO", "SOLIDO", "SOLIDO_HOVER", "SOBRE_SOLIDO", "BANDA_NEUTRA",
-               "ORO", "HALO")
+               "ORO", "MARCA", "HALO")
 
 
 def translate(color: "str | QColor", previous: str) -> QColor:
@@ -340,6 +347,20 @@ QLineEdit#bandSearch:focus {{ border: 2px solid {PAPEL}; padding: 8px 11px; }}
 #nowFactLabel {{ color: {HUMO}; font-size: 13px; }}
 #nowFactValue {{ color: {PAPEL}; font-size: 13px; }}
 
+/* Opciones: dos paneles sobre la plata, como la ventana principal. */
+QDialog#optionsDialog {{ background: {FONDO}; }}
+#optionsRailTitle {{ font-family: {DISPLAY_FONT}; font-size: 26px; color: {PAPEL}; }}
+#optionsTitle {{ font-family: {DISPLAY_FONT}; font-size: 34px; color: {PAPEL}; }}
+#optionsLead {{ color: {HUMO}; font-size: 14px; }}
+#optionsGroup {{ font-size: 14px; font-weight: 600; color: {PAPEL}; }}
+QComboBox#optionChoice {{ padding: 7px 34px 7px 12px; }}
+QComboBox#optionChoice:hover {{ border-color: {TENUE}; }}
+QComboBox#optionChoice::drop-down {{ border: none; width: 30px; }}
+QComboBox#optionChoice::down-arrow {{ image: none; width: 0; height: 0; }}
+QComboBox#optionChoice QAbstractItemView {{ background: {PANEL}; border: 1px solid {LINEA_CLARA}; padding: 4px; selection-background-color: {RELIEVE_2}; selection-color: {PAPEL}; outline: none; }}
+#optionTitle {{ font-size: 14px; color: {PAPEL}; }}
+#optionNote {{ font-size: 13px; color: {HUMO}; }}
+
 #mutedLabel {{ color: {HUMO}; }}
 #sectionTitle {{ font-weight: 600; font-size: 14px; }}
 #panelTitle {{ font-weight: 600; font-size: 13px; color: {HUMO}; }}
@@ -376,7 +397,7 @@ QScrollBar:horizontal {{ height: 0; }}
 QTabWidget::pane {{ border: none; border-top: 1px solid {LINEA}; top: -1px; }}
 QTabBar::tab {{ background: transparent; padding: 9px 16px; color: {HUMO}; border-bottom: 2px solid transparent; }}
 QTabBar::tab:hover {{ color: {PAPEL}; }}
-QTabBar::tab:selected {{ color: {PAPEL}; border-bottom-color: {ORO}; }}
+QTabBar::tab:selected {{ color: {PAPEL}; border-bottom-color: {MARCA}; }}
 QTabBar::tab:focus {{ border-bottom-color: {PAPEL}; }}
 QCheckBox, QRadioButton {{ spacing: 8px; }}
 QToolTip {{ background: {PAPEL}; color: {PANEL}; border: none; padding: 5px 9px; }}

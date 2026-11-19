@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ytm_native.core import config
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.lyrics")
 
@@ -362,7 +363,7 @@ def fetch_lyrics(
         nonlocal failure
         remaining = deadline - clock()
         if remaining < config.LYRICS_MIN_REQUEST_S:
-            failure = TimeoutError(f"la búsqueda de la letra superó {budget_s:g} s")
+            failure = TimeoutError(tr("la búsqueda de la letra superó {budget_s:g} s", budget_s=budget_s))
             raise _Stop
         return remaining
 
@@ -374,7 +375,7 @@ def fetch_lyrics(
         except ValueError:
             return None                   # respuesta que no es JSON: como si no hubiera
         except (OSError, http.client.HTTPException) as exc:
-            failure = exc if isinstance(exc, OSError) else OSError(f"respuesta cortada: {exc}")
+            failure = exc if isinstance(exc, OSError) else OSError(tr("respuesta cortada: {exc}", exc=exc))
             raise _Stop from exc
 
     def ask_ytmusic() -> Optional[Lyrics]:

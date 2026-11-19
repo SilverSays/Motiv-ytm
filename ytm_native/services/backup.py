@@ -31,6 +31,7 @@ from ytm_native.core.db import (
     _UPSERT_TRACK_SQL,
     _track_params,
 )
+from ytm_native.core.i18n import plural, tr
 
 FORMAT = "ytmn-backup"
 VERSION = 1
@@ -54,6 +55,8 @@ PREFERENCE_KEYS = (
     # Fase 8: el tema sí. Los cambios en la cuenta no (se activan solo tras
     # su aviso) ni la carpeta de música (es de este equipo).
     "app_theme",
+    # Fase 9: el idioma (se aplica al volver a abrir la app).
+    "language",
 )
 
 _VIDEO_ID = re.compile(r"^[\w\-.]{1,64}$", re.ASCII)
@@ -86,10 +89,7 @@ class Backup:
 
     def summary(self) -> str:
         songs = sum(len(p.tracks) for p in self.playlists)
-        return (f"{_count(len(self.playlists), 'lista', 'listas')} con "
-                f"{_count(songs, 'canción', 'canciones')}, "
-                f"{_count(len(self.history), 'escucha', 'escuchas')} y "
-                f"{_count(len(self.settings), 'preferencia', 'preferencias')}")
+        return (tr("{count} con {count2}, {count3} y {count4}", count=plural(len(self.playlists), "{n} lista", "{n} listas"), count2=plural(songs, "{n} canción", "{n} canciones"), count3=plural(len(self.history), "{n} escucha", "{n} escuchas"), count4=plural(len(self.settings), "{n} preferencia", "{n} preferencias")))
 
 
 @dataclass
@@ -101,16 +101,12 @@ class ImportReport:
     settings_applied: int = 0
 
     def summary(self) -> str:
-        parts = [_count(self.playlists_added, "lista nueva", "listas nuevas")]
+        parts = [plural(self.playlists_added, "{n} lista nueva", "{n} listas nuevas")]
         if self.playlists_merged:
-            parts.append(_count(self.playlists_merged, "lista completada", "listas completadas"))
-        parts.append(_count(self.tracks_added, "canción añadida", "canciones añadidas"))
-        parts.append(_count(self.plays_added, "escucha", "escuchas"))
+            parts.append(plural(self.playlists_merged, "{n} lista completada", "{n} listas completadas"))
+        parts.append(plural(self.tracks_added, "{n} canción añadida", "{n} canciones añadidas"))
+        parts.append(plural(self.plays_added, "{n} escucha", "{n} escuchas"))
         return ", ".join(parts)
-
-
-def _count(n: int, one: str, many: str) -> str:
-    return f"{n} {one if n == 1 else many}"
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +199,18 @@ def read_backup(path: Path | str) -> Backup:
     try:
         size = source.stat().st_size
     except OSError as exc:
-        raise BackupError(f"No se pudo abrir el archivo: {exc.strerror or exc}") from exc
+        raise BackupError(tr("No se pudo abrir el archivo: {value}", value=exc.strerror or exc)) from exc
     if size > MAX_BYTES:
-        raise BackupError("El archivo es demasiado grande para ser una copia de esta app.")
+        raise BackupError(tr("El archivo es demasiado grande para ser una copia de esta app."))
     try:
         with open(source, encoding="utf-8") as fh:
             data = json.load(fh)
     except UnicodeDecodeError as exc:
-        raise BackupError("El archivo no es texto JSON.") from exc
+        raise BackupError(tr("El archivo no es texto JSON.")) from exc
     except json.JSONDecodeError as exc:
-        raise BackupError(f"El archivo no es JSON válido (línea {exc.lineno}).") from exc
+        raise BackupError(tr("El archivo no es JSON válido (línea {lineno}).", lineno=exc.lineno)) from exc
     except OSError as exc:
-        raise BackupError(f"No se pudo leer el archivo: {exc.strerror or exc}") from exc
+        raise BackupError(tr("No se pudo leer el archivo: {value}", value=exc.strerror or exc)) from exc
     return parse_backup(data)
 
 
@@ -222,7 +218,7 @@ def _text(value, where: str, limit: int = 2000, optional: bool = False) -> str:
     if value is None and optional:
         return ""
     if not isinstance(value, str):
-        raise BackupError(f"{where}: se esperaba texto.")
+        raise BackupError(tr("{where}: se esperaba texto.", where=where))
     return value[:limit]
 
 
@@ -230,13 +226,13 @@ def _number(value, where: str, optional: bool = True) -> Optional[float]:
     if value is None and optional:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise BackupError(f"{where}: se esperaba un número.")
+        raise BackupError(tr("{where}: se esperaba un número.", where=where))
     return float(value)
 
 
 def _video_id(value, where: str) -> str:
     if not isinstance(value, str) or not _VIDEO_ID.match(value):
-        raise BackupError(f"{where}: identificador de canción no válido.")
+        raise BackupError(tr("{where}: identificador de canción no válido.", where=where))
     return value
 
 
@@ -246,93 +242,93 @@ def parse_backup(data) -> Backup:
     Nada se escribe con una copia a medias: cualquier error sale aquí, con un
     mensaje que dice dónde."""
     if not isinstance(data, dict) or data.get("format") != FORMAT:
-        raise BackupError("El archivo no es una copia de seguridad de YT Music Nativo.")
+        raise BackupError(tr("El archivo no es una copia de seguridad de YT Music Nativo."))
     version = data.get("version")
     if not isinstance(version, int) or isinstance(version, bool):
-        raise BackupError("La copia no dice su versión.")
+        raise BackupError(tr("La copia no dice su versión."))
     if version > VERSION:
-        raise BackupError("La copia es de una versión más nueva de la app: actualízala para importarla.")
-    exported_at = _number(data.get("exported_at"), "Fecha de la copia") or 0.0
+        raise BackupError(tr("La copia es de una versión más nueva de la app: actualízala para importarla."))
+    exported_at = _number(data.get("exported_at"), tr("Fecha de la copia")) or 0.0
 
     raw_tracks = data.get("tracks", {})
     if not isinstance(raw_tracks, dict):
-        raise BackupError("Canciones: se esperaba un objeto.")
+        raise BackupError(tr("Canciones: se esperaba un objeto."))
     tracks: dict[str, Track] = {}
     for video_id, info in raw_tracks.items():
-        where = f"Canción {video_id!r}"
+        where = tr("Canción {video_id!r}", video_id=video_id)
         _video_id(video_id, where)
         if not isinstance(info, dict):
-            raise BackupError(f"{where}: se esperaba un objeto.")
-        duration = _number(info.get("duration_s"), f"{where} (duración)")
+            raise BackupError(tr("{where}: se esperaba un objeto.", where=where))
+        duration = _number(info.get("duration_s"), tr("{where} (duración)", where=where))
         tracks[video_id] = Track(
             video_id,
-            _text(info.get("title"), f"{where} (título)", 500, optional=True) or FILLER_TITLE,
+            _text(info.get("title"), tr("{where} (título)", where=where), 500, optional=True) or FILLER_TITLE,
             _text(info.get("artists"), f"{where} (artistas)", 500, optional=True),
-            _text(info.get("album"), f"{where} (álbum)", 500, optional=True),
+            _text(info.get("album"), tr("{where} (álbum)", where=where), 500, optional=True),
             int(duration) if duration is not None and duration >= 0 else None,
-            thumb_url=_text(info.get("thumb_url"), f"{where} (carátula)", 2000, optional=True),
+            thumb_url=_text(info.get("thumb_url"), tr("{where} (carátula)", where=where), 2000, optional=True),
         )
 
     raw_playlists = data.get("playlists", [])
     if not isinstance(raw_playlists, list):
-        raise BackupError("Listas: se esperaba una lista.")
+        raise BackupError(tr("Listas: se esperaba una lista."))
     playlists: list[BackupPlaylist] = []
     seen: set[str] = set()
     for index, entry in enumerate(raw_playlists, 1):
-        where = f"Lista {index}"
+        where = tr("Lista {index}", index=index)
         if not isinstance(entry, dict):
-            raise BackupError(f"{where}: se esperaba un objeto.")
+            raise BackupError(tr("{where}: se esperaba un objeto.", where=where))
         playlist_id = entry.get("id")
         if not isinstance(playlist_id, str) or not _LOCAL_ID.match(playlist_id):
-            raise BackupError(f"{where}: identificador de lista local no válido.")
+            raise BackupError(tr("{where}: identificador de lista local no válido.", where=where))
         if playlist_id in seen:
-            raise BackupError(f"{where}: el identificador {playlist_id!r} aparece dos veces.")
+            raise BackupError(tr("{where}: el identificador {playlist_id!r} aparece dos veces.", where=where, playlist_id=playlist_id))
         seen.add(playlist_id)
         raw_ids = entry.get("tracks", [])
         if not isinstance(raw_ids, list):
-            raise BackupError(f"{where}: sus canciones deben ser una lista.")
+            raise BackupError(tr("{where}: sus canciones deben ser una lista.", where=where))
         ids: list[str] = []
         present: set[str] = set()
         for position, video_id in enumerate(raw_ids, 1):
-            _video_id(video_id, f"{where}, canción {position}")
+            _video_id(video_id, tr("{where}, canción {position}", where=where, position=position))
             if video_id not in present:           # una canción, una vez por lista
                 present.add(video_id)
                 ids.append(video_id)
-        position = _number(entry.get("position"), f"{where} (posición)")
-        play_count = _number(entry.get("play_count"), f"{where} (reproducciones)")
+        position = _number(entry.get("position"), tr("{where} (posición)", where=where))
+        play_count = _number(entry.get("play_count"), tr("{where} (reproducciones)", where=where))
         playlists.append(BackupPlaylist(
             playlist_id,
-            _text(entry.get("title"), f"{where} (título)", 300).strip() or "Lista sin nombre",
-            _text(entry.get("description"), f"{where} (descripción)", 5000, optional=True),
+            _text(entry.get("title"), tr("{where} (título)", where=where), 300).strip() or tr("Lista sin nombre"),
+            _text(entry.get("description"), tr("{where} (descripción)", where=where), 5000, optional=True),
             int(position) if position is not None else 0,
-            _number(entry.get("created_at"), f"{where} (creación)"),
+            _number(entry.get("created_at"), tr("{where} (creación)", where=where)),
             max(0, int(play_count or 0)),
-            _number(entry.get("last_played"), f"{where} (última escucha)"),
+            _number(entry.get("last_played"), tr("{where} (última escucha)", where=where)),
             ids,
         ))
 
     raw_history = data.get("history", [])
     if not isinstance(raw_history, list):
-        raise BackupError("Historial: se esperaba una lista.")
+        raise BackupError(tr("Historial: se esperaba una lista."))
     history: list[tuple[str, float]] = []
     for index, item in enumerate(raw_history, 1):
-        where = f"Historial, escucha {index}"
+        where = tr("Historial, escucha {index}", index=index)
         if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise BackupError(f"{where}: se esperaba [canción, fecha].")
+            raise BackupError(tr("{where}: se esperaba [canción, fecha].", where=where))
         played_at = _number(item[1], where, optional=False)
         if played_at <= 0:
-            raise BackupError(f"{where}: fecha no válida.")
+            raise BackupError(tr("{where}: fecha no válida.", where=where))
         history.append((_video_id(item[0], where), played_at))
 
     raw_settings = data.get("settings", {})
     if not isinstance(raw_settings, dict):
-        raise BackupError("Preferencias: se esperaba un objeto.")
+        raise BackupError(tr("Preferencias: se esperaba un objeto."))
     settings: dict[str, Optional[str]] = {}
     for key, value in raw_settings.items():
         if key not in PREFERENCE_KEYS:
             continue                    # nada que no sea una preferencia conocida
         if value is not None and not isinstance(value, (str, int, float)):
-            raise BackupError(f"Preferencia {key!r}: valor no válido.")
+            raise BackupError(tr("Preferencia {key!r}: valor no válido.", key=key))
         settings[key] = None if value is None else str(value)[:20000]
     return Backup(exported_at, tracks, playlists, history, settings)
 
@@ -346,7 +342,7 @@ def _track_for(backup: Backup, video_id: str) -> Track:
 
 def import_backup(db: Database, backup: Backup, strategy: str = MERGE) -> ImportReport:
     if strategy not in (MERGE, REPLACE):
-        raise ValueError(f"estrategia desconocida: {strategy}")
+        raise ValueError(tr("estrategia desconocida: {strategy}", strategy=strategy))
     report = ImportReport()
     referenced = {vid for p in backup.playlists for vid in p.tracks} | {vid for vid, _ in backup.history}
     prefix = (len(LOCAL_PREFIX), LOCAL_PREFIX)

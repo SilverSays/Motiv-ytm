@@ -35,6 +35,7 @@ from .components import PillButton
 from .home import CardGrid, SleeveCard
 from .motion import EASE, FADE_MS, ROW_STAGGER, STAGGER_CAP, Tween
 from .now import SimilarRow
+from ytm_native.core.i18n import tr
 
 
 class TrackColumns(QWidget):
@@ -170,7 +171,7 @@ class CardSection(Section):
     def _on_fitted(self, shown: int, total: int) -> None:
         # Solo hay botón si algo se queda fuera (o si ya se desplegó).
         self.action.setVisible(self._open or shown < total)
-        self.action.set_label("Ver menos" if self._open else f"Ver todo ({total})")
+        self.action.set_label(tr("Ver menos") if self._open else tr("Ver todo ({total})", total=total))
 
     def _toggle(self) -> None:
         self._open = not self._open
@@ -212,7 +213,7 @@ class ArtistView(QScrollArea):
         self.status = QLabel()
         self.status.setObjectName("homeStatus")
         self.status.setWordWrap(True)
-        self.retry_btn = PillButton("Reintentar", "quiet", glyph="sync")
+        self.retry_btn = PillButton(tr("Reintentar"), "quiet", glyph="sync")
         self.retry_btn.clicked.connect(self.retry)
         status.addWidget(self.status, 1)
         status.addWidget(self.retry_btn)
@@ -224,16 +225,16 @@ class ArtistView(QScrollArea):
         self.songs = TrackColumns(loader)
         self.songs.play.connect(lambda i: self._play("top_songs", i))
         self.songs.menu.connect(self.track_menu)
-        self.songs_section = Section("Canciones populares", self._indented(self.songs))
-        self.songs_section.action.set_label("Todas las canciones", "queue")
-        self.songs_section.action.setToolTip("Abrir la lista con todas sus canciones")
+        self.songs_section = Section(tr("Canciones populares"), self._indented(self.songs))
+        self.songs_section.action.set_label(tr("Todas las canciones"), "queue")
+        self.songs_section.action.setToolTip(tr("Abrir la lista con todas sus canciones"))
         self.songs_section.action.clicked.connect(self.open_all_songs)
         lay.addWidget(self.songs_section)
 
         # -- discografía y listas -------------------------------------------
-        self.albums = CardSection("Álbumes", loader)
-        self.singles = CardSection("Sencillos y EP", loader)
-        self.playlists = CardSection("Listas", loader)
+        self.albums = CardSection(tr("Álbumes"), loader)
+        self.singles = CardSection(tr("Sencillos y EP"), loader)
+        self.playlists = CardSection(tr("Listas"), loader)
         for section in (self.albums, self.singles, self.playlists):
             section.opened.connect(self._emit_open)
             section.play_requested.connect(self._emit_play)
@@ -243,9 +244,9 @@ class ArtistView(QScrollArea):
         self.similar = TrackColumns(loader)
         self.similar.play.connect(lambda i: self._play("similar", i))
         self.similar.menu.connect(self.track_menu)
-        self.similar_section = Section("Música parecida", self._indented(self.similar))
+        self.similar_section = Section(tr("Música parecida"), self._indented(self.similar))
         lay.addWidget(self.similar_section)
-        self.related = CardSection("Artistas parecidos", loader, round_art=True)
+        self.related = CardSection(tr("Artistas parecidos"), loader, round_art=True)
         self.related.opened.connect(self._emit_artist)
         lay.addWidget(self.related)
 
@@ -268,7 +269,7 @@ class ArtistView(QScrollArea):
         self.stats.setColumnStretch(1, 1)
         self._stat_labels: list[tuple[QLabel, QLabel]] = []
         about_lay.addLayout(self.stats)
-        self.about_section = Section("Sobre el artista", about)
+        self.about_section = Section(tr("Sobre el artista"), about)
         lay.addWidget(self.about_section)
         lay.addStretch(1)
         self.setWidget(page)
@@ -298,10 +299,10 @@ class ArtistView(QScrollArea):
         self.verticalScrollBar().setValue(0)
 
     def set_loading(self) -> None:
-        self._only_status("Cargando el artista…", retry=False)
+        self._only_status(tr("Cargando el artista…"), retry=False)
 
     def set_error(self, text: str = "") -> None:
-        self._only_status(text or "No se pudo cargar el artista. Comprueba la conexión.", retry=True)
+        self._only_status(text or tr("No se pudo cargar el artista. Comprueba la conexión."), retry=True)
 
     def page(self) -> Optional[ArtistPage]:
         return self._page
@@ -328,25 +329,25 @@ class ArtistView(QScrollArea):
         self.singles.set_cards(cards(page.singles), reveal_from=180)
         self.singles.setVisible(bool(page.singles))
         self.playlists.set_cards(cards(page.playlists), reveal_from=270)
-        self.playlists.set_note(f"Del artista y de la comunidad, con «{page.name}» en el título")
+        self.playlists.set_note(tr("Del artista y de la comunidad, con «{name}» en el título", name=page.name))
         self.playlists.setVisible(bool(page.playlists))
 
         self.similar.set_tracks(page.similar)
         self.similar.reveal(330)
-        self.similar_section.set_note(f"Lo que suena en la radio de {page.name}, sin sus canciones")
+        self.similar_section.set_note(tr("Lo que suena en la radio de {name}, sin sus canciones", name=page.name))
         self.similar_section.setVisible(bool(page.similar))
         self.related.set_cards([(a.name, a.note, sized_url(a.thumb_url, 400), a) for a in page.related],
                                reveal_from=390)
         self.related.setVisible(bool(page.related))
 
-        self.about_section.title.setText(f"Sobre {page.name}")
+        self.about_section.title.setText(tr("Sobre {name}", name=page.name))
         self.bio.setText(page.bio)
         self.bio.setVisible(bool(page.bio))
         self._fill_stats(page.stats)
         self.about_section.setVisible(bool(page.bio or page.stats))
 
         if not any(s.isVisibleTo(self.widget()) for s in self._sections):
-            self.status.setText("YouTube Music no tiene más información sobre este artista.")
+            self.status.setText(tr("YouTube Music no tiene más información sobre este artista."))
             self.retry_btn.hide()
             self.status_box.show()
         if not same:
@@ -370,7 +371,7 @@ class ArtistView(QScrollArea):
             label.setVisible(shown)
             value.setVisible(shown)
             if shown:
-                label.setText(stats[i][0])
+                label.setText(tr(stats[i][0]))     # guardadas en español
                 value.setText(stats[i][1])
 
     # -- señales ------------------------------------------------------------

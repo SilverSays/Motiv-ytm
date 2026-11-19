@@ -45,10 +45,21 @@ interface, with each playlist's color pulled from its cover art. The app's inter
 - **Light and dark themes**: the "Plata" look also comes in a night version. By
   default it follows Windows (light or dark apps) and switches on the fly when you
   change it, without stopping the music.
+- **Spanish or English**: the interface follows the Windows display language
+  (Spanish if Windows is in Spanish, English otherwise) or the one you pick in
+  **Options → General → Language**. The change applies when the app reopens; the
+  **Restart now** button does it for you.
+- **Options window** (**⋯** menu → **Options…**, or `Ctrl+,`): every preference in
+  one place, grouped by topic (General, Playback, Account, Integrations,
+  Maintenance). Each one shows what it does right under its name, toggles are real
+  switches that a screen reader announces with their state, and everything works
+  from the keyboard (arrows to change topic, `Tab` to go through its options,
+  `Ctrl+Tab` for the next topic). The **⋯** menu keeps only everyday actions:
+  sync, new playlist, music folder, sleep timer and view toggles.
 - **Playback**: queue, shuffle, repeat, radio from a song or an artist, and
   preloading of the next tracks so there's no waiting. When you open the app,
   the queue and the song come back at the second you left them, stopped (this can
-  be turned off in the **⋯** menu).
+  be turned off in **Options**).
 - **Loudness equalization (volume normalization)**: optional audio normalization
   using `mpv`'s `loudnorm` (EBU R128) or `dynaudnorm` filters, switchable on the fly
   without interrupting playback.
@@ -160,8 +171,8 @@ main one.
 
 ### Sign in with Firefox (recommended)
 
-From the **⋯** menu (at the bottom of the sidebar) → **Iniciar sesión con Firefox**
-(Sign in with Firefox), or the **Iniciar sesión** button of the notice at the top:
+From **Options → Account → Sign in with Firefox** (the **⋯** menu at the bottom of
+the sidebar → **Options…**), or the **Sign in** button of the notice at the top:
 
 1. Click **Abrir Firefox**. A separate, empty Firefox window opens (its own
    temporary profile: it doesn't see your usual tabs, accounts or extensions).
@@ -179,7 +190,7 @@ stops working within a few hours.
 
 ### Manual setup (advanced)
 
-From **⋯** → **Cuenta y reproducción** (Account and playback):
+From **Options → Account → Credentials and playback mode**:
 
 1. Open a **Firefox private window** and sign in to
    [music.youtube.com](https://music.youtube.com) with that account. Use Firefox:
@@ -210,32 +221,31 @@ copied to another computer or Windows user, the app just asks you to sign in aga
 
 ### Discord and Last.fm (optional)
 
-Both are off by default and live in the **⋯** menu → **Discord y Last.fm**.
+Both are off by default and live in **Options → Integrations**.
 
 - **Discord**: Discord needs the ID of an application registered at
   [discord.com/developers/applications](https://discord.com/developers/applications)
   (its name is what appears after "Listening to"). The first time you turn the
   option on, the app asks for that *Application ID*. Only the song title,
   artist, album, cover art and times are shared.
-- **Last.fm**: choose **Conectar con Last.fm…**. If the app doesn't come with
+- **Last.fm**: choose **Connect…** next to **Last.fm account**. If the app doesn't come with
   its own Last.fm API key, it asks for one (create it for free at
   [last.fm/api/account/create](https://www.last.fm/api/account/create)); then it
   opens Last.fm in your browser so you can allow access. The key, the secret and
   the session are stored encrypted with Windows DPAPI in
   `%LOCALAPPDATA%\YTMusicNativo\credenciales\lastfm.bin`.
 
-### Account changes, music folder and theme
+### Account changes, music folder, theme and language
 
-All three live in the **⋯** menu:
-
-- **Cambios en tu cuenta de YouTube Music**: turn on **Permitir cambios en mi
-  cuenta** to get the heart in the player bar and the like/library options in a
+- **Options → Account → Changes to your YouTube Music account**: turn on **Allow
+  changes to my YouTube Music account** to get the heart in the player bar and the like/library options in a
   song's right-click menu. Removing something asks for confirmation, and changes are
-  sent one at a time with short pauses. **Registrar mis escuchas en el historial de
-  YouTube** is a separate option on top of it.
-- **Música de tu equipo**: choose the folder; only new or changed files are read
-  again when the app opens.
-- **Tema**: *Como Windows*, *Claro* or *Oscuro*.
+  sent one at a time with short pauses. **Record my plays in my YouTube history**
+  is a separate option on top of it.
+- **⋯ menu → Music on this computer**: choose the folder; only new or changed files
+  are read again when the app opens.
+- **Options → General**: **Theme** (*Same as Windows*, *Light* or *Dark*) and
+  **Language** (*Same as Windows*, *Español* or *English*).
 
 ### Where everything is stored
 

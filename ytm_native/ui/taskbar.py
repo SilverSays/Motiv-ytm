@@ -25,6 +25,7 @@ from PySide6.QtWidgets import QWidget
 
 from . import theme
 from .components import glyph_pixmap
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.taskbar")
 
@@ -243,11 +244,11 @@ class ThumbBar(QObject):
     # -- interno --------------------------------------------------------------
     def _spec(self) -> list[tuple[int, int, str, int]]:
         flags = THBF_ENABLED if self._enabled else THBF_DISABLED
-        toggle = ("pause", "Pausar") if self._playing else ("play", "Reproducir")
+        toggle = ("pause", tr("Pausar")) if self._playing else ("play", tr("Reproducir"))
         return [
-            (PREV_ID, self._icon("previous"), "Anterior", flags),
+            (PREV_ID, self._icon("previous"), tr("Anterior"), flags),
             (TOGGLE_ID, self._icon(toggle[0]), toggle[1], flags),
-            (NEXT_ID, self._icon("next"), "Siguiente", flags),
+            (NEXT_ID, self._icon("next"), tr("Siguiente"), flags),
         ]
 
     def _icon(self, glyph: str) -> int:

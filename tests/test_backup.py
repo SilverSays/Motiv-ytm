@@ -211,7 +211,7 @@ def test_exportar_e_importar_desde_el_menu(window, db, tmp_path, monkeypatch):
     db.set_setting("autoplay_radio", "1")
     path = tmp_path / "desde-menu.json"
     monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(path), "")))
-    window._export_backup()
+    window.export_backup()
     assert wait_until(lambda: any("Copia guardada" in t.text for t in window.toasts._toasts), 5000)
     assert path.is_file()
 
@@ -222,7 +222,7 @@ def test_exportar_e_importar_desde_el_menu(window, db, tmp_path, monkeypatch):
     monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(path), "")))
     asked = []
     monkeypatch.setattr(window, "_ask_backup_strategy", lambda data: asked.append(data.summary()) or REPLACE)
-    window._import_backup()
+    window.import_backup()
     assert wait_until(lambda: any("Copia importada" in t.text for t in window.toasts._toasts), 5000)
     assert asked and "1 lista" in asked[0]
     assert db.get_playlist(pid).title == "Mía"
@@ -238,7 +238,7 @@ def test_importar_una_copia_rota_avisa_sin_preguntar(window, tmp_path, monkeypat
     path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(path), "")))
     monkeypatch.setattr(window, "_ask_backup_strategy", lambda data: pytest.fail("no debía preguntar"))
-    window._import_backup()
+    window.import_backup()
     assert wait_until(lambda: any("no es una copia" in t.text for t in window.toasts._toasts), 5000)
 
 
@@ -247,6 +247,6 @@ def test_cancelar_los_dialogos_no_hace_nada(window, monkeypatch):
 
     monkeypatch.setattr(mw.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", "")))
     monkeypatch.setattr(mw.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: ("", "")))
-    window._export_backup()
-    window._import_backup()
+    window.export_backup()
+    window.import_backup()
     assert window.toasts._toasts == []

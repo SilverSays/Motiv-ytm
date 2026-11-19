@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ytm_native.core import paths
+from ytm_native.core.i18n import tr
 
 Progress = Callable[[str], None]
 
@@ -56,7 +57,7 @@ def _download(url: str, dest: Path, progress: Progress, label: str, attempts: in
         except OSError as exc:
             if attempt == attempts:
                 raise
-            progress(f"La descarga de {label} se cortó ({exc}); reintento {attempt + 1} de {attempts}…")
+            progress(tr("La descarga de {label} se cortó ({exc}); reintento {value} de {attempts}…", label=label, exc=exc, value=attempt + 1, attempts=attempts))
             time.sleep(RETRY_DELAY_S * attempt)
 
 
@@ -80,15 +81,15 @@ def _download_once(url: str, dest: Path, progress: Progress, label: str) -> None
                     pct = done * 100 // total
                     if pct >= last_pct + 10:
                         last_pct = pct
-                        progress(f"Descargando {label}… {pct} %")
+                        progress(tr("Descargando {label}… {pct} %", label=label, pct=pct))
         # Si el servidor corta antes de tiempo, ``read`` devuelve vacío como
         # al final: solo la longitud anunciada distingue un archivo truncado.
         if total and done != total:
-            raise OSError(f"Descarga incompleta: {done} de {total} bytes")
+            raise OSError(tr("Descarga incompleta: {done} de {total} bytes", done=done, total=total))
         os.replace(tmp, dest)
     except http.client.HTTPException as exc:
         # IncompleteRead y compañía no son OSError: así también se reintentan.
-        raise OSError(f"Descarga interrumpida: {exc!r}") from exc
+        raise OSError(tr("Descarga interrumpida: {exc!r}", exc=exc)) from exc
     finally:
         _remove(tmp)
 
@@ -105,7 +106,7 @@ def _replace_checked(tmp: Path, dest: Path, expected_size: int) -> None:
     ejecutable final nunca queda a medio escribir."""
     size = tmp.stat().st_size
     if size != expected_size or size == 0:
-        raise BootstrapError(f"{dest.name}: se extrajeron {size} bytes de {expected_size}.")
+        raise BootstrapError(tr("{name}: se extrajeron {size} bytes de {expected_size}.", name=dest.name, size=size, expected_size=expected_size))
     os.replace(tmp, dest)
 
 
@@ -128,7 +129,7 @@ def _sha256(path: Path) -> str:
 def _verify(path: Path, sums_text: Optional[str], filename: str, progress: Progress) -> None:
     """Verifica el SHA-256 si el proyecto publica la suma; si no, lo avisa."""
     if not sums_text:
-        progress(f"Aviso: no se pudo obtener la suma SHA-256 de {filename}.")
+        progress(tr("Aviso: no se pudo obtener la suma SHA-256 de {filename}.", filename=filename))
         return
     hex64 = re.compile(r"\b([0-9a-fA-F]{64})\b")
     expected = None
@@ -143,12 +144,12 @@ def _verify(path: Path, sums_text: Optional[str], filename: str, progress: Progr
         if len(every) == 1:
             expected = every[0].lower()
     if expected is None:
-        progress(f"Aviso: la suma SHA-256 de {filename} no está en el listado.")
+        progress(tr("Aviso: la suma SHA-256 de {filename} no está en el listado.", filename=filename))
         return
     if _sha256(path) != expected:
         path.unlink(missing_ok=True)
-        raise BootstrapError(f"La suma SHA-256 de {filename} no coincide; descarga descartada.")
-    progress(f"{filename}: suma SHA-256 verificada.")
+        raise BootstrapError(tr("La suma SHA-256 de {filename} no coincide; descarga descartada.", filename=filename))
+    progress(tr("{filename}: suma SHA-256 verificada.", filename=filename))
 
 
 def install_ytdlp(progress: Progress) -> None:
@@ -176,11 +177,11 @@ def install_deno(progress: Progress) -> None:
             with zipfile.ZipFile(archive) as zf:
                 member = next((i for i in zf.infolist() if i.filename.lower().endswith("deno.exe")), None)
                 if member is None:
-                    raise BootstrapError("El zip de deno no contiene deno.exe.")
+                    raise BootstrapError(tr("El zip de deno no contiene deno.exe."))
                 with zf.open(member) as src, open(tmp, "wb") as dst:
                     shutil.copyfileobj(src, dst)
         except zipfile.BadZipFile as exc:
-            raise BootstrapError(f"El zip de deno está dañado: {exc}") from exc
+            raise BootstrapError(tr("El zip de deno está dañado: {exc}", exc=exc)) from exc
         _replace_checked(tmp, dest, member.file_size)
     finally:
         _remove(tmp)
@@ -190,11 +191,11 @@ def install_deno(progress: Progress) -> None:
 def install_mpv(progress: Progress) -> None:
     text = _fetch_text(MPV_RELEASE_API)
     if not text:
-        raise BootstrapError("No se pudo consultar la última versión de mpv.")
+        raise BootstrapError(tr("No se pudo consultar la última versión de mpv."))
     assets = json.loads(text).get("assets") or []
     asset = next((a for a in assets if _MPV_ASSET_RE.match(a.get("name", ""))), None)
     if asset is None:
-        raise BootstrapError("No se encontró el paquete mpv-x86_64 en la última versión publicada.")
+        raise BootstrapError(tr("No se encontró el paquete mpv-x86_64 en la última versión publicada."))
     work = paths.app_home() / "descargas"
     archive = work / asset["name"]
     out = work / "mpv_extraido"
@@ -207,24 +208,24 @@ def install_mpv(progress: Progress) -> None:
         digest = str(asset.get("digest") or "")
         if digest.startswith("sha256:"):
             if _sha256(archive) != digest.split(":", 1)[1].lower():
-                raise BootstrapError("La suma SHA-256 de mpv no coincide; descarga descartada.")
-            progress("mpv: suma SHA-256 verificada.")
+                raise BootstrapError(tr("La suma SHA-256 de mpv no coincide; descarga descartada."))
+            progress(tr("mpv: suma SHA-256 verificada."))
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
-        progress("Extrayendo mpv…")
+        progress(tr("Extrayendo mpv…"))
         try:
             proc = subprocess.run(
                 ["tar", "-xf", str(archive), "-C", str(out)],
                 capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise BootstrapError(f"No se pudo ejecutar tar para extraer mpv: {exc}") from exc
+            raise BootstrapError(tr("No se pudo ejecutar tar para extraer mpv: {exc}", exc=exc)) from exc
         found = next(iter(out.rglob("mpv.exe")), None)
         if proc.returncode != 0 or found is None:
             keep_archive = True       # el mensaje pide extraerlo a mano
             raise BootstrapError(
-                "No se pudo extraer el .7z de mpv con tar. Extrae a mano "
-                f"{archive} y copia mpv.exe a {paths.bin_dir()}. Detalle: {proc.stderr.strip()[:200]}"
+                tr("No se pudo extraer el .7z de mpv con tar. Extrae a mano {archive} y copia mpv.exe a "
+                   "{bin_dir}. Detalle: {value}", archive=archive, bin_dir=paths.bin_dir(), value=proc.stderr.strip()[:200])
             )
         shutil.copy2(found, tmp)
         _replace_checked(tmp, dest, found.stat().st_size)
@@ -246,14 +247,14 @@ def install_all(progress: Progress = print, force: bool = False) -> list[str]:
     )
     for target, installer in steps:
         if target.is_file() and not force:
-            progress(f"{target.name}: ya está instalado.")
+            progress(tr("{name}: ya está instalado.", name=target.name))
             continue
         try:
             installer(progress)
-            progress(f"{target.name}: instalado en {target.parent}.")
+            progress(tr("{name}: instalado en {parent}.", name=target.name, parent=target.parent))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{target.name}: {exc}")
-            progress(f"ERROR con {target.name}: {exc}")
+            progress(tr("ERROR con {name}: {exc}", name=target.name, exc=exc))
     shutil.rmtree(paths.app_home() / "descargas", ignore_errors=True)
     return errors
 

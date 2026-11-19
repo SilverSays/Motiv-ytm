@@ -41,6 +41,7 @@ from ytm_native.core.errors import ErrorKind
 from ytm_native.playback.extractor import ExtractorManager, ResolveResult
 from ytm_native.services import local_media
 from ytm_native.services.sync import radio_tracks
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.player")
 
@@ -311,13 +312,13 @@ class PlaybackController(QObject):
             return  # el usuario ya puso otra cosa
         advance, self._radio_pending = self._radio_pending, False
         if error is not None:
-            self.notice.emit(f"No se pudo cargar la radio: {error}")
+            self.notice.emit(tr("No se pudo cargar la radio: {error}", error=error))
             return
         known = {t.video_id for t in self._queue}
         fresh = [t for t in tracks if t.video_id not in known]
         if not fresh:
             if advance:
-                self.notice.emit("La radio no devolvió pistas nuevas.")
+                self.notice.emit(tr("La radio no devolvió pistas nuevas."))
             return
         for track in fresh:
             self.db.upsert_track(track)
@@ -540,12 +541,12 @@ class PlaybackController(QObject):
         if not path:
             self._handle_failure(ResolveResult(
                 video_id=track.video_id, kind=ErrorKind.UNAVAILABLE,
-                message="El archivo ya no está en el disco.",
+                message=tr("El archivo ya no está en el disco."),
             ))
             return
         now = time.time()
         self._play_result(ResolveResult(
-            video_id=track.video_id, url=local_media.file_uri(path), format_desc="archivo local",
+            video_id=track.video_id, url=local_media.file_uri(path), format_desc=tr("archivo local"),
             duration_s=float(track.duration_s) if track.duration_s else None,
             resolved_at=now, expire_ts=now + 365 * 86400, ready=True,
         ))
@@ -696,8 +697,8 @@ class PlaybackController(QObject):
         if self.db.resolves_since(time.time() - 86400) > config.DAILY_RESOLVE_SOFT_CAP:
             self._soft_cap_warned = True
             self.notice.emit(
-                f"Más de {config.DAILY_RESOLVE_SOFT_CAP} resoluciones en 24 h: "
-                "considera bajar el ritmo para no exponer la cuenta."
+                tr("Más de {DAILY_RESOLVE_SOFT_CAP} resoluciones en 24 h: considera bajar el ritmo para no "
+                   "exponer la cuenta.", DAILY_RESOLVE_SOFT_CAP=config.DAILY_RESOLVE_SOFT_CAP)
             )
 
     # -- fallos de resolución ----------------------------------------------
@@ -714,7 +715,7 @@ class PlaybackController(QObject):
             return
         if kind is ErrorKind.NETWORK:
             self._set_state(STOPPED)
-            self.notice.emit("Sin conexión. La cola quedó en pausa.")
+            self.notice.emit(tr("Sin conexión. La cola quedó en pausa."))
             return
         if kind in (ErrorKind.RUNTIME_MISSING, ErrorKind.BINARY_MISSING):
             self._set_state(STOPPED)
@@ -732,9 +733,9 @@ class PlaybackController(QObject):
                 self.db.mark_unavailable(res.video_id, res.message)
                 self._streak_marked.append(res.video_id)
             self.track_flagged.emit(res.video_id)
-            self.notice.emit(f"No disponible: {title}")
+            self.notice.emit(tr("No disponible: {title}", title=title))
         else:
-            self.notice.emit(f"No se pudo reproducir «{title}»: {res.message}")
+            self.notice.emit(tr("No se pudo reproducir «{title}»: {message}", title=title, message=res.message))
         self._advance_auto()
 
     def _reset_failures(self) -> None:
@@ -762,7 +763,7 @@ class PlaybackController(QObject):
         self._entry_id = None
         self._set_state(STOPPED)
         self.notice.emit(
-            "Varias pistas seguidas fallaron: puede ser un bloqueo temporal. La cola quedó en pausa."
+            tr("Varias pistas seguidas fallaron: puede ser un bloqueo temporal. La cola quedó en pausa.")
         )
         return True
 
@@ -803,7 +804,7 @@ class PlaybackController(QObject):
             return  # respuesta a una carga que ya no interesa
         if not accepted:
             self._awaiting_start = False
-            self._recover_stream("mpv rechazó la orden de carga")
+            self._recover_stream(tr("mpv rechazó la orden de carga"))
             return
         self._load_acked = True
         self._expected_entry = entry_id or None
@@ -865,7 +866,7 @@ class PlaybackController(QObject):
             self._load_retry.start(delay)
             return
         if reason == "error" or premature:
-            self._recover_stream(file_error or ("fin prematuro" if premature else "error"))
+            self._recover_stream(file_error or (tr("fin prematuro") if premature else "error"))
         else:
             if self._loaded_ok:
                 # Sonó entera aunque durase menos que HEALTHY_PLAY_S (una intro,
@@ -879,7 +880,7 @@ class PlaybackController(QObject):
         if track is None:
             return
         if self._reresolves >= config.MAX_RERESOLVE_PER_TRACK:
-            self.notice.emit(f"No se pudo reproducir «{track.title}» ({detail}).")
+            self.notice.emit(tr("No se pudo reproducir «{title}» ({detail}).", title=track.title, detail=detail))
             if self._count_failure():
                 return
             self._advance_auto()

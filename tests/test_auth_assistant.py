@@ -344,9 +344,14 @@ def test_sin_credenciales_el_aviso_ofrece_iniciar_sesion_con_firefox(window, mon
     monkeypatch.setattr(mw.bootstrap, "missing_binaries", lambda: [])    # el aviso de binarios va antes
     window._refresh_banner()
     assert window.banner_button.text() == "Iniciar sesión"
-    assert window._banner_action == window._open_firefox_login
-    texts = [action.text() for action in window.app_menu.actions()]
-    assert "Iniciar sesión con Firefox…" in texts
+    assert window._banner_action == window.open_firefox_login
+    # También a mano: Opciones > Cuenta.
+    from ytm_native.ui.settings import OptionsDialog, Row
+
+    dialog = OptionsDialog(window, "account")
+    titles = [row.title.text() for row in dialog.pages["account"].findChildren(Row)]
+    assert "Iniciar sesión con Firefox" in titles
+    dialog.deleteLater()
 
 
 def test_el_validador_real_no_se_usa_en_las_pruebas():

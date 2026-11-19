@@ -33,6 +33,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from ytm_native.core import config, crypto, paths
 from ytm_native.core.db import Database, Track
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.lastfm")
 
@@ -93,13 +94,13 @@ def _requests_http(method: str, params: dict, timeout: float) -> dict:
         else:
             resp = requests.get(config.LASTFM_API_URL, params=params, timeout=timeout, headers=headers)
     except requests.RequestException as exc:
-        raise LastfmError(f"sin conexión con Last.fm ({type(exc).__name__})", network=True) from exc
+        raise LastfmError(tr("sin conexión con Last.fm ({name__})", name__=type(exc).__name__), network=True) from exc
     try:
         data = resp.json()
     except ValueError:
         data = None
     if not isinstance(data, dict):
-        raise LastfmError(f"respuesta inesperada de Last.fm (HTTP {resp.status_code})",
+        raise LastfmError(tr("respuesta inesperada de Last.fm (HTTP {status_code})", status_code=resp.status_code),
                           network=resp.status_code >= 500)
     return data
 
@@ -166,13 +167,13 @@ class LastfmClient:
     def _call(self, method: str, params: Optional[dict] = None, post: bool = False,
               with_session: bool = False) -> dict:
         if not self.api_key or not self.api_secret:
-            raise LastfmError("faltan la clave y el secreto de la aplicación de Last.fm", code=10)
+            raise LastfmError(tr("faltan la clave y el secreto de la aplicación de Last.fm"), code=10)
         query = {key: str(value) for key, value in (params or {}).items() if value not in (None, "")}
         query["method"] = method
         query["api_key"] = self.api_key
         if with_session:
             if not self.session_key:
-                raise LastfmError("no hay sesión de Last.fm", code=9)
+                raise LastfmError(tr("no hay sesión de Last.fm"), code=9)
             query["sk"] = self.session_key
         query["api_sig"] = sign(query, self.api_secret)
         query["format"] = "json"
@@ -182,13 +183,13 @@ class LastfmClient:
                 code = int(data.get("error") or 0)
             except (TypeError, ValueError):
                 code = 0
-            raise LastfmError(str(data.get("message") or f"error {code} de Last.fm"), code=code)
+            raise LastfmError(str(data.get("message") or tr("error {code} de Last.fm", code=code)), code=code)
         return data
 
     def get_token(self) -> str:
         token = self._call("auth.getToken").get("token")
         if not isinstance(token, str) or not token:
-            raise LastfmError("Last.fm no devolvió un token")
+            raise LastfmError(tr("Last.fm no devolvió un token"))
         return token
 
     def auth_url(self, token: str) -> str:
@@ -199,7 +200,7 @@ class LastfmClient:
         session = self._call("auth.getSession", {"token": token}).get("session") or {}
         name, key = session.get("name"), session.get("key")
         if not isinstance(key, str) or not key:
-            raise LastfmError("Last.fm no devolvió la sesión")
+            raise LastfmError(tr("Last.fm no devolvió la sesión"))
         return (name if isinstance(name, str) else ""), key
 
     def update_now_playing(self, entry: Scrobble) -> None:
@@ -489,7 +490,7 @@ class LastfmScrobbler(QObject):
         el envío. ``done(usuario, error)``."""
         token, self._token = self._token, ""
         if not token:
-            done(None, LastfmError("no hay ninguna autorización pendiente", code=14))
+            done(None, LastfmError(tr("no hay ninguna autorización pendiente"), code=14))
             return
         client = self._client()
 
@@ -533,8 +534,8 @@ class LastfmScrobbler(QObject):
         except (OSError, crypto.CryptoError):
             log.warning("no se pudo actualizar la sesión de Last.fm guardada")
         self.changed.emit()
-        self.session_lost.emit("Last.fm ya no acepta la sesión: vuelve a conectar la cuenta. "
-                               "Tus escuchas esperan en la cola.")
+        self.session_lost.emit(tr("Last.fm ya no acepta la sesión: vuelve a conectar la cuenta. "
+                               "Tus escuchas esperan en la cola."))
 
     # -- escuchas -----------------------------------------------------------
     def now_playing(self, track: Track, duration: float = 0.0) -> None:
@@ -600,7 +601,7 @@ class LastfmScrobbler(QObject):
         if kind == APP:
             self._halted = True
             log.warning("Last.fm rechazó la clave de la aplicación: %s", error)
-            self.halted.emit("Last.fm rechazó la clave de la aplicación: revisa la clave y el secreto.")
+            self.halted.emit(tr("Last.fm rechazó la clave de la aplicación: revisa la clave y el secreto."))
             return
         delays = config.LASTFM_RETRY_DELAYS_S
         delay = delays[min(self._retry_step, len(delays) - 1)]

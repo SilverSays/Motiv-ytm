@@ -26,6 +26,7 @@ from PySide6.QtCore import QObject, Signal
 from ytm_native import __version__
 from ytm_native.core import config
 from ytm_native.core.db import Database
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.updater")
 
@@ -108,7 +109,7 @@ def check(db: Database, fetch: Optional[Fetch] = None, now: Optional[float] = No
         _remember(db, now, "", "")
         return None
     if status != 200 or not isinstance(data, dict):
-        raise OSError(f"GitHub respondió {status} al preguntar por versiones nuevas")
+        raise OSError(tr("GitHub respondió {status} al preguntar por versiones nuevas", status=status))
     tag = data.get("tag_name")
     if not isinstance(tag, str) or data.get("draft") or data.get("prerelease"):
         _remember(db, now, "", "")
@@ -183,7 +184,7 @@ class AppUpdateChecker(QObject):
         if error is not None:
             log.info("no se pudo comprobar si hay versión nueva: %s", error)
             if manual:
-                self.failed.emit("No se pudo comprobar si hay una versión nueva.")
+                self.failed.emit(tr("No se pudo comprobar si hay una versión nueva."))
             return
         if release is not None:
             self.release = release

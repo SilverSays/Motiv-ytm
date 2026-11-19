@@ -73,6 +73,7 @@ from .motion import (
     mix,
     reduced_motion,
 )
+from ytm_native.core.i18n import tr
 
 def glyph_pixmap(name: str, size: int, color: str, dpr: float = 1.0) -> QPixmap:
     """Icono de la fuente de símbolos como imagen (para la barra lateral)."""
@@ -534,8 +535,8 @@ class PlayButton(_Pressable):
         self._spin.setInterval(16)
         self._spin.timeout.connect(self.update)
         self.setFixedSize(self.SIZE, self.SIZE)
-        self.setToolTip("Reproducir o pausar (Espacio)")
-        self.setAccessibleName("Reproducir o pausar")
+        self.setToolTip(tr("Reproducir o pausar (Espacio)"))
+        self.setAccessibleName(tr("Reproducir o pausar"))
 
     def set_playing(self, playing: bool) -> None:
         if playing != self._playing:
@@ -1057,8 +1058,63 @@ class ActiveMark(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(theme.ORO))
+        painter.setBrush(QColor(theme.MARCA))
         painter.drawRoundedRect(QRectF(self.rect()), self.W / 2, self.W / 2)
+
+
+class ListFocusRing(QWidget):
+    """Anillo de foco sobre la fila actual de una lista lateral, solo cuando
+    se llega con el teclado (como el resto de anillos de la app, ver
+    ``focus``). Sin él, al tabular hasta la barra lateral no se veía dónde
+    estaba el foco: la fila elegida pinta igual con foco que sin él.
+
+    Va encima del área de la lista, sin recibir el ratón."""
+
+    PEN = 2.0
+
+    def __init__(self, view: QListWidget):
+        super().__init__(view.viewport())
+        self._view = view
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.resize(view.viewport().size())
+        view.viewport().installEventFilter(self)
+        view.installEventFilter(self)
+        view.currentRowChanged.connect(lambda _row: self.update())
+        view.verticalScrollBar().valueChanged.connect(lambda _value: self._pin())
+        self.show()
+
+    def _pin(self) -> None:
+        # Al desplazarse, la lista mueve con su contenido a los hijos de su
+        # área: el anillo se queda cubriéndola entera.
+        self.move(0, 0)
+        self.update()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        kind = event.type()
+        if watched is self._view.viewport() and kind == QEvent.Type.Resize:
+            self.resize(event.size())
+        elif kind in (QEvent.Type.FocusIn, QEvent.Type.FocusOut, QEvent.Type.KeyPress):
+            self.update()
+        return False
+
+    def shown(self) -> bool:
+        view = self._view
+        item = view.currentItem()
+        return (view.hasFocus() and focus.keyboard() and item is not None
+                and bool(item.flags() & Qt.ItemFlag.ItemIsSelectable))
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        if not self.shown():
+            return
+        rect = QRectF(self._view.visualItemRect(self._view.currentItem()))
+        inset = self.PEN / 2 + 1
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(theme.PAPEL), self.PEN))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(inset, inset, -inset, -inset), theme.R_CONTROL, theme.R_CONTROL)
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -1124,8 +1180,8 @@ class PlaylistBand(QWidget):
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("bandSearch")
-        self.search_edit.setPlaceholderText("Canción, artista o álbum")
-        self.search_edit.setAccessibleName("Buscar música")
+        self.search_edit.setPlaceholderText(tr("Canción, artista o álbum"))
+        self.search_edit.setAccessibleName(tr("Buscar música"))
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMaximumWidth(520)
         self.search_edit.setMinimumHeight(42)
@@ -1150,10 +1206,10 @@ class PlaylistBand(QWidget):
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
-        self.play_btn = PillButton("Reproducir", "primary", glyph="play")
-        self.shuffle_btn = PillButton("Aleatorio", "ghost", glyph="shuffle")
-        self.sync_btn = PillButton("Sincronizar lista", "ghost", glyph="sync")
-        self.sync_btn.setToolTip("Descarga esta lista completa aunque el conteo no haya cambiado")
+        self.play_btn = PillButton(tr("Reproducir"), "primary", glyph="play")
+        self.shuffle_btn = PillButton(tr("Aleatorio"), "ghost", glyph="shuffle")
+        self.sync_btn = PillButton(tr("Sincronizar lista"), "ghost", glyph="sync")
+        self.sync_btn.setToolTip(tr("Descarga esta lista completa aunque el conteo no haya cambiado"))
         # Botón de la vista: "Opciones" en una lista local, "Guardar como lista
         # local" en una ajena. La ventana decide texto y qué hace.
         self.extra_btn = PillButton("", "ghost")
@@ -1171,8 +1227,8 @@ class PlaylistBand(QWidget):
         actions.addStretch(1)
         # Solo en las listas ajenas a la biblioteca: no tienen fila en la barra
         # lateral, así que el camino de vuelta tiene que estar a la vista.
-        self.back_btn = PillButton("Volver", "ghost", glyph="back")
-        self.back_btn.setToolTip("Volver a la vista anterior (Alt+Izquierda)")
+        self.back_btn = PillButton(tr("Volver"), "ghost", glyph="back")
+        self.back_btn.setToolTip(tr("Volver a la vista anterior (Alt+Izquierda)"))
         self.back_btn.hide()
         actions.addWidget(self.back_btn)
         text.addLayout(actions)
@@ -1690,7 +1746,7 @@ class SuggestionStrip(QWidget):
             self._chips.append(chip)
         self._count = len(texts)
         self._lead = lead if texts else ""
-        self.setAccessibleName(lead or "Sugerencias de búsqueda")
+        self.setAccessibleName(lead or tr("Sugerencias de búsqueda"))
         for chip, text in zip(self._chips, texts):
             chip.set_suggestion(text, typed, glyph, strong)
         self._fit()
@@ -2150,7 +2206,7 @@ class SidebarFooter(QWidget):
         lay.setContentsMargins(16, 6, 6, 6)
         lay.setSpacing(4)
         self.status = ElidedLabel(theme.ui_font(12), theme.HUMO)
-        self.menu_btn = IconButton("more", "Menú de la aplicación", size=36, glyph_px=16, quiet=True)
+        self.menu_btn = IconButton("more", tr("Menú de la aplicación"), size=36, glyph_px=16, quiet=True)
         # Versión nueva de la app: un enlace discreto que abre su página en el
         # navegador (no descarga ni instala nada). Oculto mientras no haya.
         self.update_btn = PillButton("", "quiet", glyph="window")
@@ -2180,8 +2236,8 @@ class SidebarFooter(QWidget):
         """Enseña (o quita, con ``""``) el enlace a la versión nueva."""
         if version:
             self.update_btn.set_label(version, "window")
-            self.update_btn.setToolTip(f"Versión {version} disponible: abre su página en el navegador")
-            self.update_btn.setAccessibleName(f"Versión {version} disponible")
+            self.update_btn.setToolTip(tr("Versión {version} disponible: abre su página en el navegador", version=version))
+            self.update_btn.setAccessibleName(tr("Versión {version} disponible", version=version))
         else:
             self.update_btn.set_label("", "window")
         self.update_btn.setVisible(bool(version) and not self._collapsed)
@@ -2334,7 +2390,7 @@ class ClickableCover(CoverLabel):
         self._pressed = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.setAccessibleName("Ver la canción que suena")
+        self.setAccessibleName(tr("Ver la canción que suena"))
 
     def enterEvent(self, event) -> None:  # noqa: N802
         self._veil.to(1.0)
@@ -2460,10 +2516,10 @@ class LyricsPanel(QFrame):
         head = QHBoxLayout()
         head.setContentsMargins(18, 10, 8, 4)
         head.setSpacing(8)
-        title = QLabel("Letra")
+        title = QLabel(tr("Letra"))
         title.setObjectName("panelTitle")
         self.source = ElidedLabel(theme.ui_font(12), theme.TENUE, align=Qt.AlignmentFlag.AlignRight)
-        close = IconButton("close", "Ocultar la letra (Ctrl+L)", size=32, glyph_px=11, quiet=True)
+        close = IconButton("close", tr("Ocultar la letra (Ctrl+L)"), size=32, glyph_px=11, quiet=True)
         close.clicked.connect(self.close_requested)
         head.addWidget(title)
         head.addWidget(self.source, 1)

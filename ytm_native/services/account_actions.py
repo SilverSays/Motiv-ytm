@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, Signal
 
 from ytm_native.core import config, paths
 from ytm_native.core.db import Database, Track
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.account")
 
@@ -64,16 +65,16 @@ def describe_error(exc: BaseException) -> str:
     from ytm_native.services.sync import SessionExpired, http_status, is_auth_error
 
     if isinstance(exc, MutationsDisabled):
-        return "Los cambios en la cuenta están desactivados."
+        return tr("Los cambios en la cuenta están desactivados.")
     if isinstance(exc, AccountActionError):
         return str(exc)
     if isinstance(exc, SessionExpired) or is_auth_error(exc):
-        return "La sesión de YouTube Music caducó: vuelve a iniciar sesión."
+        return tr("La sesión de YouTube Music caducó: vuelve a iniciar sesión.")
     if http_status(exc) == 429:
-        return "YouTube Music pidió esperar un poco antes de más cambios."
+        return tr("YouTube Music pidió esperar un poco antes de más cambios.")
     if isinstance(exc, OSError):
-        return "Sin conexión."
-    return "YouTube Music no aceptó el cambio."
+        return tr("Sin conexión.")
+    return tr("YouTube Music no aceptó el cambio.")
 
 
 class RateLimiter:
@@ -130,11 +131,11 @@ class AccountClient:
     # -- guardas -------------------------------------------------------------
     def _guard(self, video_id: str = "") -> None:
         if not mutations_enabled(self.db):
-            raise MutationsDisabled("los cambios en la cuenta están desactivados")
+            raise MutationsDisabled(tr("los cambios en la cuenta están desactivados"))
         if video_id and is_local_track(video_id):
-            raise AccountActionError("Las canciones del disco no están en YouTube Music.")
+            raise AccountActionError(tr("Las canciones del disco no están en YouTube Music."))
         if not self._credentials_present():
-            raise AccountActionError("Inicia sesión en YouTube Music para cambiar tu cuenta.")
+            raise AccountActionError(tr("Inicia sesión en YouTube Music para cambiar tu cuenta."))
 
     def _call(self, work: Callable[[Any], Any]) -> Any:
         """Una petición con su turno en el limitador y el cliente de la cuenta."""
@@ -153,7 +154,7 @@ class AccountClient:
     # -- canciones -----------------------------------------------------------
     def rate_song(self, video_id: str, rating: str) -> None:
         if rating not in RATINGS:
-            raise ValueError(f"valoración desconocida: {rating!r}")
+            raise ValueError(tr("valoración desconocida: {rating!r}", rating=rating))
         self._guard(video_id)
         self._call(lambda client: client.rate_song(video_id, rating))
 
@@ -187,19 +188,19 @@ class AccountClient:
         token = status.add_token if add else status.remove_token
         if not token:
             raise AccountActionError(
-                "YouTube Music no permite guardar esta canción en la biblioteca."
-                if add else "YouTube Music no permite quitar esta canción de la biblioteca."
+                tr("YouTube Music no permite guardar esta canción en la biblioteca.")
+                if add else tr("YouTube Music no permite quitar esta canción de la biblioteca.")
             )
         result = self._call(lambda client: client.edit_song_library_status([token]))
         if isinstance(result, dict) and result.get("feedbackResponses"):
             if not all(isinstance(r, dict) and r.get("isProcessed", True)
                        for r in result["feedbackResponses"]):
-                raise AccountActionError("YouTube Music no procesó el cambio en la biblioteca.")
+                raise AccountActionError(tr("YouTube Music no procesó el cambio en la biblioteca."))
 
     def report_history(self, video_id: str) -> None:
         """Anota la escucha en el historial de YouTube (sub-opción aparte)."""
         if not history_reporting_enabled(self.db):
-            raise MutationsDisabled("el registro de escuchas en YouTube está desactivado")
+            raise MutationsDisabled(tr("el registro de escuchas en YouTube está desactivado"))
         self._guard(video_id)
 
         def work(client: Any) -> Any:
@@ -213,14 +214,14 @@ class AccountClient:
         self._guard()
         title = (title or "").strip()
         if not title:
-            raise AccountActionError("La lista necesita un nombre.")
+            raise AccountActionError(tr("La lista necesita un nombre."))
         if "<" in title or ">" in title:
-            raise AccountActionError("El nombre de la lista no puede llevar < ni >.")
+            raise AccountActionError(tr("El nombre de la lista no puede llevar < ni >."))
         ids = [v for v in dict.fromkeys(video_ids) if v and not is_local_track(v)]
         result = self._call(lambda client: client.create_playlist(
             title, description, privacy_status="PRIVATE", video_ids=ids or None))
         if not isinstance(result, str) or not result:
-            raise AccountActionError("YouTube Music no creó la lista.")
+            raise AccountActionError(tr("YouTube Music no creó la lista."))
         return result
 
     def add_playlist_items(self, playlist_id: str, video_ids: Iterable[str]) -> None:
@@ -229,21 +230,21 @@ class AccountClient:
         if not ids:
             return
         result = self._call(lambda client: client.add_playlist_items(playlist_id, ids, duplicates=False))
-        _expect_succeeded(result, "YouTube Music no añadió las canciones a la lista.")
+        _expect_succeeded(result, tr("YouTube Music no añadió las canciones a la lista."))
 
     def remove_playlist_items(self, playlist_id: str, items: Iterable[tuple[str, str]]) -> None:
         """``items``: pares (videoId, setVideoId) tal como los guarda la sincronización."""
         self._guard()
         videos = [{"videoId": vid, "setVideoId": set_vid} for vid, set_vid in items if vid and set_vid]
         if not videos:
-            raise AccountActionError("No se sabe qué copia de la canción quitar: sincroniza la lista.")
+            raise AccountActionError(tr("No se sabe qué copia de la canción quitar: sincroniza la lista."))
         result = self._call(lambda client: client.remove_playlist_items(playlist_id, videos))
-        _expect_succeeded(result, "YouTube Music no quitó la canción de la lista.")
+        _expect_succeeded(result, tr("YouTube Music no quitó la canción de la lista."))
 
     def rate_playlist(self, playlist_id: str, rating: str) -> None:
         """Guarda (``LIKE``) o quita (``INDIFFERENT``) una lista o álbum de la biblioteca."""
         if rating not in RATINGS:
-            raise ValueError(f"valoración desconocida: {rating!r}")
+            raise ValueError(tr("valoración desconocida: {rating!r}", rating=rating))
         self._guard()
         self._call(lambda client: client.rate_playlist(playlist_id, rating))
 
@@ -340,7 +341,7 @@ class AccountActions(QObject):
         if track is None or is_local_track(track.video_id):
             return False
         if not self.enabled:
-            self.notice.emit("Activa «Permitir cambios en mi cuenta» para cambiar tu cuenta de YouTube Music.",
+            self.notice.emit(tr("Activa «Permitir cambios en mi cuenta» para cambiar tu cuenta de YouTube Music."),
                              "info")
             return False
         return True
@@ -378,9 +379,9 @@ class AccountActions(QObject):
             self._wanted.pop(key, None)
             self._shown.pop(key, None)
             self.status_changed.emit(video_id)
-            what = "el me gusta de" if kind == "rate" else "la biblioteca con"
+            what = tr("el me gusta de") if kind == "rate" else tr("la biblioteca con")
             log.warning("no se pudo cambiar %s %s: %s", what, video_id, type(error).__name__)
-            self.notice.emit(f"No se pudo actualizar {what} «{title}». {describe_error(error)}", "error")
+            self.notice.emit(tr("No se pudo actualizar {what} «{title}». {describe_error}", what=what, title=title, describe_error=describe_error(error)), "error")
             return
         try:
             if kind == "rate":
@@ -430,9 +431,9 @@ class AccountActions(QObject):
 
         def done(playlist_id: Optional[str], error: Optional[BaseException]) -> None:
             if error is not None:
-                self.notice.emit(f"No se pudo crear la lista «{title}». {describe_error(error)}", "error")
+                self.notice.emit(tr("No se pudo crear la lista «{title}». {describe_error}", title=title, describe_error=describe_error(error)), "error")
                 return
-            self.notice.emit(f"Lista «{title}» creada en tu cuenta de YouTube Music.", "info")
+            self.notice.emit(tr("Lista «{title}» creada en tu cuenta de YouTube Music.", title=title), "info")
             self.playlist_created.emit(playlist_id, title)
 
         self._run(lambda: self.client.create_playlist(title, ids), done)
@@ -446,7 +447,7 @@ class AccountActions(QObject):
 
         def done(_result, error: Optional[BaseException]) -> None:
             if error is not None:
-                self.notice.emit(f"No se pudo quitar «{track.title}» de la lista. {describe_error(error)}",
+                self.notice.emit(tr("No se pudo quitar «{title}» de la lista. {describe_error}", title=track.title, describe_error=describe_error(error)),
                                  "error")
                 return
             self.playlist_item_removed.emit(playlist_id, track.video_id)

@@ -41,6 +41,8 @@ from ytm_native.services.sync import (
     parse_count,
     track_from_item,
 )
+from ytm_native.core import i18n
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.discover")
 
@@ -48,6 +50,7 @@ HOME_CACHE_KEY = "inicio"
 NOW_CACHE_PREFIX = "suena:"
 ARTIST_CACHE_PREFIX = "artista:"
 CACHE_PURGED_KEY = "discover_cache_purged_at"
+CACHE_LANG_KEY = "discover_cache_lang"         # idioma de la última purga por idioma
 RECENT_KEY = "recent_searches"
 
 
@@ -243,11 +246,11 @@ def _card_note(item: dict) -> str:
     elif isinstance(author, dict):
         author = author.get("name")
     if author:
-        return f"De {author}"
+        return tr("De {author}", author=author)
     description = str(item.get("description") or "")
     parts = [p.strip() for p in description.split("•")]
     if len(parts) >= 2:                   # "Playlist • Autor • 20K views"
-        return f"De {parts[1]}" if parts[1] else ""
+        return tr("De {value}", value=parts[1]) if parts[1] else ""
     return description                    # portada: "Artista, artista, artista"
 
 
@@ -323,7 +326,7 @@ def generic_client() -> Any:
 
             session = requests.Session()
             session.request = _with_timeout(session.request, 15.0)
-            _generic_client = YTMusic(requests_session=session, language="es")
+            _generic_client = YTMusic(requests_session=session, language=i18n.active())
         return _generic_client
 
 
@@ -427,23 +430,23 @@ def build_recommendations(
                 log.warning("relacionadas de %s: %s", seed.video_id, exc)
                 last_error = exc
                 break
-            by = f", de {seed.artists}" if seed.artists else ""
-            add(f"Parecidas a «{playlist.title}»", f"Elegidas a partir de «{seed.title}»{by}", items)
+            by = tr(", de {artists}", artists=seed.artists) if seed.artists else ""
+            add(tr("Parecidas a «{title}»", title=playlist.title), tr("Elegidas a partir de «{title}»{by}", title=seed.title, by=by), items)
 
     for name, songs in _pick_artists(taste(db).artists, config.HOME_SEED_ARTISTS, rng):
-        count = "una canción" if songs == 1 else f"{songs} canciones"
-        note = f"Está en {count} de tus listas" if songs else "Lo has escuchado hace poco"
+        count = tr("una canción") if songs == 1 else tr("{songs} canciones", songs=songs)
+        note = tr("Está en {count} de tus listas", count=count) if songs else tr("Lo has escuchado hace poco")
         before = len(shelves)
         try:
             # Primero lo relacionado con una canción suya: sirve para descubrir
             # y no depende de cómo se llame el artista.
             seed = _artist_seed(db, name, rng)
             if seed is not None:
-                add(f"Porque escuchas a {name}", note, related_playlists(client, seed.video_id))
+                add(tr("Porque escuchas a {name}", name=name), note, related_playlists(client, seed.video_id))
             if len(shelves) == before:
                 # Sin relacionadas: listas que lo nombran en el título. Buscar
                 # "Air" a secas trae también "Air Supply" o "On Air".
-                add(f"Listas de la comunidad con {name}", note,
+                add(tr("Listas de la comunidad con {name}", name=name), note,
                     _titled_like(community_playlists(client, name), name))
         except Exception as exc:  # noqa: BLE001
             log.warning("listas de la comunidad de %s: %s", name, exc)
@@ -457,12 +460,25 @@ def build_recommendations(
     # Sin biblioteca (o sin nada parecido): la portada general, sin cuenta.
     for section in (generic_factory or generic_client)().get_home(limit=4) or []:
         if isinstance(section, dict) and isinstance(section.get("contents"), list):
-            add(str(section.get("title") or "Para empezar"), "", section["contents"])
+            add(str(section.get("title") or tr("Para empezar")), "", section["contents"])
     return "general", shelves
 
 
+def _with_language(data: dict) -> dict:
+    """Lo que se guarda en la caché lleva el idioma en que se pidió: sus
+    títulos, notas y datos (y lo que devuelve YouTube Music) van en él."""
+    data["lang"] = i18n.active()
+    return data
+
+
+def _same_language(data: dict) -> bool:
+    """¿Se guardó en el idioma de ahora? Lo de antes del inglés no lo dice:
+    era español. Al cambiar de idioma, lo guardado se vuelve a pedir."""
+    return data.pop("lang", i18n.SPANISH) == i18n.active()
+
+
 def save_shelves(db: Database, kind: str, shelves: list[Shelf], now: Optional[float] = None) -> None:
-    payload = {"kind": kind, "shelves": [asdict(s) for s in shelves]}
+    payload = _with_language({"kind": kind, "shelves": [asdict(s) for s in shelves]})
     db.set_discover_entry(HOME_CACHE_KEY, json.dumps(payload, ensure_ascii=False), now)
 
 
@@ -474,6 +490,8 @@ def load_shelves(db: Database) -> Optional[tuple[float, str, list[Shelf]]]:
     fetched_at, raw = entry
     try:
         data = json.loads(raw)
+        if not _same_language(data):
+            return None
         shelves = [
             Shelf(s["title"], s.get("note", ""), tuple(PlaylistCard(**c) for c in s["cards"]))
             for s in data["shelves"]
@@ -606,7 +624,10 @@ def now_playing_info(track: Track, client_factory: Optional[Callable[[], Any]] =
         ("Álbum", album),
         ("Año", head.get("year")),
         ("Reproducciones", head.get("views")),
-        ("Tipo", _VIDEO_KINDS.get(str(head.get("videoType") or ""))),
+        # El tipo es texto de la app, no un dato: se guarda ya traducido
+        # (la caché va por idioma). Las etiquetas, en español: las traduce
+        # quien las enseña.
+        ("Tipo", tr(_VIDEO_KINDS.get(str(head.get("videoType") or ""), ""))),
     ):
         if value:
             info.facts.append([label, str(value)])
@@ -637,16 +658,34 @@ def purge_stale_cache(db: Database, now: Optional[float] = None) -> int:
     """Quita de la caché lo que ya no se usaría (más viejo que su plazo), como
     mucho una vez cada ``DISCOVER_PURGE_INTERVAL_S``: cada canción y cada
     artista que se abren dejan una entrada, y sin esto la base solo crece.
-    Las recomendaciones del inicio no se tocan: se enseñan aunque sean viejas."""
+    Las recomendaciones del inicio no se tocan: se enseñan aunque sean viejas.
+
+    La primera vez tras cambiar de idioma, además, se va al momento lo
+    guardado en el anterior: ya no se enseñaría (se vuelve a pedir) y, si
+    no, se quedaría en la base hasta caducar."""
     now = time.time() if now is None else now
+    removed = purge_other_language(db)
     if 0 <= now - db.get_float(CACHE_PURGED_KEY) < config.DISCOVER_PURGE_INTERVAL_S:
-        return 0
+        return removed
     db.set_setting(CACHE_PURGED_KEY, now)
-    removed = db.purge_discover_cache(
+    expired = db.purge_discover_cache(
         {NOW_CACHE_PREFIX: config.NOW_INFO_TTL_S, ARTIST_CACHE_PREFIX: config.ARTIST_PAGE_TTL_S}, now
     )
+    if expired:
+        log.info("caché de recomendaciones: %d entradas caducadas borradas", expired)
+    return removed + expired
+
+
+def purge_other_language(db: Database) -> int:
+    """Borra las canciones y artistas guardados en otro idioma, una vez por
+    cambio de idioma (``CACHE_LANG_KEY`` recuerda el último purgado)."""
+    language = i18n.active()
+    if db.get_setting(CACHE_LANG_KEY) == language:
+        return 0
+    removed = db.purge_discover_language((NOW_CACHE_PREFIX, ARTIST_CACHE_PREFIX), language, i18n.SPANISH)
+    db.set_setting(CACHE_LANG_KEY, language)
     if removed:
-        log.info("caché de recomendaciones: %d entradas caducadas borradas", removed)
+        log.info("caché de recomendaciones: %d entradas en otro idioma borradas", removed)
     return removed
 
 
@@ -655,7 +694,7 @@ def save_now_info(db: Database, info: NowInfo, now: Optional[float] = None) -> N
     if info.partial:
         return
     db.set_discover_entry(
-        f"{NOW_CACHE_PREFIX}{info.video_id}", json.dumps(asdict(info), ensure_ascii=False), now
+        f"{NOW_CACHE_PREFIX}{info.video_id}", json.dumps(_with_language(asdict(info)), ensure_ascii=False), now
     )
     purge_stale_cache(db, now)
 
@@ -670,6 +709,8 @@ def load_now_info(db: Database, video_id: str, now: Optional[float] = None) -> O
         return None
     try:
         data = json.loads(raw)
+        if not _same_language(data):
+            return None
         data["similar"] = [Track(**t) for t in data.get("similar") or []]
         info = NowInfo(**data)
         # Una entrada guardada con otra forma se descarta y se vuelve a pedir.
@@ -700,7 +741,7 @@ def fetch_playlist(
         author = split_artists(tracks[0].artists)[:1][0] if split_artists(tracks[0].artists) else ""
     return RemotePlaylist(
         playlist_id=playlist_id,
-        title=str(data.get("title") or "Lista"),
+        title=str(data.get("title") or tr("Lista")),
         author=author,
         description=str(data.get("description") or ""),
         year=str(data.get("year") or ""),
@@ -731,7 +772,7 @@ def _album_track(item: Any, album: str, thumb: str) -> Optional[Track]:
 def fetch_album(browse_id: str, client_factory: Optional[Callable[[], Any]] = None) -> RemotePlaylist:
     """Un álbum o sencillo (``MPREb_…``) como lista que se puede ver y reproducir."""
     data = (client_factory or generic_client)().get_album(browse_id) or {}
-    title = str(data.get("title") or "Álbum")
+    title = str(data.get("title") or tr("Álbum"))
     thumb = best_thumbnail(data.get("thumbnails"))
     artists = ", ".join(
         a.get("name", "") for a in (data.get("artists") or []) if isinstance(a, dict) and a.get("name")
@@ -792,7 +833,7 @@ def artist_card_from_item(item: Any) -> Optional[ArtistCard]:
     if not channel.startswith("UC") or not name:
         return None
     subscribers = str(item.get("subscribers") or "").strip()
-    return ArtistCard(channel, name, f"{subscribers} suscriptores" if subscribers else "Artista",
+    return ArtistCard(channel, name, tr("{subscribers} suscriptores", subscribers=subscribers) if subscribers else tr("Artista"),
                       best_thumbnail(item.get("thumbnails")))
 
 
@@ -888,7 +929,7 @@ def _release_card(item: dict, single: bool) -> Optional[PlaylistCard]:
         return None
     year = str(item.get("year") or "").strip()
     kind = str(item.get("type") or "").strip()
-    note = f"{kind} de {year}" if single and kind and year else (year or kind)
+    note = tr("{kind} de {year}", kind=kind, year=year) if single and kind and year else (year or kind)
     return PlaylistCard(pid, title, note, best_thumbnail(item.get("thumbnails")))
 
 
@@ -919,7 +960,7 @@ def artist_page(
 
     client = tolerant((client_factory or generic_client)())
     data = client.get_artist(channel_id) or {}
-    name = str(data.get("name") or "").strip() or "Artista"
+    name = str(data.get("name") or "").strip() or tr("Artista")
     page = ArtistPage(
         channel_id=channel_id,
         name=name,
@@ -1002,7 +1043,7 @@ def artist_page(
 
 def save_artist_page(db: Database, page: ArtistPage, now: Optional[float] = None) -> None:
     db.set_discover_entry(
-        f"{ARTIST_CACHE_PREFIX}{page.channel_id}", json.dumps(asdict(page), ensure_ascii=False), now
+        f"{ARTIST_CACHE_PREFIX}{page.channel_id}", json.dumps(_with_language(asdict(page)), ensure_ascii=False), now
     )
     purge_stale_cache(db, now)
 
@@ -1017,6 +1058,8 @@ def load_artist_page(db: Database, channel_id: str, now: Optional[float] = None)
         return None
     try:
         data = json.loads(raw)
+        if not _same_language(data):
+            return None
         for key in ("top_songs", "similar"):
             data[key] = [Track(**t) for t in data.get(key) or []]
         for key in ("albums", "singles", "playlists"):

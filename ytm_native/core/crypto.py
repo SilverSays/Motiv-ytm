@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sys
 from typing import Optional
+from ytm_native.core.i18n import tr
 
 MAGIC = b"YTMN_DPAPI\x01"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
@@ -82,7 +83,7 @@ if sys.platform == "win32":
 def dpapi_protect(data: bytes, entropy: Optional[bytes] = None) -> bytes:
     """Cifra ``data`` para el usuario de Windows actual."""
     if not available():
-        raise CryptoError("el cifrado de Windows (DPAPI) no está disponible en este sistema")
+        raise CryptoError(tr("el cifrado de Windows (DPAPI) no está disponible en este sistema"))
     data_in, keep_data = _blob(bytes(data))
     extra = _blob(entropy) if entropy else None
     out = _Blob()
@@ -92,16 +93,16 @@ def dpapi_protect(data: bytes, entropy: Optional[bytes] = None) -> bytes:
     )
     del keep_data, extra
     if not ok:
-        raise CryptoError(f"Windows no pudo cifrar los datos (error {ctypes.get_last_error()})")
+        raise CryptoError(tr("Windows no pudo cifrar los datos (error {get_last_error})", get_last_error=ctypes.get_last_error()))
     return _take(out)
 
 
 def dpapi_unprotect(data: bytes, entropy: Optional[bytes] = None) -> bytes:
     """Descifra lo que cifró ``dpapi_protect`` con la misma ``entropy``."""
     if not available():
-        raise CryptoError("el cifrado de Windows (DPAPI) no está disponible en este sistema")
+        raise CryptoError(tr("el cifrado de Windows (DPAPI) no está disponible en este sistema"))
     if not data:
-        raise CryptoError("no hay datos cifrados")
+        raise CryptoError(tr("no hay datos cifrados"))
     data_in, keep_data = _blob(bytes(data))
     extra = _blob(entropy) if entropy else None
     out = _Blob()
@@ -112,7 +113,7 @@ def dpapi_unprotect(data: bytes, entropy: Optional[bytes] = None) -> bytes:
     del keep_data, extra
     if not ok:
         # Datos dañados, de otro usuario o de otro equipo, o entropía distinta.
-        raise CryptoError(f"Windows no pudo descifrar los datos (error {ctypes.get_last_error()})")
+        raise CryptoError(tr("Windows no pudo descifrar los datos (error {get_last_error})", get_last_error=ctypes.get_last_error()))
     return _take(out)
 
 
@@ -129,5 +130,5 @@ def unseal(data: bytes, entropy: Optional[bytes] = None) -> bytes:
     """Lo contrario de ``seal``. Sin la cabecera, ``CryptoError``: lo que no
     se cifró nunca se acepta como si lo estuviera."""
     if not is_sealed(data):
-        raise CryptoError("los datos no están cifrados con la cabecera de la aplicación")
+        raise CryptoError(tr("los datos no están cifrados con la cabecera de la aplicación"))
     return dpapi_unprotect(bytes(data[len(MAGIC):]), entropy)

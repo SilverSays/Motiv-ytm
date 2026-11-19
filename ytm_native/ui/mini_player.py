@@ -24,6 +24,7 @@ from .components import CoverLabel, ElidedLabel, IconButton, SeekSlider
 from .motion import FRAME_MS, MARQUEE_PX_S, MARQUEE_REST_MS, reduced_motion
 from .tray import app_icon
 from .widgets import format_time
+from ytm_native.core.i18n import tr
 
 POS_KEY = "mini_player_pos"
 COVER_PX = 64
@@ -212,13 +213,13 @@ class MiniPlayer(QWidget):
         self.cover.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.title = MarqueeLabel(theme.ui_font(14, QFont.Weight.DemiBold), theme.PAPEL)
         self.artist = MarqueeLabel(theme.ui_font(12), theme.HUMO)
-        self.window_btn = IconButton("window", "Volver a la ventana principal", size=28, glyph_px=13, quiet=True)
-        self.prev_btn = IconButton("previous", "Anterior", size=32, glyph_px=14)
-        self.play_btn = IconButton("play", "Reproducir", size=36, glyph_px=16)
-        self.next_btn = IconButton("next", "Siguiente", size=32, glyph_px=14)
+        self.window_btn = IconButton("window", tr("Volver a la ventana principal"), size=28, glyph_px=13, quiet=True)
+        self.prev_btn = IconButton("previous", tr("Anterior"), size=32, glyph_px=14)
+        self.play_btn = IconButton("play", tr("Reproducir"), size=36, glyph_px=16)
+        self.next_btn = IconButton("next", tr("Siguiente"), size=32, glyph_px=14)
         self.time_label = ElidedLabel(theme.ui_font(11, tabular=True), theme.TENUE)
         self.seek = SeekSlider()
-        self.seek.setAccessibleName("Posición en la pista")
+        self.seek.setAccessibleName(tr("Posición en la pista"))
         self.seek.setRange(0, 1000)
         self.seek.setFixedHeight(16)
         self.seek.hover_text = lambda f: format_time(f * self._duration) if self._duration > 0 else ""
@@ -273,7 +274,7 @@ class MiniPlayer(QWidget):
     # -- reproducción ---------------------------------------------------------
     def _on_current(self, track: Optional[Track]) -> None:
         if track is None:
-            self.title.setText("Nada en reproducción")
+            self.title.setText(tr("Nada en reproducción"))
             self.title.set_color(theme.HUMO)
             self.artist.setText("")
             self.cover.set_url("")
@@ -290,7 +291,7 @@ class MiniPlayer(QWidget):
     def _on_state(self, state: str) -> None:
         playing = state in (PLAYING, LOADING)
         self.play_btn.set_glyph("pause" if playing else "play")
-        self.play_btn.setToolTip("Pausar" if playing else "Reproducir")
+        self.play_btn.setToolTip(tr("Pausar") if playing else tr("Reproducir"))
         has_track = self.player.current_track() is not None
         for button in (self.play_btn, self.prev_btn, self.next_btn):
             button.setEnabled(has_track)

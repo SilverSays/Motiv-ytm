@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from ytm_native.core import crypto
+from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.credentials")
 
@@ -76,8 +77,8 @@ def read_bytes(path: Path) -> bytes:
     except crypto.CryptoError as exc:
         log.warning("no se pueden descifrar las credenciales de %s (%s)", Path(path).name, exc)
         raise CredentialError(
-            f"{Path(path).name} no se puede descifrar: se guardó con otro usuario de Windows, "
-            "en otro equipo o está dañado"
+            tr("{name} no se puede descifrar: se guardó con otro usuario de Windows, en otro equipo o está "
+               "dañado", name=Path(path).name)
         ) from exc
 
 

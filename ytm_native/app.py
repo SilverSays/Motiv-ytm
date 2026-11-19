@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
+import subprocess
 import sys
 import threading
 import traceback
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from ytm_native.core import paths
+from ytm_native.core import i18n, paths
 from ytm_native.core.db import Database
 from ytm_native.core.instance import SingleInstance
 from ytm_native.playback.extractor import ExtractorManager, probe_url
@@ -24,6 +28,7 @@ from ytm_native.ui import chrome
 from ytm_native.ui.art import track_art_url
 from ytm_native.ui.main_window import Bridge, MainWindow
 from ytm_native.ui.tray import MINIMIZED_ARG
+from ytm_native.core.i18n import tr
 
 
 log = logging.getLogger("ytmn.app")
@@ -77,8 +82,11 @@ def report_crash(exc_type, exc, tb) -> None:
     _crash_dialogs += 1
     try:
         _show_crash_dialog(
-            f"Ocurrió un error inesperado:\n\n{exc_type.__name__}: {exc}\n\n"
-            f"Los detalles están en {paths.log_dir() / 'ytmn.log'}"
+            tr("Ocurrió un error inesperado:\n"
+               "\n"
+               "{name__}: {exc}\n"
+               "\n"
+               "Los detalles están en {value}", name__=exc_type.__name__, exc=exc, value=paths.log_dir() / 'ytmn.log')
         )
     except Exception:  # noqa: BLE001 - el aviso no puede provocar otro fallo
         log.exception("no se pudo enseñar el aviso del error")
@@ -167,9 +175,46 @@ def show_initial(window: MainWindow, argv: list[str]) -> None:
         window.showMinimized()
 
 
+def relaunch_command(argv: Optional[list[str]] = None) -> list[str]:
+    """La orden que abre otra vez esta misma instalación con los mismos
+    argumentos que esta (``argv``, por defecto los de ``sys.argv``), salvo
+    ``--minimized``: quien reinicia está mirando la ventana."""
+    args = [arg for arg in (sys.argv if argv is None else argv)[1:] if arg != MINIMIZED_ARG]
+    exe = Path(sys.executable)
+    if getattr(sys, "frozen", False):
+        return [str(exe), *args]
+    windowed = exe.with_name("pythonw.exe")
+    if exe.name.lower() == "python.exe" and windowed.is_file():
+        exe = windowed
+    return [str(exe), str(Path(__file__).resolve().parent / "__main__.py"), *args]
+
+
+def relaunch_env() -> dict[str, str]:
+    """El entorno de la copia nueva: el de esta sin ``YTMN_LANG``. Esa
+    variable manda sobre la preferencia guardada; heredada, la app volvería
+    a abrirse en el idioma de antes, justo el que se quería cambiar."""
+    env = os.environ.copy()
+    env.pop(i18n.ENV_KEY, None)
+    return env
+
+
+def relaunch() -> None:
+    """Abre la app de nuevo tras salir (Opciones > Idioma > Reiniciar ahora).
+    Se llama cuando esta copia ya soltó el cerrojo de instancia: si no, la
+    nueva creería que ya hay una abierta y se cerraría."""
+    try:
+        subprocess.Popen(relaunch_command(), close_fds=True, env=relaunch_env(),  # noqa: S603 - la propia app
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    except OSError:
+        log.exception("no se pudo volver a abrir la app")
+
+
 def main() -> int:
     install_crash_hooks()
     setup_logging()
+    # El idioma se decide aquí, en el hilo principal y antes de que haya
+    # ningún hilo de trabajo: así nadie lo decide a medias en paralelo.
+    log.info("idioma de la interfaz: %s", i18n.active())
     app = QApplication(sys.argv)
     app.setApplicationName("YT Music Nativo")
     instance = SingleInstance()
@@ -193,6 +238,8 @@ def main() -> int:
         return app.exec()
     finally:
         instance.release()
+        if app.property("ytmn_restart"):
+            relaunch()
 
 
 if __name__ == "__main__":

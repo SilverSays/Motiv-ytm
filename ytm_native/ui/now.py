@@ -31,6 +31,7 @@ from . import theme
 from .art import BAR_ART_PX, ArtLoader, Tint, neutral_tint, placeholder_pixmap, sized_url, square_pixmap, track_art_url
 from .components import CoverLabel, ElidedLabel, IconButton, PillButton, Reveal, _alpha, _Pressable
 from .motion import EASE, EASE_OUT, FADE_MS, Tween, mix
+from ytm_native.core.i18n import tr
 
 
 def whole_pixmap(image, width: int, height: int, radius: float, dpr: float = 1.0) -> QPixmap:
@@ -463,9 +464,9 @@ class NowPanel(QFrame):
         outer.setSpacing(0)
         head = QHBoxLayout()
         head.setContentsMargins(18, 10, 8, 4)
-        title = QLabel("Ahora suena")
+        title = QLabel(tr("Ahora suena"))
         title.setObjectName("panelTitle")
-        close = IconButton("close", "Ocultar el panel (Ctrl+I)", size=32, glyph_px=11, quiet=True)
+        close = IconButton("close", tr("Ocultar el panel (Ctrl+I)"), size=32, glyph_px=11, quiet=True)
         close.clicked.connect(self.close_requested)
         head.addWidget(title, 1)
         head.addWidget(close)
@@ -548,7 +549,7 @@ class NowPanel(QFrame):
         self.artist_facts = pairs()
         self._artist_labels: list[tuple[QLabel, QLabel]] = []
         more.addLayout(self.artist_facts)
-        self.facts_title = QLabel("Sobre esta canción")
+        self.facts_title = QLabel(tr("Sobre esta canción"))
         self.facts_title.setObjectName("nowHeading")
         self.facts_title.setContentsMargins(0, 8, 0, 0)
         more.addWidget(self.facts_title)
@@ -562,13 +563,13 @@ class NowPanel(QFrame):
         self._more_fade = Tween(self.more, 1.0, self._apply_more_fade, ms=FADE_MS, curve=EASE)
         artist.addWidget(self.more)
 
-        self.toggle = PillButton("Más información", "quiet", glyph="chevron_down")
+        self.toggle = PillButton(tr("Más información"), "quiet", glyph="chevron_down")
         self.toggle.setFixedHeight(32)
         self.toggle.clicked.connect(lambda: self.set_expanded(not self._expanded))
         # La página entera del artista: discografía, listas y artistas parecidos.
-        self.artist_btn = PillButton("Ver artista", "quiet", glyph="expand")
+        self.artist_btn = PillButton(tr("Ver artista"), "quiet", glyph="expand")
         self.artist_btn.setFixedHeight(32)
-        self.artist_btn.setToolTip("Abrir la página del artista: canciones, álbumes, listas y música parecida")
+        self.artist_btn.setToolTip(tr("Abrir la página del artista: canciones, álbumes, listas y música parecida"))
         self.artist_btn.clicked.connect(self._emit_artist)
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
@@ -583,7 +584,7 @@ class NowPanel(QFrame):
         similar = QVBoxLayout(self.similar_box)
         similar.setContentsMargins(0, 26, 0, 0)
         similar.setSpacing(0)
-        heading = QLabel("Música parecida")
+        heading = QLabel(tr("Música parecida"))
         heading.setObjectName("nowHeading")
         similar.addWidget(heading)
         similar.addSpacing(6)
@@ -649,7 +650,7 @@ class NowPanel(QFrame):
     def show_idle(self) -> None:
         self._info = None
         self.body.hide()
-        self.message.setText("Reproduce una canción para verla aquí en grande, con su artista y música parecida.")
+        self.message.setText(tr("Reproduce una canción para verla aquí en grande, con su artista y música parecida."))
         self.message.show()
 
     def set_track(self, track: Track) -> None:
@@ -668,14 +669,14 @@ class NowPanel(QFrame):
         self._info = None
         self.artist_box.hide()
         self.similar_box.hide()
-        self.status.setText("Buscando información y música parecida…")
+        self.status.setText(tr("Buscando información y música parecida…"))
         self.status.show()
 
     def set_error(self) -> None:
         self._info = None
         self.artist_box.hide()
         self.similar_box.hide()
-        self.status.setText("No se pudo cargar la información de esta canción (¿sin conexión?).")
+        self.status.setText(tr("No se pudo cargar la información de esta canción (¿sin conexión?)."))
         self.status.show()
 
     def set_info(self, info: NowInfo) -> None:
@@ -687,7 +688,7 @@ class NowPanel(QFrame):
         self.artist_name.setText(info.artist)
         # Junto al nombre, un solo dato; el resto queda en «Más información».
         lead = info.artist_stats[0] if info.artist_stats else None
-        self.artist_stats.setText(f"{lead[1]} {lead[0].lower()}" if lead else "")
+        self.artist_stats.setText(f"{lead[1]} {tr(lead[0]).lower()}" if lead else "")
         self.artist_stats.setVisible(lead is not None)
         self._fill(self.artist_facts, self._artist_labels, info.artist_stats)
         self.avatar.set_url(sized_url(info.artist_thumb, 120))
@@ -719,7 +720,7 @@ class NowPanel(QFrame):
                 row.set_track(info.similar[i])
         self.similar_box.setVisible(bool(info.similar))
         if not info.similar and not info.artist:
-            self.status.setText("No hay más información sobre esta canción.")
+            self.status.setText(tr("No hay más información sobre esta canción."))
             self.status.show()
 
     @staticmethod
@@ -740,7 +741,11 @@ class NowPanel(QFrame):
             label.setVisible(shown)
             value.setVisible(shown)
             if shown:
-                label.setText(facts[i][0])
+                # Las etiquetas se guardan en español y se traducen al
+                # enseñarlas. El valor es el dato tal cual (un álbum llamado
+                # «Inicio» no puede salir como «Home»): lo que sea texto de la
+                # app ya llega traducido de ``discover``.
+                label.setText(tr(facts[i][0]))
                 value.setText(facts[i][1])
 
     def info(self) -> Optional[NowInfo]:
@@ -764,7 +769,7 @@ class NowPanel(QFrame):
         # El extracto y la historia completa no se enseñan a la vez: sería leer lo mismo dos veces.
         self.excerpt.setVisible(not expanded and bool(self._info and self._info.bio))
         self.more.setVisible(expanded)
-        self.toggle.set_label("Menos información" if expanded else "Más información",
+        self.toggle.set_label(tr("Menos información") if expanded else tr("Más información"),
                               "chevron_up" if expanded else "chevron_down")
         if expanded and animate:
             self._more_fade.set(0.0)
