@@ -383,6 +383,11 @@ QTableView {{ background: transparent; border: none; gridline-color: transparent
 QTableView::item {{ border: none; background: transparent; }}
 QHeaderView {{ background: transparent; }}
 QHeaderView::section {{ background: transparent; color: {TENUE}; border: none; border-bottom: 1px solid {LINEA}; padding: 8px 10px; font-size: 12px; }}
+QHeaderView::section:hover {{ color: {PAPEL}; }}
+QLineEdit#listFilter {{ background: transparent; border: none; border-bottom: 1px solid {LINEA}; border-radius: 0; padding: 6px 4px; font-size: 13px; }}
+QLineEdit#listFilter:hover {{ border-bottom-color: {TENUE}; }}
+QLineEdit#listFilter:focus {{ border-bottom: 2px solid {PAPEL}; padding-bottom: 5px; }}
+#filterNote {{ color: {TENUE}; font-size: 13px; }}
 
 #lyricsList {{ background: transparent; border: none; padding: 4px 8px 12px 8px; }}
 

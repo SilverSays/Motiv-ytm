@@ -161,9 +161,12 @@ class MediaControls(QObject):
         parent: Optional[QObject] = None,
         session_factory: Callable = open_windows_session,
         art_url: Callable[[Track], str] = default_art_url,
+        clock: Callable[[], float] = time.monotonic,
     ):
         super().__init__(parent)
         self.player = player
+        # Reloj para espaciar los avisos de posición (las pruebas pasan uno propio).
+        self._clock = clock
         self._art_url = art_url
         self._sent_pos = 0.0
         self._sent_dur = -1.0
@@ -228,7 +231,7 @@ class MediaControls(QObject):
         session = self._session
         if session is None:
             return
-        now = time.monotonic()
+        now = self._clock()
         elapsed = now - self._sent_at
         expected = self._sent_pos + (elapsed if self.player.state == PLAYING else 0.0)
         # Windows no necesita cada aviso: basta uno cada pocos segundos, salvo

@@ -33,7 +33,11 @@ from PySide6.QtWidgets import (
 )
 
 from ytm_native.core import i18n
-from ytm_native.core.i18n import tr
+from ytm_native.core.i18n import plural, tr
+from ytm_native.playback.mpv_ipc import AUTO_DEVICE
+from ytm_native.playback.player import (
+    CROSSFADE_MAX_S, CROSSFADE_MIN_S, TRANSITION_CROSSFADE, TRANSITION_GAPLESS, TRANSITION_OFF,
+)
 
 from . import focus, theme
 from .components import ActiveMark, ListFocusRing
@@ -371,6 +375,32 @@ def follow(signal, owner: QObject, step: Callable[[], None]) -> None:
     signal.connect(_Relay(owner, step).fire)
 
 
+# Preajustes del ecualizador, en el orden en que se ofrecen (claves de ``EQ_PRESETS``).
+EQ_LABELS = (
+    ("flat", tr("Plano (desactivado)")),
+    ("bass", tr("Realce de graves")),
+    ("vocal", tr("Voces claras")),
+    ("rock", tr("Rock")),
+    ("pop", tr("Pop")),
+    ("electronic", tr("Electrónica")),
+    ("acoustic", tr("Acústico")),
+)
+
+TRANSITION_LABELS = (
+    (TRANSITION_GAPLESS, tr("Sin pausas")),
+    (TRANSITION_CROSSFADE, tr("Fundido cruzado")),
+    (TRANSITION_OFF, tr("Normal")),
+)
+
+TRANSITION_NOTES = {
+    TRANSITION_GAPLESS: tr("La siguiente empieza justo al acabar la anterior, sin silencio: "
+                           "los álbumes en directo o mezclados suenan de corrido."),
+    TRANSITION_CROSSFADE: tr("La que acaba baja poco a poco en sus últimos segundos y la siguiente "
+                             "entra subiendo igual, sin silencio entre ellas."),
+    TRANSITION_OFF: tr("Cada canción se carga al terminar la anterior: puede quedar un silencio breve."),
+}
+
+
 class OptionsDialog(QDialog):
     """La ventana de opciones. ``window`` es la ventana principal: sus
     acciones son el modelo de cada interruptor y sus métodos, lo que hacen
@@ -579,6 +609,33 @@ class OptionsDialog(QDialog):
                      tr("Nivela el volumen para que ninguna canción suene mucho más fuerte que otra."))
         self._switch(page, w.resume_action, tr("Seguir donde lo dejaste"),
                      tr("Al abrir la app vuelven la cola, la canción y el segundo en que te quedaste."))
+
+        page.group(tr("Dispositivo de salida y ecualizador"))
+        self.device_row = self._choice(
+            page, tr("Dispositivo de audio"),
+            tr("Por dónde suena la música. Si se desconecta, sigue por la predeterminada de Windows."),
+            self._device_options(), w.audio_device()[0], w.set_audio_device)
+        self.equalizer_row = self._choice(
+            page, tr("Ecualizador"),
+            tr("Realza graves, voces o agudos. Se suma a «Igualar el volumen» sin apagarlo."),
+            EQ_LABELS, w.equalizer_preset(), w.set_equalizer_preset)
+        # Unos auriculares que se conectan o se van cambian la lista al momento.
+        follow(w.mpv.devices_changed, self.device_row, self._sync_devices)
+
+        page.group(tr("Transición entre canciones"))
+        self.transition_row = self._choice(page, tr("Al pasar de una canción a otra"), "",
+                                           TRANSITION_LABELS, w.transition_mode(), self._pick_transition)
+        seconds = [(n, plural(n, "{n} segundo", "{n} segundos")) for n in range(CROSSFADE_MIN_S, CROSSFADE_MAX_S + 1)]
+        self.fade_row = self._choice(page, tr("Duración del fundido"), "", seconds, w.crossfade_seconds(),
+                                     lambda value: w.set_crossfade_seconds(int(value)))
+        # Las cuatro listas, del mismo ancho: forman una columna.
+        rows = (self.device_row, self.equalizer_row, self.transition_row, self.fade_row)
+        width = max(row.control.sizeHint().width() for row in rows)
+        for row in rows:
+            row.control.setMinimumWidth(width)
+        self._sync_transition_notes()
+        self._refreshers.append(self._sync_sound_choices)
+
         page.group(tr("Historial"))
         self._switch(page, w.history_action, tr("Guardar el historial de escucha"),
                      tr("Anota en este equipo lo que escuchas. No se envía a ningún sitio."))
@@ -686,6 +743,46 @@ class OptionsDialog(QDialog):
         self._show_choice(self.language_combo, i18n.preference(self.window_.db))
         self._show_choice(self.theme_row.control, self.window_.theme_mode)
         self._sync_language_note()
+
+    # -- sonido -----------------------------------------------------------------
+    def _device_options(self) -> list[tuple[str, str]]:
+        """La predeterminada de Windows, las salidas que hay y, si la elegida
+        no está conectada, también ella (para que se vea cuál es)."""
+        w = self.window_
+        options = [(AUTO_DEVICE, tr("Predeterminado de Windows"))] + w.audio_devices()
+        chosen, name = w.audio_device()
+        if chosen != AUTO_DEVICE and chosen not in {value for value, _ in options}:
+            options.append((chosen, tr("{name} (no conectado)", name=name or chosen)))
+        return options
+
+    def _sync_devices(self) -> None:
+        combo = self.device_row.control
+        combo.blockSignals(True)
+        combo.clear()
+        for value, label in self._device_options():
+            combo.addItem(label, value)
+        combo.blockSignals(False)
+        self._show_choice(combo, self.window_.audio_device()[0])
+
+    def _pick_transition(self, mode: str) -> None:
+        self.window_.set_transition_mode(mode)
+        self._sync_transition_notes()
+
+    def _sync_transition_notes(self) -> None:
+        mode = self.window_.transition_mode()
+        self.transition_row.set_note(TRANSITION_NOTES.get(mode, ""))
+        fading = mode == TRANSITION_CROSSFADE
+        self.fade_row.control.setEnabled(fading)
+        self.fade_row.set_note("" if fading else tr("Solo con «Fundido cruzado»."))
+
+    def _sync_sound_choices(self) -> None:
+        """Las listas de sonido como están guardadas (una copia importada)."""
+        w = self.window_
+        self._sync_devices()
+        self._show_choice(self.equalizer_row.control, w.equalizer_preset())
+        self._show_choice(self.transition_row.control, w.transition_mode())
+        self._show_choice(self.fade_row.control, w.crossfade_seconds())
+        self._sync_transition_notes()
 
     def _pick_language(self, value: str) -> None:
         i18n.set_preference(self.window_.db, value)

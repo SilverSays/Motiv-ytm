@@ -1,5 +1,7 @@
+import faulthandler
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,44 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # sea el idioma de Windows de quien las ejecuta.
 os.environ["YTMN_LANG"] = "es"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+# Tope por prueba (preparación, prueba y recogida): una regresión que deje un
+# hilo bloqueado o una espera que no acaba no cuelga toda la batería. Pasado
+# el tope se enseñan las pilas de todos los hilos y la ejecución termina con
+# error. Con pytest-timeout instalado manda el suyo; YTMN_TEST_TIMEOUT=0 lo
+# desactiva (para depurar con pausas).
+TEST_TIMEOUT_S = float(os.environ.get("YTMN_TEST_TIMEOUT", "120"))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    if TEST_TIMEOUT_S <= 0 or item.config.pluginmanager.hasplugin("timeout"):
+        yield
+        return
+    done = threading.Event()
+
+    def watch() -> None:
+        if done.wait(TEST_TIMEOUT_S):
+            return
+        capture = item.config.pluginmanager.getplugin("capturemanager")
+        try:
+            if capture is not None:
+                capture.suspend_global_capture(in_=True)    # que se vea en la consola
+        except Exception:  # noqa: BLE001 - se corta igual
+            pass
+        sys.stderr.write(f"\n\n*** {item.nodeid} lleva más de {TEST_TIMEOUT_S:g} s: "
+                         "se corta la batería. Pilas de los hilos: ***\n")
+        sys.stderr.flush()
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        sys.stderr.flush()
+        os._exit(3)
+
+    threading.Thread(target=watch, name="vigia-de-pruebas", daemon=True).start()
+    try:
+        yield
+    finally:
+        done.set()
 
 
 @pytest.fixture(autouse=True)

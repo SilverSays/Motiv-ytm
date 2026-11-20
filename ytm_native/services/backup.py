@@ -57,6 +57,10 @@ PREFERENCE_KEYS = (
     "app_theme",
     # Fase 9: el idioma (se aplica al volver a abrir la app).
     "language",
+    # Fase 10: cómo suena. La salida de audio no: es de este equipo.
+    "equalizer_preset",
+    "transition_mode",
+    "crossfade_seconds",
 )
 
 _VIDEO_ID = re.compile(r"^[\w\-.]{1,64}$", re.ASCII)

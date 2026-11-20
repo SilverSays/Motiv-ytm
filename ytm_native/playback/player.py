@@ -21,11 +21,24 @@
 * **Archivos del disco**: una pista ``local:…`` se carga en mpv directamente
   desde su archivo (``file:///…``), sin yt-dlp ni red; tampoco se resuelve por
   adelantado ni siembra la radio automática.
+* **Sin pausas**: con la pista actual sonando y la URL de la siguiente ya a
+  mano (precargada, o un archivo del disco), se encadena en mpv con
+  ``append``. Al acabar la actual mpv sigue con ella sin hueco y la cola
+  avanza sin pasar por "detenida" ni recargar nada. Cualquier cambio (un salto,
+  editar la cola, repetir una) descarta lo encadenado; si lo encadenado no
+  abre, se resuelve de nuevo y se carga como siempre.
+* **Transición entre canciones** (``transition``): "gapless" (sin pausas, lo
+  de arriba), "crossfade" (fundido: además, la que acaba baja en sus últimos
+  segundos y la siguiente sube en los primeros) u "off" (cada pista se carga
+  al acabar la anterior, como antes). El fundido es una atenuación del
+  volumen sobre el elegido (``MpvPlayer.set_fade``); con una sola instancia
+  de mpv las dos canciones no llegan a sonar a la vez.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import random
 import threading
 import time
@@ -48,6 +61,13 @@ log = logging.getLogger("ytmn.player")
 STOPPED, LOADING, PLAYING, PAUSED = "stopped", "loading", "playing", "paused"
 REPEAT_OFF, REPEAT_ALL, REPEAT_ONE = "off", "all", "one"
 DEFAULT_VOLUME = 80
+# Transición entre canciones y duración del fundido (segundos).
+TRANSITION_GAPLESS, TRANSITION_CROSSFADE, TRANSITION_OFF = "gapless", "crossfade", "off"
+TRANSITIONS = (TRANSITION_GAPLESS, TRANSITION_CROSSFADE, TRANSITION_OFF)
+TRANSITION_KEY = "transition_mode"
+CROSSFADE_KEY = "crossfade_seconds"
+CROSSFADE_DEFAULT_S, CROSSFADE_MIN_S, CROSSFADE_MAX_S = 4, 2, 8
+FADE_TICK_MS = 40
 
 
 def saved_volume(db: Database) -> int:
@@ -65,6 +85,16 @@ class _Job:
     gen: int
     cancel: threading.Event = field(default_factory=threading.Event)
     done: bool = False
+
+
+@dataclass(eq=False)
+class _Chain:
+    """La pista encadenada en mpv tras la que suena (``loadfile … append``)."""
+    video_id: str
+    token: int
+    res: ResolveResult
+    entry_id: Optional[int] = None    # el ``playlist_entry_id`` que le dio mpv
+    acked: bool = False               # mpv confirmó que la añadió
 
 
 class PlaybackController(QObject):
@@ -101,7 +131,22 @@ class PlaybackController(QObject):
         self._radio_token = 0
         self._radio_pending = False
         # Al acabar la pista que suena, parar en vez de seguir con la cola.
-        self.stop_after_current = False
+        self._stop_after_current = False
+        # Cómo se pasa de una canción a otra. Salvo "off", la siguiente se
+        # encadena en mpv para que suene sin hueco.
+        mode = db.get_setting(TRANSITION_KEY, TRANSITION_GAPLESS)
+        self.transition = mode if mode in TRANSITIONS else TRANSITION_GAPLESS
+        self.crossfade_s = self._clamp_crossfade(db.get_int(CROSSFADE_KEY, CROSSFADE_DEFAULT_S))
+        self._fade_in = False                     # la actual entró con fundido y aún sube
+        self._pos_at = 0.0                        # cuándo llegó ``_last_pos`` (monotónico)
+        self._chain: Optional[_Chain] = None
+        # mpv puede tener algo tras la pista actual (se encadenó y aún no se
+        # cargó otra con ``replace`` ni se paró): al acabar fuera de lo previsto,
+        # hay que pararlo para que no suene por su cuenta.
+        self._mpv_extra = False
+        # La pista actual llegó encadenada y aún no ha abierto.
+        self._from_chain = False
+        self._token_seq = 0                       # fichas de carga, también las encadenadas
         self.state = STOPPED
         self.shuffle = False
         self.repeat = REPEAT_OFF
@@ -147,6 +192,12 @@ class PlaybackController(QObject):
         self._prefetch_timer = QTimer(self)
         self._prefetch_timer.setSingleShot(True)
         self._prefetch_timer.timeout.connect(self._plan_prefetch)
+
+        # Fundido: mientras dura se recalcula a menudo (la posición de mpv
+        # llega cada cuarto de segundo, que daría escalones audibles).
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(FADE_TICK_MS)
+        self._fade_timer.timeout.connect(self._update_fade)
 
         # Reintento de carga de la MISMA URL (403 pasajero tras resolver).
         self._loaded_ok = False
@@ -221,7 +272,9 @@ class PlaybackController(QObject):
         self.repeat = repeat if repeat in (REPEAT_OFF, REPEAT_ALL, REPEAT_ONE) else REPEAT_OFF
         track = self.current_track()
         self._duration = float(track.duration_s or 0)
-        position = float(position) if position == position else 0.0    # NaN
+        position = float(position)
+        if not math.isfinite(position):
+            position = 0.0                  # NaN o infinito (con duración desconocida no lo para nada más)
         if position < 0 or (self._duration > 0 and position >= self._duration):
             position = 0.0
         self._last_pos = position
@@ -253,26 +306,40 @@ class PlaybackController(QObject):
 
     def enqueue(self, track: Track) -> None:
         """Añade una pista al final de la cola."""
-        self._insert(track, len(self._order), next_up=False)
+        self.enqueue_many([track])
 
     def play_next(self, track: Track) -> None:
         """Inserta una pista justo después de la actual."""
-        self._insert(track, self._pos + 1 if self._pos >= 0 else 0, next_up=True)
+        self.play_next_many([track])
 
-    def _insert(self, track: Track, at: int, next_up: bool) -> None:
-        if self.current_track() is None:
-            self.play_tracks([track], 0)
+    def enqueue_many(self, tracks: list[Track]) -> None:
+        """Añade las pistas al final de la cola, en su orden."""
+        self._insert(tracks, len(self._order), next_up=False)
+
+    def play_next_many(self, tracks: list[Track]) -> None:
+        """Inserta las pistas, en su orden, justo después de la actual."""
+        self._insert(tracks, self._pos + 1 if self._pos >= 0 else 0, next_up=True)
+
+    def _insert(self, tracks: list[Track], at: int, next_up: bool) -> None:
+        tracks = list(tracks)
+        if not tracks:
             return
-        self._queue.append(track)
-        index = len(self._queue) - 1
-        self._order.insert(max(0, min(at, len(self._order))), index)
+        if self.current_track() is None:
+            self.play_tracks(tracks, 0)
+            return
+        first = len(self._queue)
+        self._queue.extend(tracks)
+        indexes = list(range(first, len(self._queue)))
+        at = max(0, min(at, len(self._order)))
+        self._order[at:at] = indexes
         # En el orden lógico, «a continuación» va tras la que suena y «a la
         # cola», al final: al quitar el aleatorio cada una sigue en su sitio.
         if next_up:
             current = self._order[self._pos]
-            self._base.insert(self._base.index(current) + 1, index)
+            after = self._base.index(current) + 1
+            self._base[after:after] = indexes
         else:
-            self._base.append(index)
+            self._base.extend(indexes)
         self._replan_prefetch()           # puede haber cambiado la "siguiente"
         self.queue_changed.emit()
 
@@ -281,6 +348,100 @@ class PlaybackController(QObject):
         if 0 <= order_pos < len(self._order):
             self._reset_failures()
             self._goto(order_pos)
+
+    # -- edición de la cola -------------------------------------------------
+    # Las posiciones son las del orden en que suena (las filas de la vista
+    # "Cola"). Ninguna de estas operaciones corta ni recarga lo que suena.
+    def remove_from_queue(self, order_pos: int) -> bool:
+        """Quita una pista de la cola. La que suena no se quita (devuelve
+        False): para dejar de oírla basta con pasar a la siguiente."""
+        if not (0 <= order_pos < len(self._order)) or order_pos == self._pos:
+            return False
+        index = self._order.pop(order_pos)
+        if order_pos < self._pos:
+            self._pos -= 1
+        self._base.remove(index)
+        del self._queue[index]
+        # Los índices a ``_queue`` que había detrás del quitado bajan uno.
+        self._order = [i - 1 if i > index else i for i in self._order]
+        self._base = [i - 1 if i > index else i for i in self._base]
+        self._replan_prefetch()           # puede haber cambiado la "siguiente"
+        self.queue_changed.emit()
+        return True
+
+    def move_in_queue(self, from_order_pos: int, to_order_pos: int) -> bool:
+        """Lleva la pista de ``from_order_pos`` a ``to_order_pos`` (su
+        posición final). La que suena puede moverse y sigue sonando."""
+        n = len(self._order)
+        if not (0 <= from_order_pos < n and 0 <= to_order_pos < n):
+            return False
+        if from_order_pos == to_order_pos:
+            return True
+        pos = self._pos
+        if pos == from_order_pos:
+            pos = to_order_pos
+        elif from_order_pos < pos <= to_order_pos:
+            pos -= 1
+        elif to_order_pos <= pos < from_order_pos:
+            pos += 1
+        index = self._order.pop(from_order_pos)
+        self._order.insert(to_order_pos, index)
+        self._pos = pos
+        if not self.shuffle:
+            # Sin aleatorio el orden lógico es el que suena. Con él, el lógico
+            # no se toca: al quitarlo cada pista vuelve al sitio de la lista.
+            self._base = list(self._order)
+        self._replan_prefetch()
+        self.queue_changed.emit()
+        return True
+
+    def clear_queue(self) -> None:
+        """Vacía la cola salvo la pista que suena, que sigue sonando."""
+        track = self.current_track()
+        if track is None:
+            self._queue, self._order, self._base, self._pos = [], [], [], -1
+        else:
+            self._queue, self._order, self._base, self._pos = [track], [0], [0], 0
+        # Una radio pedida para la cola anterior ya no debe rellenar esta.
+        self._radio_token += 1
+        self._radio_pending = False
+        self._replan_prefetch()
+        self.queue_changed.emit()
+
+    @property
+    def stop_after_current(self) -> bool:
+        return self._stop_after_current
+
+    @stop_after_current.setter
+    def stop_after_current(self, enabled: bool) -> None:
+        # El temporizador lo cambia en marcha: lo encadenado ya no debe sonar.
+        self._stop_after_current = bool(enabled)
+        self._sync_chain()
+
+    def set_transition(self, mode: str) -> None:
+        """"gapless", "crossfade" u "off". Se aplica ya: lo encadenado se
+        quita o se pone, y un fundido a medias se deshace."""
+        if mode not in TRANSITIONS:
+            return
+        self.transition = mode
+        self.db.set_setting(TRANSITION_KEY, mode)
+        if mode != TRANSITION_CROSSFADE:
+            self._fade_in = False
+        self._sync_chain()
+        self._update_fade()
+
+    def set_crossfade_seconds(self, seconds: int) -> None:
+        self.crossfade_s = self._clamp_crossfade(seconds)
+        self.db.set_setting(CROSSFADE_KEY, self.crossfade_s)
+        self._update_fade()
+
+    @staticmethod
+    def _clamp_crossfade(seconds) -> int:
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            return CROSSFADE_DEFAULT_S
+        return max(CROSSFADE_MIN_S, min(CROSSFADE_MAX_S, seconds))
 
     def set_autoplay(self, enabled: bool) -> None:
         self.autoplay = bool(enabled)
@@ -401,7 +562,9 @@ class PlaybackController(QObject):
             self._pre_job.cancel.set()
             self._pre_job = None
         self._entry_id = None
-        self.mpv.stop()
+        self._fade_in = False
+        self._forget_chain()              # y el volumen vuelve a ser el elegido
+        self.mpv.stop()                   # también vacía la lista de mpv
         self._set_state(STOPPED)
 
     # -- orden de la cola ---------------------------------------------------
@@ -489,6 +652,7 @@ class PlaybackController(QObject):
         if state != self.state:
             self.state = state
             self.state_changed.emit(state)
+            self._update_fade()           # en pausa el fundido se queda donde iba
 
     def _goto(self, pos: int, start_at: float = 0.0, debounce: bool = False) -> None:
         self._pos = pos
@@ -508,6 +672,10 @@ class PlaybackController(QObject):
         self._duration = float(track.duration_s or 0)
         self._current_res = None
         self._clicked_at = time.monotonic()
+        # Un salto (siguiente, anterior, otra fila…) descarta lo encadenado:
+        # ``stop`` vacía la lista de mpv y lo que se pida irá con ``replace``.
+        self._fade_in = False             # antes de olvidar lo encadenado: así vuelve el volumen entero
+        self._forget_chain()
         self.mpv.stop()
         self._set_state(LOADING)
         self.current_changed.emit(track)
@@ -537,19 +705,26 @@ class PlaybackController(QObject):
 
     def _play_local(self, track: Track) -> None:
         """Archivo del disco: directo a mpv, sin ExtractorManager ni red."""
-        path = self._local_path(track.video_id)
-        if not path:
+        res = self._local_result(track)
+        if res is None:
             self._handle_failure(ResolveResult(
                 video_id=track.video_id, kind=ErrorKind.UNAVAILABLE,
                 message=tr("El archivo ya no está en el disco."),
             ))
             return
+        self._play_result(res)
+
+    def _local_result(self, track: Track) -> Optional[ResolveResult]:
+        """La "URL" de un archivo del disco (``None`` si ya no está): no caduca."""
+        path = self._local_path(track.video_id)
+        if not path:
+            return None
         now = time.time()
-        self._play_result(ResolveResult(
+        return ResolveResult(
             video_id=track.video_id, url=local_media.file_uri(path), format_desc=tr("archivo local"),
             duration_s=float(track.duration_s) if track.duration_s else None,
             resolved_at=now, expire_ts=now + 365 * 86400, ready=True,
-        ))
+        )
 
     # -- trabajos de resolución --------------------------------------------
     @staticmethod
@@ -628,6 +803,9 @@ class PlaybackController(QObject):
         self._plan_prefetch()
 
     def _plan_prefetch(self) -> None:
+        # Cada vez que algo pudo cambiar la "siguiente" (la URL llegó, la cola
+        # se editó, cambió un modo) se revisa también lo encadenado en mpv.
+        self._sync_chain()
         if self.state not in (PLAYING, PAUSED) or self._running(self._pre_job):
             return   # de una en una, y solo cuando la pista actual ya suena
         now = time.time()
@@ -644,6 +822,164 @@ class PlaybackController(QObject):
             self._prefetch_tried[vid] = now
             self._pre_job = self._launch(vid, "prefetch")
             return
+
+    # -- sin pausas: la siguiente, encadenada en mpv ----------------------------
+    def _new_token(self) -> int:
+        self._token_seq += 1
+        return self._token_seq
+
+    def _chain_target(self) -> Optional[tuple[Track, ResolveResult]]:
+        """Lo que debería estar encadenado tras la que suena, o ``None``.
+
+        Solo con la actual ya sonando, y solo si la URL de la siguiente está a
+        mano (no se resuelve nada para esto). Con «repetir una» se encadena la
+        misma pista: vuelve a empezar sin hueco y sin otra resolución."""
+        if (self.transition == TRANSITION_OFF or self._stop_after_current or not self._loaded_ok
+                or self.state not in (PLAYING, PAUSED) or getattr(self.mpv, "append", None) is None):
+            return None
+        pos = self._next_pos(auto=True)          # la que vendría al acabar (repetir incluido)
+        if pos is None:
+            return None
+        track = self._queue[self._order[pos]]
+        if pos == self._pos:
+            res = self._current_res
+        elif local_media.is_local(track.video_id):
+            res = self._local_result(track)      # un archivo del disco no caduca
+        else:
+            res = self._cached(track.video_id)
+        if res is None or not res.ok or not res.is_fresh():
+            return None
+        return track, res
+
+    def _sync_chain(self) -> None:
+        """Deja encadenado en mpv lo que toca ahora: nada, lo mismo u otra."""
+        target = self._chain_target()
+        chain = self._chain
+        if chain is not None:
+            if target is not None and chain.video_id == target[0].video_id and chain.res.url == target[1].url:
+                return
+            # Ya no es la siguiente (cola editada, otro modo, «parar tras esta»).
+            self._chain = None
+            self.mpv.playlist_clear()             # la que suena se queda
+        if target is None:
+            return
+        track, res = target
+        self._chain = _Chain(video_id=track.video_id, token=self._new_token(), res=res)
+        self._mpv_extra = True
+        self.mpv.append(res.url, res.user_agent, self._chain.token)
+        log.debug("encadenada %s tras la actual", track.video_id)
+
+    def _forget_chain(self) -> None:
+        """Lo encadenado ya no está en mpv (``stop``, ``replace``, relanzado)."""
+        self._chain = None
+        self._mpv_extra = False
+        self._update_fade()               # sin siguiente, nada que fundir al final
+
+    # -- fundido entre canciones ------------------------------------------------
+    def _fade_length(self) -> float:
+        """Segundos del fundido; en una pista corta, como mucho un tercio de ella."""
+        seconds = float(self.crossfade_s)
+        return min(seconds, self._duration / 3) if self._duration > 0 else seconds
+
+    def _position_now(self) -> float:
+        """La posición estimada entre dos avisos de mpv (llegan cada 0,25 s)."""
+        if self.state != PLAYING or self._entry_id is None or not self._pos_at:
+            return self._last_pos
+        return self._last_pos + min(0.5, time.monotonic() - self._pos_at)
+
+    def fade_level(self) -> float:
+        """1 = volumen elegido; menos, mientras una pista entra o sale con fundido."""
+        if self.transition != TRANSITION_CROSSFADE or self.state == STOPPED:
+            return 1.0
+        if self._entry_id is None:
+            # Entre el final de una y el principio de la siguiente: en silencio
+            # si la que viene entra con fundido.
+            return 0.0 if self._fade_in else 1.0
+        length = self._fade_length()
+        if length <= 0:
+            return 1.0
+        pos = self._position_now()
+        level = 1.0
+        if self._fade_in:
+            if pos >= length:
+                self._fade_in = False
+            else:
+                level = min(level, pos / length)
+        chain = self._chain
+        if chain is not None and chain.acked and self._duration > 0:
+            # Solo baja si de verdad viene otra: al final de la cola acaba entera.
+            level = min(level, (self._duration - pos) / length)
+        return max(0.0, min(1.0, level))
+
+    def _update_fade(self) -> None:
+        if not hasattr(self, "_fade_timer"):
+            return                        # aún en ``__init__``
+        level = self.fade_level()
+        set_fade = getattr(self.mpv, "set_fade", None)
+        if set_fade is not None:
+            set_fade(level)
+        near_end = (self._chain is not None and self._duration > 0
+                    and self._duration - self._last_pos <= self._fade_length() + 1.0)
+        busy = (self.transition == TRANSITION_CROSSFADE and self.state == PLAYING
+                and (self._fade_in or near_end))
+        if busy and not self._fade_timer.isActive():
+            self._fade_timer.start()
+        elif not busy and self._fade_timer.isActive():
+            self._fade_timer.stop()
+
+    def _release_mpv_extra(self) -> None:
+        """Para mpv si pudo quedarse con algo encadenado que ya no toca: al
+        acabar una pista empieza solo con lo siguiente de su lista."""
+        self._chain = None
+        if self._mpv_extra:
+            self._mpv_extra = False
+            self.mpv.stop()
+
+    def _adopt_chain(self) -> bool:
+        """La actual acabó y mpv ya empezó la encadenada: la cola avanza con
+        ella sin pararse ni recargar. ``False`` si no hay nada que adoptar (o
+        ya no es la que toca) y hay que seguir como siempre."""
+        chain = self._chain
+        if chain is None or not chain.acked or self._stop_after_current:
+            return False
+        pos = self._next_pos(auto=True)
+        if pos is None:
+            return False
+        track = self._queue[self._order[pos]]
+        if track.video_id != chain.video_id or not chain.res.is_fresh():
+            return False
+        self._chain = None
+        self._mpv_extra = False                   # lo encadenado es ahora lo que suena
+        self._pos = pos
+        self._gen += 1
+        self._debounce.stop()
+        self._load_retry.stop()
+        self._prefetch_timer.stop()
+        self._reresolves = 0
+        self._load_retries = 0
+        self._healthy_s = 0.0
+        # Sus eventos llegan con la ficha y la entrada que mpv dio al encadenarla.
+        self._entry_id = None
+        self._awaiting_start = True
+        self._load_token = chain.token
+        self._load_acked = True
+        self._expected_entry = chain.entry_id
+        self._loaded_ok = False
+        self._from_chain = True
+        self._pending_seek = 0.0
+        self._resume_paused = False               # acabó sonando: la siguiente sigue sonando
+        self._last_pos = 0.0
+        self._duration = float(track.duration_s or chain.res.duration_s or 0)
+        self._current_res = chain.res
+        self._clicked_at = 0.0
+        # Con fundido, la nueva empieza en silencio y sube en sus primeros segundos.
+        self._fade_in = self.transition == TRANSITION_CROSSFADE
+        self._update_fade()
+        self.mpv.set_media_title(f"{track.title} — {track.artists}" if track.artists else track.title)
+        log.info("%s sigue sin pausa a la anterior", track.video_id)
+        self.current_changed.emit(track)
+        self.position_changed.emit(0.0, self._duration)
+        return True
 
     def _play_result(self, res: ResolveResult) -> None:
         self._current_res = res
@@ -674,9 +1010,12 @@ class PlaybackController(QObject):
     def _send_load(self, res: ResolveResult) -> None:
         self._load_retry.stop()
         self._loaded_ok = False
+        self._from_chain = False
         self._entry_id = None
         self._awaiting_start = True
-        self._load_token += 1
+        self._fade_in = False             # una carga nueva suena entera desde el principio
+        self._forget_chain()              # ``replace`` vacía la lista de mpv (y deja el volumen entero)
+        self._load_token = self._new_token()
         self._load_acked = False
         self._expected_entry = None
         track = self.current_track()
@@ -761,6 +1100,7 @@ class PlaybackController(QObject):
         self._prefetch_timer.stop()
         self._cancel_job()
         self._entry_id = None
+        self._release_mpv_extra()         # nada encadenado debe sonar con la cola en pausa
         self._set_state(STOPPED)
         self.notice.emit(
             tr("Varias pistas seguidas fallaron: puede ser un bloqueo temporal. La cola quedó en pausa.")
@@ -800,6 +1140,15 @@ class PlaybackController(QObject):
 
     # -- eventos de mpv -----------------------------------------------------
     def _on_load_acked(self, token: int, entry_id: int, accepted: bool) -> None:
+        chain = self._chain
+        if chain is not None and token == chain.token:
+            if accepted:
+                chain.acked = True
+                chain.entry_id = entry_id or None
+            else:
+                log.info("mpv no aceptó encadenar %s: sonará como siempre", chain.video_id)
+                self._chain = None
+            return
         if token != self._load_token or not self._awaiting_start:
             return  # respuesta a una carga que ya no interesa
         if not accepted:
@@ -823,6 +1172,7 @@ class PlaybackController(QObject):
         if self._entry_id is None:
             return
         self._loaded_ok = True
+        self._from_chain = False
         if self._pending_seek > 1.0:
             self.mpv.seek(self._pending_seek)
         self._pending_seek = 0.0
@@ -848,6 +1198,24 @@ class PlaybackController(QObject):
             reason == "eof" and duration > 0 and last < duration - config.PREMATURE_EOF_MARGIN_S
         )
         res = self._current_res
+        if reason == "error" and self._from_chain and not self._loaded_ok:
+            # Lo encadenado no abrió (URL caducada, red): en vez de reintentar
+            # esa misma URL, se resuelve de nuevo y se carga con ``replace``.
+            log.info("la pista encadenada %s no abrió (%s): se resuelve de nuevo",
+                     res.video_id if res else "?", file_error)
+            self._release_mpv_extra()
+            self._recover_stream(file_error or "error")
+            return
+        if reason != "error" and not premature:
+            if self._loaded_ok:
+                # Sonó entera aunque durase menos que HEALTHY_PLAY_S (una intro,
+                # un interludio): la racha de fallos ya no es seguida.
+                self._reset_failures()
+            if self._adopt_chain():
+                return                    # mpv ya está con la siguiente, sin hueco
+        # Fuera de lo previsto, lo que mpv tenga encadenado no debe sonar solo
+        # mientras se recupera esta pista o se decide qué viene.
+        self._release_mpv_extra()
         delays = config.LOAD_RETRY_DELAYS_MS
         if (
             reason == "error"
@@ -868,10 +1236,6 @@ class PlaybackController(QObject):
         if reason == "error" or premature:
             self._recover_stream(file_error or (tr("fin prematuro") if premature else "error"))
         else:
-            if self._loaded_ok:
-                # Sonó entera aunque durase menos que HEALTHY_PLAY_S (una intro,
-                # un interludio): la racha de fallos ya no es seguida.
-                self._reset_failures()
             self._advance_auto()
 
     def _recover_stream(self, detail: str) -> None:
@@ -904,6 +1268,7 @@ class PlaybackController(QObject):
             return
         step = pos - self._last_pos
         self._last_pos = pos
+        self._pos_at = time.monotonic()
         if 0.0 < step < config.HEALTHY_PLAY_MAX_STEP_S:   # avance normal, no un salto
             self._healthy_s += step
             if self._consecutive_failures and self._healthy_s >= config.HEALTHY_PLAY_S:
@@ -911,6 +1276,8 @@ class PlaybackController(QObject):
                          self._consecutive_failures)
                 self._reset_failures()
         self.position_changed.emit(pos, self._duration)
+        if self.transition == TRANSITION_CROSSFADE:
+            self._update_fade()           # p. ej. empieza a bajar al acercarse el final
 
     def _on_duration(self, duration: float) -> None:
         if self._entry_id is not None and duration > 0:
@@ -923,6 +1290,7 @@ class PlaybackController(QObject):
 
     # -- recuperación de mpv ------------------------------------------------
     def _on_mpv_ready(self) -> None:
+        self._forget_chain()              # un mpv recién lanzado no tiene nada encadenado
         track = self.current_track()
         if track is None or self.state == STOPPED:
             return
@@ -940,5 +1308,6 @@ class PlaybackController(QObject):
 
     def _on_mpv_gave_up(self, message: str) -> None:
         self._entry_id = None
+        self._forget_chain()
         self._set_state(STOPPED)
         self.notice.emit(message)

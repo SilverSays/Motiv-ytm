@@ -221,6 +221,15 @@ class Database:
         # ":memory:" es por conexión; para tests se comparte una sola conexión.
         self._shared: Optional[sqlite3.Connection] = None
         self._shared_lock = threading.RLock()
+        # Las conexiones abiertas (una por hilo), para cerrarlas al salir. Al
+        # cerrar sube la generación: un hilo que vuelva a usar la base abre otra.
+        self._conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
+        self._generation = 0
+        # Lo que SQLite aceptó al pedir WAL ("wal" salvo en un disco que no lo
+        # admite o en memoria): sin WAL, la GUI espera a que el hilo de
+        # sincronización acabe de escribir.
+        self.journal_mode = "memory" if self._path == ":memory:" else ""
         if self._path == ":memory:":
             self._shared = self._open()
         with self._tx() as c:
@@ -236,7 +245,14 @@ class Database:
         try:
             conn.row_factory = sqlite3.Row
             if self._path != ":memory:":
-                conn.execute("PRAGMA journal_mode=WAL")
+                # WAL + synchronous=NORMAL: un cierre brusco del proceso no
+                # pierde nada; un apagón puede llevarse las últimas escrituras
+                # (nunca corrompe la base). ``close`` las vuelca al salir.
+                mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+                if mode != "wal" and mode != self.journal_mode:
+                    log.warning("SQLite no aceptó el modo WAL (sigue en «%s»): las lecturas "
+                                "esperarán a las escrituras de otros hilos", mode)
+                self.journal_mode = mode
                 conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=15000")
         except BaseException:
@@ -249,9 +265,12 @@ class Database:
         if self._shared is not None:
             return self._shared
         conn = getattr(self._local, "conn", None)
-        if conn is None:
+        if conn is None or getattr(self._local, "generation", -1) != self._generation:
             conn = self._open()
             self._local.conn = conn
+            self._local.generation = self._generation
+            with self._conns_lock:
+                self._conns.append(conn)
         return conn
 
     def _tx(self) -> "_Tx":
@@ -264,8 +283,43 @@ class Database:
     def close_thread_connection(self) -> None:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
+            with self._conns_lock:
+                if conn in self._conns:
+                    self._conns.remove(conn)
             conn.close()
             self._local.conn = None
+
+    def close(self) -> None:
+        """Al salir de la app: cierra las conexiones y vuelca el WAL al archivo
+        principal (``wal_checkpoint(TRUNCATE)``), para que ni un apagón justo
+        después se lleve lo último guardado. Se puede llamar más de una vez; si
+        algo vuelve a usar la base después, abre una conexión nueva."""
+        if self._shared is not None:
+            return                        # en memoria (pruebas): cerrarla la borraría
+        if not self._shared_lock.acquire(timeout=self.LOCK_TIMEOUT_S):
+            log.warning("no se cerró la base: otra operación la tiene ocupada")
+            return
+        try:
+            with self._conns_lock:
+                conns, self._conns = self._conns, []
+                self._generation += 1
+            for conn in conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    log.debug("conexión ya cerrada", exc_info=True)
+            self._local.conn = None
+            last = sqlite3.connect(self._path, timeout=15)
+            try:
+                busy, _frames, _done = last.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if busy:
+                    log.info("el volcado del WAL al cerrar no fue completo (base ocupada)")
+            finally:
+                last.close()
+        except sqlite3.Error:
+            log.warning("no se pudo volcar la base al cerrar", exc_info=True)
+        finally:
+            self._shared_lock.release()
 
     # -- settings -----------------------------------------------------------
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -486,16 +540,24 @@ class Database:
             c.execute(
                 "INSERT INTO playlists (playlist_id, title, position, last_full_sync, description, "
                 "author, year, thumb_url) VALUES (?, ?, ?, ?, '', '', '', '')",
-                (playlist_id, title.strip() or "Lista sin nombre", first + 1, now),
+                (playlist_id, title.strip() or tr("Lista sin nombre"), first + 1, now),
             )
             # La lista y sus canciones, juntas o nada: un fallo a mitad no
             # deja una lista a medio llenar.
             self._append_tracks(c, playlist_id, tracks)
         return playlist_id
 
-    def rename_playlist(self, playlist_id: str, title: str) -> None:
+    def rename_playlist(self, playlist_id: str, title: str) -> bool:
+        """Cambia el nombre de una lista local (un nombre en blanco queda como
+        «Lista sin nombre», igual que al crearla). ``False`` si la lista no es
+        local (la sincronización le devolvería el de la cuenta) o no existe."""
+        if not is_local_playlist(playlist_id):
+            return False
         with self._tx() as c:
-            c.execute("UPDATE playlists SET title=? WHERE playlist_id=?", (title.strip(), playlist_id))
+            return c.execute(
+                "UPDATE playlists SET title=? WHERE playlist_id=?",
+                (title.strip() or tr("Lista sin nombre"), playlist_id),
+            ).rowcount == 1
 
     def delete_local_playlist(self, playlist_id: str) -> bool:
         if not is_local_playlist(playlist_id):
@@ -545,25 +607,59 @@ class Database:
         return len(fresh)
 
     def remove_from_local_playlist(self, playlist_id: str, video_id: str) -> bool:
+        return self.remove_tracks_from_local_playlist(playlist_id, [video_id]) == 1
+
+    def remove_tracks_from_local_playlist(self, playlist_id: str, video_ids: Iterable[str]) -> int:
+        """Quita esas pistas de la lista y la renumera, todo en una sola
+        transacción. Devuelve cuántas quitó (0 si la lista no es local)."""
+        if not is_local_playlist(playlist_id):
+            return 0
+        gone = set(video_ids)
+        with self._tx() as c:
+            rows = self._entries(c, playlist_id)
+            kept = [row for row in rows if row[0] not in gone]
+            if len(kept) == len(rows):
+                return 0
+            self._rewrite_entries(c, playlist_id, kept)
+        return len(rows) - len(kept)
+
+    def move_in_local_playlist(self, playlist_id: str, from_pos: int, to_pos: int) -> bool:
+        """Lleva la pista de ``from_pos`` a ``to_pos`` (su posición final) en
+        una lista local. Las de la cuenta no se reordenan aquí: su orden es
+        el de YouTube Music y la próxima sincronización lo impondría."""
         if not is_local_playlist(playlist_id):
             return False
         with self._tx() as c:
-            rows = [
-                r["video_id"]
-                for r in c.execute(
-                    "SELECT video_id FROM playlist_tracks WHERE playlist_id=? ORDER BY position",
-                    (playlist_id,),
-                ).fetchall()
-            ]
-            if video_id not in rows:
+            rows = self._entries(c, playlist_id)
+            if not (0 <= from_pos < len(rows) and 0 <= to_pos < len(rows)):
                 return False
-            rows.remove(video_id)
-            c.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
-            c.executemany(
-                "INSERT INTO playlist_tracks (playlist_id, position, video_id) VALUES (?, ?, ?)",
-                [(playlist_id, i, vid) for i, vid in enumerate(rows)],
-            )
+            if from_pos == to_pos:
+                return True
+            rows.insert(to_pos, rows.pop(from_pos))
+            self._rewrite_entries(c, playlist_id, rows)
         return True
+
+    @staticmethod
+    def _entries(c: sqlite3.Connection, playlist_id: str) -> list[tuple[str, Optional[str]]]:
+        return [
+            (r["video_id"], r["set_video_id"])
+            for r in c.execute(
+                "SELECT video_id, set_video_id FROM playlist_tracks WHERE playlist_id=? ORDER BY position",
+                (playlist_id,),
+            ).fetchall()
+        ]
+
+    @staticmethod
+    def _rewrite_entries(c: sqlite3.Connection, playlist_id: str,
+                         rows: list[tuple[str, Optional[str]]]) -> None:
+        """Numera de nuevo la lista desde 0. Se borra y se vuelve a insertar
+        (dentro de la transacción de quien llama): actualizar en el sitio
+        chocaría con la clave ``(playlist_id, position)`` a mitad de camino."""
+        c.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
+        c.executemany(
+            "INSERT INTO playlist_tracks (playlist_id, position, video_id, set_video_id) VALUES (?, ?, ?, ?)",
+            [(playlist_id, i, video_id, set_video_id) for i, (video_id, set_video_id) in enumerate(rows)],
+        )
 
     def playlist_cover(self, playlist: Playlist) -> str:
         """Carátula de la lista; una local toma la de su primera canción."""
@@ -811,12 +907,26 @@ class Database:
             return c.execute("SELECT COUNT(*) AS n FROM local_files").fetchone()["n"]
 
     # -- historial de escucha ----------------------------------------------
-    def log_play(self, video_id: str, now: Optional[float] = None) -> None:
+    def log_play(self, track: "Track | str", now: Optional[float] = None) -> bool:
+        """Anota una escucha. Con la pista (``Track``) la registra o completa y
+        anota la escucha en la misma transacción: el historial y sus cuentas
+        no pueden quedar a medias. Con solo el id, la pista ya debe estar en
+        ``tracks``; si no está no se anota nada (``False``): una escucha sin su
+        pista contaría en ``play_stats`` sin verse en el historial."""
         with self._tx() as c:
+            if isinstance(track, Track):
+                c.execute(_UPSERT_TRACK_SQL, _track_params(track))
+                video_id = track.video_id
+            else:
+                video_id = track
+                if c.execute("SELECT 1 FROM tracks WHERE video_id=?", (video_id,)).fetchone() is None:
+                    log.warning("escucha de %s sin la pista en la base: no se anota", video_id)
+                    return False
             c.execute(
                 "INSERT INTO plays (video_id, played_at) VALUES (?, ?)",
                 (video_id, time.time() if now is None else now),
             )
+        return True
 
     def play_stats(self, since: float = 0.0) -> tuple[int, int]:
         """(escuchas, canciones distintas) desde ``since``."""
@@ -946,11 +1056,17 @@ class _Tx:
     El candado solo se toma cuando ya hay conexión: si abrirla falla (archivo
     bloqueado por el antivirus o por OneDrive), la excepción sale sin dejar el
     candado tomado y el resto de hilos siguen pudiendo usar la base.
+
+    Anidable: solo la transacción de fuera hace commit o rollback. Una de
+    dentro (un método de ``Database`` que llama a otro dentro de su ``with``)
+    es un SAVEPOINT de la de fuera: si falla, se deshace solo lo suyo, y lo
+    que confirma no queda guardado hasta que la de fuera termina bien.
     """
 
     def __init__(self, db: Database):
         self._db = db
         self._conn: Optional[sqlite3.Connection] = None
+        self._savepoint = ""
 
     def __enter__(self) -> sqlite3.Connection:
         conn = self._db.conn
@@ -958,14 +1074,42 @@ class _Tx:
             raise DatabaseLockTimeout(
                 tr("La base de datos lleva más de {LOCK_TIMEOUT_S:g} s ocupada por otra operación", LOCK_TIMEOUT_S=self._db.LOCK_TIMEOUT_S)
             )
+        local = self._db._local
+        depth = getattr(local, "tx_depth", 0)
+        if depth:
+            try:
+                # Sin BEGIN explícito, un SAVEPOINT fuera de transacción abriría
+                # una propia y su RELEASE confirmaría ya lo de dentro.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")
+                self._savepoint = f"ytmn_tx_{depth}"
+                conn.execute(f"SAVEPOINT {self._savepoint}")
+            except BaseException:
+                self._savepoint = ""
+                self._db._shared_lock.release()
+                raise
+        local.tx_depth = depth + 1
         self._conn = conn
         return conn
 
     def __exit__(self, exc_type, exc, tb) -> None:
         conn = self._conn
         self._conn = None
+        savepoint, self._savepoint = self._savepoint, ""
+        self._db._local.tx_depth = max(0, getattr(self._db._local, "tx_depth", 1) - 1)
         try:
-            if exc_type is None:
+            if savepoint:
+                if exc_type is None:
+                    conn.execute(f"RELEASE {savepoint}")
+                else:
+                    try:
+                        conn.execute(f"ROLLBACK TO {savepoint}")
+                        conn.execute(f"RELEASE {savepoint}")
+                    except sqlite3.Error:
+                        # Sin tapar la excepción: la transacción de fuera la
+                        # verá y lo deshará todo.
+                        log.warning("No se pudo deshacer el SAVEPOINT %s", savepoint, exc_info=True)
+            elif exc_type is None:
                 try:
                     conn.commit()
                 except BaseException:

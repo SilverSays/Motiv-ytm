@@ -107,10 +107,15 @@ def test_la_caratula_la_elige_quien_crea_los_controles(env):
     assert made[0].tracks[0][3] == "art://v0/300" and controls.active
 
 
-def test_la_posicion_se_manda_de_vez_en_cuando_y_al_saltar(env, controls, monkeypatch):
+def test_la_posicion_se_manda_de_vez_en_cuando_y_al_saltar(env):
+    # Un reloj propio de los controles: congelar time.monotonic para todo el
+    # proceso pararía también las esperas de las pruebas (y colgaría la batería).
     clock = [1000.0]
-    monkeypatch.setattr(media_controls.time, "monotonic", lambda: clock[0])
-    session = controls.session
+    made = []
+    controls = MediaControls(env.player, session_factory=lambda *a: made.append(FakeSession(*a)) or made[-1],
+                             clock=lambda: clock[0])
+    session = made[0]
+    assert controls.active
     start_playing(env)
     sent = len(session.timelines)
     for second in range(1, 5):               # suena con normalidad: nada nuevo que contar

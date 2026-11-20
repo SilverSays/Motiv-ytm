@@ -320,7 +320,7 @@ def test_mpv_real_acepta_los_filtros_y_sigue_sonando(qapp, caplog):
                 assert wait_until(qapp, lambda: positions[-1] > before + 0.5, timeout=10)
             assert not [r for r in caplog.records if "filtro" in r.getMessage()]
             # Un filtro que no existe sí se rechaza (y la comprobación no es de adorno).
-            player._audio_filter = "filtro_que_no_existe"
+            player._normalization_filter = "filtro_que_no_existe"
             player._apply_audio_filter()
             assert wait_until(qapp, lambda: player._filter_request == -1, timeout=10)
         assert any("rechazó el filtro" in r.getMessage() for r in caplog.records)

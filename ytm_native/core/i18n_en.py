@@ -459,6 +459,44 @@ CATALOG = {
     "Radio al terminar la cola": "Radio when the queue ends",
     "Seguir donde lo dejaste": "Pick up where you left off",
     "Igualar el volumen": "Even out the volume",
+    # -- sonido: salida, ecualizador y transición (Fase 10) -------------------
+    "Dispositivo de salida y ecualizador": "Output device and equalizer",
+    "Dispositivo de audio": "Audio device",
+    "Por dónde suena la música. Si se desconecta, sigue por la predeterminada de Windows.":
+        "Where the music plays. If it disconnects, playback continues on the Windows default.",
+    "Predeterminado de Windows": "Windows default",
+    "{name} (no conectado)": "{name} (not connected)",
+    "Se desconectó «{name}»: la música sigue por la salida predeterminada de Windows.":
+        "“{name}” was disconnected: the music continues on the Windows default output.",
+    "Ecualizador": "Equalizer",
+    "Realza graves, voces o agudos. Se suma a «Igualar el volumen» sin apagarlo.":
+        "Boosts bass, vocals or treble. Works together with “Even out the volume” without turning it off.",
+    "Plano (desactivado)": "Flat (off)",
+    "Realce de graves": "Bass boost",
+    "Voces claras": "Clear vocals",
+    "Rock": "Rock",
+    "Pop": "Pop",
+    "Electrónica": "Electronic",
+    "Acústico": "Acoustic",
+    "Transición entre canciones": "Transition between songs",
+    "Al pasar de una canción a otra": "When moving from one song to the next",
+    "Sin pausas": "Gapless",
+    "Fundido cruzado": "Crossfade",
+    "Normal": "Normal",
+    "La siguiente empieza justo al acabar la anterior, sin silencio: "
+    "los álbumes en directo o mezclados suenan de corrido.":
+        "The next one starts right as the previous one ends, with no silence: "
+        "live or mixed albums play straight through.",
+    "La que acaba baja poco a poco en sus últimos segundos y la siguiente "
+    "entra subiendo igual, sin silencio entre ellas.":
+        "The ending song fades out over its last seconds and the next one fades in the same way, "
+        "with no silence in between.",
+    "Cada canción se carga al terminar la anterior: puede quedar un silencio breve.":
+        "Each song loads when the previous one ends: there may be a short silence.",
+    "Duración del fundido": "Fade length",
+    "{n} segundo": "{n} second",
+    "{n} segundos": "{n} seconds",
+    "Solo con «Fundido cruzado».": "Only with “Crossfade”.",
     "Guardar el historial de escucha": "Keep a listening history",
     "Al cerrar, seguir sonando en la bandeja": "When closing, keep playing in the tray",
     "Al minimizar, ir a la bandeja": "When minimising, go to the tray",
@@ -543,12 +581,32 @@ CATALOG = {
     "«{title}» añadida a «{title2}».": "“{title}” added to “{title2}”.",
     "«{title}» ya estaba en «{title2}».": "“{title}” was already in “{title2}”.",
     "«{title}» quitada de la lista.": "“{title}” removed from the playlist.",
+    "{n} canción añadida a «{title}».": "{n} song added to “{title}”.",
+    "{n} canciones añadidas a «{title}».": "{n} songs added to “{title}”.",
+    "Ya estaban todas en «{title}».": "They were all already in “{title}”.",
+    "¿Quitar {plural} de «{title}»? No se borran de ningún otro sitio.":
+        "Remove {plural} from “{title}”? They aren't deleted from anywhere else.",
+    "{n} canción quitada de la lista.": "{n} song removed from the playlist.",
+    "{n} canciones quitadas de la lista.": "{n} songs removed from the playlist.",
+    "{n} canción añadida a la cola.": "{n} song added to the queue.",
+    "{n} canciones añadidas a la cola.": "{n} songs added to the queue.",
     "Elegir otra carpeta…": "Choose another folder…",
     "Lista local": "Local playlist",
     "Sincronizada {format_ago}": "Synced {format_ago}",
     "Error: {value}": "Error: {value}",
-    "Lo que suena y lo que viene después. Un doble clic salta a esa pista.":
-        "What's playing and what comes next. Double-click to jump to that track.",
+    "Lo que suena y lo que viene después. Un doble clic salta a esa pista; "
+    "arrastra una fila para cambiarla de sitio.":
+        "What's playing and what comes next. Double-click to jump to that track; "
+        "drag a row to move it.",
+    "Filtrar en esta lista…": "Filter this list…",
+    "Filtrar en esta lista": "Filter this list",
+    "Ninguna canción coincide con «{text}».": "No song matches “{text}”.",
+    "Vaciar la cola": "Clear queue",
+    "Quita de la cola todo menos lo que suena": "Removes everything from the queue except what's playing",
+    "Se quitarán {plural} de la cola. Lo que suena sigue sonando.":
+        "{plural} will be removed from the queue. What's playing keeps playing.",
+    "Vaciar": "Clear",
+    "Quitar de la cola": "Remove from queue",
     "La cola está vacía": "The queue is empty",
     "Reproduce una lista o una búsqueda.": "Play a playlist or a search.",
     "Esta lista está vacía": "This playlist is empty",

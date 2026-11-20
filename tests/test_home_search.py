@@ -12,6 +12,7 @@ from ytm_native.ui import motion
 from ytm_native.ui.art import ArtLoader
 from ytm_native.ui.components import SuggestionStrip
 from ytm_native.ui.home import CardGrid, HomePage, SleeveCard
+from ytm_native.ui.views import search_view
 
 
 def wait(ms: int) -> None:
@@ -249,7 +250,7 @@ class FakeNet:
 @pytest.fixture
 def net(monkeypatch):
     fake = FakeNet()
-    monkeypatch.setattr(mw, "search_tracks", fake.search_tracks)
+    monkeypatch.setattr(search_view, "search_tracks", fake.search_tracks)   # la búsqueda vive en su vista
     monkeypatch.setattr(mw.discover, "now_playing_info", fake.now_playing_info)
     monkeypatch.setattr(mw.discover, "search_suggestions", fake.search_suggestions)
     monkeypatch.setattr(mw.discover, "build_recommendations", fake.build_recommendations)

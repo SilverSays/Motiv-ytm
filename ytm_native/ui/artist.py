@@ -32,7 +32,7 @@ from ytm_native.core.db import Track
 from ytm_native.services.discover import ArtistCard, ArtistPage, PlaylistCard
 from .art import ArtLoader, sized_url
 from .components import PillButton
-from .home import CardGrid, SleeveCard
+from .cards import CardGrid, SleeveCard
 from .motion import EASE, FADE_MS, ROW_STAGGER, STAGGER_CAP, Tween
 from .now import SimilarRow
 from ytm_native.core.i18n import tr

@@ -298,3 +298,37 @@ def test_un_fallo_al_guardar_el_punto_se_reintenta(env, keeper, monkeypatch):
     keeper._save_state()                       # el mismo estado se vuelve a escribir
     assert env.db.get_setting(session.STATE_KEY) == failures[0]
     assert keeper._last_state == failures[0]
+
+
+# ---------------------------------------------------------------------------
+# Un estado guardado dañado (OBS-000056)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", [
+    "x", "[]", "null", "42", '"texto"', '{"pos": "a"}', '{"pos": null}', '{"pos": 1e400}',
+    '{"pos": NaN}', '{"position": "mucho"}', '{"position": [1]}',
+])
+def test_un_estado_ilegible_recupera_la_cola_desde_el_principio(env, keeper, raw):
+    env.db.set_setting(session.QUEUE_KEY, encode_queue(env.tracks, list(range(6))))
+    env.db.set_setting(session.STATE_KEY, raw)
+    assert keeper.restore() is True
+    assert env.player.current_track().video_id == "v0"
+    assert env.player.session_state()["position"] == 0
+    assert len(env.player.upcoming()) == 5                     # la cola, entera
+
+
+@pytest.mark.parametrize("position", ["Infinity", "-Infinity", "NaN"])
+@pytest.mark.parametrize("duration", [200, None])
+def test_un_punto_no_finito_empieza_la_pista_aunque_no_se_sepa_su_duracion(env, keeper, position, duration):
+    tracks = [Track(t.video_id, t.title, t.artists, t.album, duration) for t in env.tracks]
+    env.db.set_setting(session.QUEUE_KEY, encode_queue(tracks, list(range(6))))
+    env.db.set_setting(session.STATE_KEY, '{"pos": 2, "video_id": "v2", "position": %s}' % position)
+    assert keeper.restore() is True
+    assert env.player.current_track().video_id == "v2"
+    state = env.player.session_state()
+    assert state["position"] == 0 and state["position"] == state["position"]   # ni NaN ni infinito
+
+
+def test_el_reproductor_tampoco_acepta_un_punto_infinito(env):
+    tracks = [Track("a", "A", "", "", None)]
+    assert env.player.restore(tracks, [0], 0, float("inf")) is True
+    assert env.player.session_state()["position"] == 0

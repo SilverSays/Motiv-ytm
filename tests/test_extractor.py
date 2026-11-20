@@ -3,6 +3,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -42,7 +43,9 @@ class FakeYtdlp:
 
     def __call__(self, args, timeout, should_stop=None):
         if "--version" in args:
-            if args[0].endswith("deno.exe") or "deno" in args[0]:
+            # Por el nombre del binario, no por la ruta entera: la carpeta
+            # temporal de pytest lleva el nombre de la prueba (que puede decir "deno").
+            if Path(args[0]).name.lower().startswith("deno"):
                 return RunResult(0, stdout="deno 2.9.8 (stable)\n")
             text = self.exe.read_text() if self.exe.is_file() else ""
             if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", text):
@@ -414,6 +417,15 @@ def test_deno_status_detects_missing_and_old(env, tmp_path):
     env.mgr._runner = original
 
 
+def test_deno_en_el_nombre_de_la_prueba_no_confunde_al_falso_ytdlp(env, tmp_path):
+    # La carpeta temporal se llama como la prueba (dice "deno"): yt-dlp sigue
+    # siendo yt-dlp para el simulado.
+    assert "deno" in str(env.mgr.ytdlp)
+    assert re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", env.mgr.ytdlp_version())
+    (tmp_path / "bin" / "deno.exe").write_text("")
+    assert env.mgr.deno_status()[1] == "2.9.8"
+
+
 def test_update_drains_running_resolution_then_requeues_it(env, monkeypatch):
     """La actualización espera/mata la resolución en curso y esta se reintenta después."""
     monkeypatch.setattr(config, "UPDATE_DRAIN_TIMEOUT_S", 0.2)
@@ -440,7 +452,7 @@ def test_update_drains_running_resolution_then_requeues_it(env, monkeypatch):
     states = []
     env.mgr.on_state = states.append
     out = {}
-    t = threading.Thread(target=lambda: out.setdefault("res", env.mgr.resolve("slow")))
+    t = threading.Thread(target=lambda: out.setdefault("res", env.mgr.resolve("slow")), daemon=True)
     t.start()
     assert started.wait(5)
     result = env.mgr.update("manual")
@@ -456,13 +468,16 @@ def test_cancel_while_waiting_for_update(env):
     env.mgr._enter_update(0)                            # simula una actualización en curso
     cancel = threading.Event()
     out = {}
-    t = threading.Thread(target=lambda: out.setdefault("res", env.mgr.resolve("abc", cancel)))
-    t.start()
-    time.sleep(0.2)
-    assert t.is_alive() and env.fake.calls == []       # en cola de espera, sin lanzar yt-dlp
-    cancel.set()
-    t.join(5)
-    env.mgr._leave_update()
+    t = threading.Thread(target=lambda: out.setdefault("res", env.mgr.resolve("abc", cancel)), daemon=True)
+    try:
+        t.start()
+        time.sleep(0.2)
+        assert t.is_alive() and env.fake.calls == []   # en cola de espera, sin lanzar yt-dlp
+    finally:
+        # Pase lo que pase, el hilo no se queda esperando para siempre.
+        cancel.set()
+        t.join(5)
+        env.mgr._leave_update()
     assert out["res"].kind is ErrorKind.CANCELLED
 
 
@@ -586,7 +601,7 @@ class BlockingRunner:
 
 def in_thread(fn):
     out = {}
-    thread = threading.Thread(target=lambda: out.setdefault("res", fn()))
+    thread = threading.Thread(target=lambda: out.setdefault("res", fn()), daemon=True)
     thread.start()
     return thread, out
 

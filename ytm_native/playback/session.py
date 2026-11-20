@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from typing import Optional
 
@@ -151,8 +152,11 @@ class SessionKeeper(QObject):
             pos = int(state.get("pos", 0))
             position = float(state.get("position", 0.0))
             video_id = str(state.get("video_id") or "")
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            # Basura, "null", una lista o un número imposible (1e400 no cabe en un int).
             state, pos, position, video_id = {}, 0, 0.0, ""
+        if not math.isfinite(position):
+            position = 0.0                  # json acepta Infinity y NaN
         pos = max(0, min(pos, len(order) - 1))
         if video_id and tracks[order[pos]].video_id != video_id:
             # La cola y el estado no casan (cierre brusco entre una escritura
@@ -207,6 +211,9 @@ class SessionKeeper(QObject):
         elapsed = time.perf_counter() - started
         if elapsed > 0.1:
             log.info("guardar la cola (%d pistas) tardó %.2f s", len(tracks), elapsed)
+        # Quitar o mover filas cambia por qué posición va la que suena sin
+        # cambiar de pista: el punto se escribe a la vez que la cola nueva.
+        self._save_state()
 
     def _state_json(self) -> str:
         return json.dumps(self.player.session_state(), separators=(",", ":"))

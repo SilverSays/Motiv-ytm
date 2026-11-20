@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -50,20 +51,21 @@ from ytm_native.services.lyrics import Lyrics, current_line_index, fetch_lyrics
 from ytm_native.core.db import Database, Track, is_local_playlist
 from ytm_native.playback.extractor import ExtractorManager, ExtractorState, UpdateResult, UpdateStatus
 from ytm_native.playback.history import PlayTracker
-from ytm_native.playback.mpv_ipc import MpvPlayer
+from ytm_native.playback.mpv_ipc import AUTO_DEVICE, EQ_FLAT, EQ_PRESETS, MpvPlayer
 from ytm_native.playback.player import (
-    DEFAULT_VOLUME, LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE, PlaybackController, saved_volume,
+    CROSSFADE_DEFAULT_S, CROSSFADE_KEY, DEFAULT_VOLUME, LOADING, PAUSED, PLAYING, REPEAT_ALL, REPEAT_OFF, REPEAT_ONE,
+    TRANSITION_GAPLESS, TRANSITION_KEY, PlaybackController, saved_volume,
 )
 from ytm_native.playback import history as play_history
 from ytm_native.playback import session as play_session
 from ytm_native.playback.session import SessionKeeper
 from ytm_native.playback.sleep_timer import PRESETS_MIN, TIME, TRACK, SleepTimer
-from ytm_native.services import backup, local_media
+from ytm_native.services import backup
 from ytm_native.services.account_actions import AccountActions, is_local_track
 from ytm_native.services.discord_rpc import DiscordPresence, valid_client_id
 from ytm_native.services.lastfm import LastfmScrobbler
 from ytm_native.services.updater import AppUpdateChecker
-from ytm_native.services.sync import LibrarySync, SyncReport, SyncState, looks_device_bound, search_tracks
+from ytm_native.services.sync import LibrarySync, SyncReport, SyncState, looks_device_bound
 from . import art as art_style
 from . import chrome, focus, theme
 from .art import BAR_ART_PX, ArtLoader, neutral_tint, placeholder_pixmap, sized_url, track_art_url
@@ -80,6 +82,7 @@ from .components import (
     ClickableCover,
     ElidedLabel,
     EmptyState,
+    FilterBox,
     IconButton,
     LyricsPanel,
     PaneButton,
@@ -93,70 +96,54 @@ from .components import (
     TrackTable,
     glyph_pixmap,
 )
-from .home import CardGrid, HomePage
+from .cards import ArtistStrip, CardGrid
+from .home import HomePage
 from .mini_player import MiniPlayer
 from .motion import EASE, EASE_DRAWER, FADE_MS, FLIGHT_MS, PANE_CLOSE_MS, PANE_OPEN_MS, Tween, reduced_motion
 from .now import NowPanel
 from .settings import OptionsDialog
-from .search import ARTISTS, PLAYLISTS, SONGS, ArtistStrip, CardsPage, ScopeBar
+from .search import SONGS, CardsPage, ScopeBar
 from .taskbar import ThumbBar
 from .tray import Autostart, TrayIcon, app_icon
-from .widgets import AccountDialog, TrackModel, format_ago, format_time, run_async
+from .widgets import AccountDialog, TrackFilterProxyModel, TrackModel, format_ago, format_time, run_async
 from ytm_native.core.i18n import plural, tr
+from .views.common import (  # noqa: F401 - las pruebas y otras piezas las leen de aquí
+    HOME_KEY,
+    SEARCH_KEY,
+    QUEUE_KEY,
+    AUDIO_DEVICE_KEY,
+    AUDIO_DEVICE_NAME_KEY,
+    EQUALIZER_KEY,
+    HISTORY_KEY,
+    LOCAL_KEY,
+    FIXED_KEYS,
+    HEARD_RECENT,
+    HEARD_MONTH,
+    HEARD_ALL,
+    HEARD_LABELS,
+    NEW_LIST_KEY,
+    REMOTE_PREFIX,
+    ARTIST_PREFIX,
+    ROLE_ID,
+    ROLE_ART,
+    SEARCH_IDLE_NOTE,
+    is_remote,
+    is_artist,
+    is_library,
+    format_total,
+)
+from .views import (
+    QueueView,
+    SearchView,
+    HistoryView,
+    LocalView,
+    PlaylistView,
+)
 
 if sys.platform == "win32":
     from ctypes import wintypes
 
 log = logging.getLogger("ytmn.ui")
-
-HOME_KEY = "__inicio__"
-SEARCH_KEY = "__buscar__"
-QUEUE_KEY = "__cola__"
-HISTORY_KEY = "__historial__"
-LOCAL_KEY = "__equipo__"          # canciones de la carpeta de música del disco
-FIXED_KEYS = (HOME_KEY, SEARCH_KEY, QUEUE_KEY, HISTORY_KEY, LOCAL_KEY)
-# Pestañas del historial: lo último, lo más escuchado en 30 días y desde siempre.
-HEARD_RECENT, HEARD_MONTH, HEARD_ALL = "recientes", "mes", "siempre"
-HEARD_LABELS = (
-    (HEARD_RECENT, tr("Recientes")),
-    (HEARD_MONTH, tr("Lo más escuchado del mes")),
-    (HEARD_ALL, tr("Lo más escuchado")),
-)
-# Fila de la barra lateral que no es una vista: abre el diálogo de lista nueva.
-NEW_LIST_KEY = "__nueva_lista__"
-# Vista de una lista ajena a la biblioteca (una recomendación abierta).
-REMOTE_PREFIX = "remota:"
-# Página de un artista (por su canal).
-ARTIST_PREFIX = "artista:"
-ROLE_ID = Qt.ItemDataRole.UserRole
-ROLE_ART = Qt.ItemDataRole.UserRole + 1
-
-SEARCH_IDLE_NOTE = tr("Busca sin iniciar sesión")
-
-
-def is_remote(key: Optional[str]) -> bool:
-    return bool(key) and key.startswith(REMOTE_PREFIX)
-
-
-def is_artist(key: Optional[str]) -> bool:
-    return bool(key) and key.startswith(ARTIST_PREFIX)
-
-
-def is_library(key: Optional[str]) -> bool:
-    """¿La vista es una lista de la biblioteca (y no una vista fija o ajena)?"""
-    return (bool(key) and key not in FIXED_KEYS and key != NEW_LIST_KEY
-            and not is_remote(key) and not is_artist(key))
-
-
-def format_total(seconds: Optional[float]) -> str:
-    """Duración total legible: "42 min", "5 h 12 min"."""
-    if not seconds or seconds <= 0:
-        return ""
-    minutes = int(round(seconds / 60))
-    hours, minutes = divmod(minutes, 60)
-    if hours and minutes:
-        return tr("{hours} h {minutes} min", hours=hours, minutes=minutes)
-    return tr("{hours} h", hours=hours) if hours else tr("{minutes} min", minutes=minutes)
 
 
 class Bridge(QObject):
@@ -167,8 +154,7 @@ class Bridge(QObject):
     progress = Signal(str)
     shelf = Signal(int, object)   # tanda de recomendaciones, fila lista
 
-
-class MainWindow(QMainWindow):
+class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QMainWindow):
     SIDE_MIN = 208
     SIDE_MAX = 340
     SIDE_COLLAPSED = 64
@@ -650,10 +636,24 @@ class MainWindow(QMainWindow):
         self.scope_bar = ScopeBar()
         self.scope_bar.hide()
         body.addWidget(self.scope_bar)
-        # Solo en el historial: lo último o lo más escuchado.
+        # Fila de herramientas sobre la tabla: las pestañas del historial (solo
+        # allí) y, a la derecha, el filtro de la lista a la vista.
+        self.tools_box = QWidget()
+        tools = QHBoxLayout(self.tools_box)
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(12)
         self.heard_bar = ScopeBar(labels=HEARD_LABELS)
         self.heard_bar.hide()
-        body.addWidget(self.heard_bar)
+        tools.addWidget(self.heard_bar, 1)
+        tools.addStretch(1)
+        self.filter_note = QLabel()
+        self.filter_note.setObjectName("filterNote")
+        self.filter_note.hide()
+        tools.addWidget(self.filter_note)
+        self.list_filter = FilterBox()
+        tools.addWidget(self.list_filter)
+        self.tools_box.hide()
+        body.addWidget(self.tools_box)
         self.artist_strip = ArtistStrip(self.art)
         self.artist_strip.hide()
         body.addWidget(self.artist_strip)
@@ -662,13 +662,15 @@ class MainWindow(QMainWindow):
         body.addWidget(self.search_cards, 1)
 
         self.model = TrackModel(self)
+        # La tabla ve la lista a través del filtro y el orden; sus filas no
+        # son las del modelo: se traducen con ``proxy.source_row``.
+        self.proxy = TrackFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
         self.table = TrackTable()
         self.table.setAccessibleName(tr("Pistas"))
-        self.table.setModel(self.model)
+        self.table.setModel(self.proxy)
         self.delegate = TrackDelegate(self.art, self._row_art_url, self.table)
         self.table.setItemDelegate(self.delegate)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         self.table.verticalHeader().hide()
@@ -677,7 +679,12 @@ class MainWindow(QMainWindow):
         self.table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         head = self.table.horizontalHeader()
         head.setHighlightSections(False)
-        head.setSectionsClickable(False)
+        # Clic en una columna: ascendente, descendente y vuelta al orden de la lista.
+        head.setSectionsClickable(True)
+        head.setSortIndicatorClearable(True)
+        head.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)      # se abre en el orden de la lista
+        self.table.setSortingEnabled(True)
+        head.setSortIndicatorShown(False)         # la flecha la pone el rótulo (``headerData``)
         head.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         head.setMinimumSectionSize(0)
         head.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -831,6 +838,14 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_menu)
         self.table.thumb_clicked.connect(self._on_thumb_clicked)
+        self.table.row_moved.connect(self._on_row_moved)
+        self.table.delete_requested.connect(self._on_rows_delete)
+        # Filtro y orden: el arrastre solo vale con la lista tal cual es.
+        self.list_filter.textChanged.connect(self._on_filter_text)
+        self.list_filter.down_pressed.connect(self._filter_to_table)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(lambda *_: self._sync_list_tools())
+        for signal in (self.model.modelReset, self.model.rowsInserted, self.model.rowsRemoved):
+            signal.connect(lambda *_: self._sync_list_tools())
         self.lyrics.line_clicked.connect(self._on_lyric_clicked)
         self.lyrics.close_requested.connect(lambda: self.lyrics_action.setChecked(False))
         self.footer.menu_btn.clicked.connect(self._open_app_menu)
@@ -1095,34 +1110,6 @@ class MainWindow(QMainWindow):
                 self._refresh_library_view(key)
         elif key == HOME_KEY:
             self._refresh_home()                   # reutiliza sus tarjetas: no parpadea
-
-    def _refresh_library_view(self, key: str) -> None:
-        """La lista a la vista tras sincronizar: filas nuevas o quitadas sin
-        volver arriba, y la cabecera solo si cambió."""
-        playlist = self.db.get_playlist(key)
-        tracks = self.db.playlist_tracks(key)
-        self.model.set_tracks(tracks)
-        current = self.player.current_track()
-        self.model.set_current(current.video_id if current else None)
-        description = playlist.description.strip()
-        if len(description) > 230:
-            description = description[:228].rstrip() + "…"
-        art = sized_url(self.db.playlist_cover(playlist), 400)
-        facts = self._playlist_facts(playlist, tracks)
-        header = (playlist.title, description, art)
-        if header != (self.band._full_title, self.band.description.text(), self._band_art):
-            self._band_art = art
-            self.band.set_content(
-                playlist.title, description, facts, art, show_sync=not playlist.local,
-                extra=(tr("Opciones"), "more") if playlist.local else None,
-            )
-            self._apply_band_tint()
-        else:
-            self.band.set_facts(facts)
-        if not playlist.local:
-            self._set_empty("" if tracks else tr("Esta lista aún no tiene pistas guardadas"),
-                            tr("Sincronízala para verlas."))
-        self._update_buttons()
 
     def _reload_sidebar(self) -> None:
         keep = self._view_key or HOME_KEY
@@ -1505,75 +1492,6 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is yes
 
-    def _create_local_playlist(self, tracks: tuple = (), suggested: str = "") -> Optional[str]:
-        """Pregunta el nombre y crea la lista. Devuelve su id (o ``None``)."""
-        name = self._ask_text(
-            tr("Nueva lista"),
-            tr("Nombre de la lista. Se guarda solo en esta app, no en tu cuenta."),
-            suggested, ok=tr("Crear"),
-        )
-        if not name:
-            return None
-        playlist_id = self.db.create_local_playlist(name, tracks)
-        self._reload_sidebar()
-        if tracks:
-            self._notice(tr("Lista «{name}» creada con {plural}.", name=name, plural=plural(len(tracks), "{n} canción", "{n} canciones")))
-        else:
-            self._navigate(playlist_id)
-        return playlist_id
-
-    def _add_local_actions(self, menu: QMenu, playlist_id: str) -> None:
-        menu.addAction(tr("Cambiar el nombre…"), lambda: self._rename_local_playlist(playlist_id))
-        menu.addAction(tr("Eliminar la lista…"), lambda: self._delete_local_playlist(playlist_id))
-        if self.account.enabled:
-            menu.addAction(tr("Copiar en tu cuenta de YouTube Music…"), lambda: self._copy_to_account(playlist_id))
-
-    def _rename_local_playlist(self, playlist_id: str) -> None:
-        playlist = self.db.get_playlist(playlist_id)
-        if playlist is None:
-            return
-        name = self._ask_text(tr("Cambiar el nombre"), tr("Nombre de la lista:"), playlist.title, ok=tr("Guardar"))
-        if name and name != playlist.title:
-            self.db.rename_playlist(playlist_id, name)
-            self._reload_sidebar()
-
-    def _delete_local_playlist(self, playlist_id: str) -> None:
-        playlist = self.db.get_playlist(playlist_id)
-        if playlist is None:
-            return
-        if not self._confirm(
-            tr("Eliminar la lista"),
-            tr("«{title}» se eliminará de esta app. Sus canciones no se borran de ningún otro sitio. No se "
-               "puede deshacer.", title=playlist.title),
-            tr("Eliminar"),
-        ):
-            return
-        self.db.delete_local_playlist(playlist_id)
-        self._reload_sidebar()            # si era la vista actual, vuelve al inicio
-        self._notice(tr("Lista «{title}» eliminada.", title=playlist.title))
-
-    def _add_to_local_playlist(self, playlist_id: str, track: Track) -> None:
-        playlist = self.db.get_playlist(playlist_id)
-        if playlist is None:
-            return
-        if self.db.add_to_local_playlist(playlist_id, track):
-            self._notice(tr("«{title}» añadida a «{title2}».", title=track.title, title2=playlist.title))
-            self._after_local_change(playlist_id)
-        else:
-            self._notice(tr("«{title}» ya estaba en «{title2}».", title=track.title, title2=playlist.title))
-
-    def _remove_from_local_playlist(self, playlist_id: str, track: Track) -> None:
-        if self.db.remove_from_local_playlist(playlist_id, track.video_id):
-            self._notice(tr("«{title}» quitada de la lista.", title=track.title))
-            self._after_local_change(playlist_id)
-
-    def _after_local_change(self, playlist_id: str) -> None:
-        """La lista cambió: se refresca donde se esté viendo (y su carátula)."""
-        scroll = self.table.verticalScrollBar().value()
-        self._reload_sidebar()
-        if self._view_key == playlist_id:
-            self.table.verticalScrollBar().setValue(scroll)
-
     def _on_band_extra(self) -> None:
         """Botón de la cabecera: opciones de una lista local o guardar una ajena."""
         key = self._view_key
@@ -1590,6 +1508,8 @@ class MainWindow(QMainWindow):
             self._play_artist_mix(shuffle=False)
         elif key == HISTORY_KEY:
             self._clear_history()
+        elif key == QUEUE_KEY:
+            self._clear_queue()
         elif key == LOCAL_KEY:
             menu = rounded_menu(QMenu(self))
             menu.addAction(tr("Volver a leer la carpeta"), lambda: self._scan_local(manual=True))
@@ -1634,23 +1554,6 @@ class MainWindow(QMainWindow):
             self.mini.set_ink(ink)
         self.table.viewport().update()
 
-    def _playlist_facts(self, playlist, tracks: list[Track]) -> list[str]:
-        facts = [plural(len(tracks), "{n} canción", "{n} canciones")]
-        total = playlist.duration_s or sum(t.duration_s or 0 for t in tracks)
-        if format_total(total):
-            facts.append(format_total(total))
-        if playlist.author:
-            facts.append(tr("De {author}", author=playlist.author))
-        if playlist.year:
-            facts.append(playlist.year)
-        if playlist.local:
-            facts.append(tr("Lista local"))          # vive solo en esta app: no hay nada que sincronizar
-            return facts
-        facts.append(tr("Sincronizada {format_ago}", format_ago=format_ago(playlist.last_full_sync)))
-        if playlist.last_error:
-            facts.append(tr("Error: {value}", value=playlist.last_error[:60]))
-        return facts
-
     def _show_view(self, key: str, force: bool = False) -> None:
         self._nav_timer.stop()            # una vista pedida de otro modo gana a las flechas
         if key == self._view_key and not force:
@@ -1679,6 +1582,14 @@ class MainWindow(QMainWindow):
         self.home.setVisible(home)
         self.scope_bar.setVisible(key == SEARCH_KEY)
         self.heard_bar.setVisible(key == HISTORY_KEY)
+        if key != previous:
+            # Otra lista: llega entera y en su orden, sin el filtro de la anterior.
+            self.list_filter.clear()
+            self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self._sync_list_tools()
+        # El botón de la cabecera es de cada vista: no hereda el estado de otra.
+        self.band.extra_btn.setEnabled(True)
+        self.band.extra_btn.setToolTip("")
         if key != SEARCH_KEY:
             self.artist_strip.hide()
             self.search_cards.hide()
@@ -1697,9 +1608,13 @@ class MainWindow(QMainWindow):
             self._band_art = track_art_url(current.video_id, current.thumb_url, 400) if current else ""
             self.band.set_content(
                 tr("Cola de reproducción"),
-                tr("Lo que suena y lo que viene después. Un doble clic salta a esa pista."),
+                tr("Lo que suena y lo que viene después. Un doble clic salta a esa pista; "
+                   "arrastra una fila para cambiarla de sitio."),
                 facts, self._band_art, show_sync=False,
+                extra=(tr("Vaciar la cola"), "close") if tracks else None,
             )
+            self.band.extra_btn.setToolTip(tr("Quita de la cola todo menos lo que suena"))
+            self.band.extra_btn.setEnabled(len(tracks) > 1)
             self._set_empty("" if tracks else tr("La cola está vacía"), tr("Reproduce una lista o una búsqueda."),
                             glyph="queue")
         elif key == HISTORY_KEY:
@@ -1779,18 +1694,6 @@ class MainWindow(QMainWindow):
         self._band_flight = flight
         flight.fly()
 
-    def _set_search_note(self, text: str) -> None:
-        self._search_note = text
-        self._refresh_search_band()
-
-    def _refresh_search_band(self) -> None:
-        if self._view_key == SEARCH_KEY:
-            self.band.set_facts([self._scope_note()])
-
-    def _cards_shown(self) -> bool:
-        """¿La búsqueda enseña tarjetas (listas o artistas) en vez de canciones?"""
-        return self._view_key == SEARCH_KEY and self._search_scope != SONGS
-
     def _set_empty(self, title: str, hint: str = "", glyph: str = "music") -> None:
         if title:
             self.empty.set_content(glyph, title, hint)
@@ -1799,7 +1702,7 @@ class MainWindow(QMainWindow):
         self.search_cards.setVisible(not title and self._cards_shown())
 
     def _update_buttons(self) -> None:
-        has_rows = self.model.rowCount() > 0
+        has_rows = self.proxy.rowCount() > 0
         # En la búsqueda los botones no existen hasta que hay algo que reproducir
         # (y con listas o artistas a la vista no hay una lista que reproducir).
         searching = self._view_key == SEARCH_KEY
@@ -1810,11 +1713,6 @@ class MainWindow(QMainWindow):
         self.play_all_btn.setEnabled(has_rows)
         self.shuffle_all_btn.setEnabled(has_rows)
         self.sync_list_btn.setEnabled(not self._syncing and paths.browser_json().is_file())
-
-    def _focus_search(self) -> None:
-        self._navigate(SEARCH_KEY)
-        self.search_edit.setFocus()
-        self.search_edit.selectAll()
 
     # ------------------------------------------------------------------ inicio
     def _refresh_home(self) -> None:
@@ -1848,199 +1746,6 @@ class MainWindow(QMainWindow):
         self.home.set_library(specs, facts, empty_text)
         self._refresh_recent()
         self._load_recommendations()
-
-    # --------------------------------------------------------------- historial
-    def _refresh_recent(self) -> None:
-        """«Escuchado hace poco» del inicio: lo último del historial, cada canción una vez."""
-        self._recent_tracks = [row[0] for row in self.db.recent_plays(config.HISTORY_HOME_CARDS)]
-        self.home.set_recent([
-            (t.title, t.artists, track_art_url(t.video_id, t.thumb_url, 400), t)
-            for t in self._recent_tracks
-        ])
-
-    def _play_recent(self, track: Track) -> None:
-        take_launch()                 # la tarjeta no abre una vista: no hay carátula que vuele
-        if self._missing_binaries_notice():
-            return
-        ids = [t.video_id for t in self._recent_tracks]
-        if track.video_id in ids:
-            self.player.play_tracks(self._recent_tracks, ids.index(track.video_id))
-        else:
-            self.player.play_tracks([track], 0)
-
-    def _fill_history(self) -> None:
-        """Vista «Historial»: la tabla con una nota por pista en lugar del álbum."""
-        scope, limit = self._heard_scope, config.HISTORY_VIEW_LIMIT
-        month_ago = time.time() - 30 * 86400
-        if scope == HEARD_RECENT:
-            rows = self.db.recent_plays(limit)
-            notes = {t.video_id: format_ago(at).capitalize() for t, at, _n in rows}
-            header = tr("Última vez")
-        else:
-            rows = self.db.top_plays(month_ago if scope == HEARD_MONTH else 0.0, limit)
-            notes = {t.video_id: plural(n, "{n} vez", "{n} veces") for t, _at, n in rows}
-            header = tr("Escuchas")
-        tracks = [row[0] for row in rows]
-        self.model.set_tracks(tracks, notes, header)
-        total, songs = self.db.play_stats()
-        plays, heard = self.db.play_stats(month_ago) if scope == HEARD_MONTH else (total, songs)
-        facts = []
-        if plays:
-            # El plazo va en la primera nota: si la banda es estrecha, las
-            # que no caben se ocultan empezando por el final.
-            first = (plural(plays, "{n} escucha en 30 días", "{n} escuchas en 30 días")
-                     if scope == HEARD_MONTH else plural(plays, "{n} escucha", "{n} escuchas"))
-            facts = [first,
-                     plural(heard, "{n} canción distinta", "{n} canciones distintas")]
-        latest = self.db.recent_plays(1)
-        self._band_art = (track_art_url(latest[0][0].video_id, latest[0][0].thumb_url, 400)
-                          if latest else "")
-        self.band.set_content(
-            tr("Historial"),
-            tr("Lo que has escuchado en esta app. Se guarda solo en este equipo."),
-            facts, self._band_art, show_sync=False, show_cover=bool(latest),
-            extra=(tr("Borrar historial"), "close") if total else None,
-        )
-        self.heard_bar.setVisible(total > 0)
-        if tracks:
-            self._set_empty("")
-        elif total:
-            self._set_empty(tr("Nada escuchado en los últimos 30 días"),
-                            tr("Lo anterior sigue en las otras dos pestañas."), glyph="history")
-        elif self.tracker.enabled:
-            self._set_empty(tr("Aún no hay nada en el historial"),
-                            tr("Aquí aparecerá cada canción que escuches al menos medio minuto."),
-                            glyph="history")
-        else:
-            self._set_empty(tr("El historial está desactivado"),
-                            tr("Actívalo en Opciones (Ctrl+,): «Guardar el historial de escucha»."),
-                            glyph="history")
-
-    def _set_heard_scope(self, scope: str) -> None:
-        if scope == self._heard_scope:
-            return
-        self._heard_scope = scope
-        self.heard_bar.set_scope(scope)
-        if self._view_key == HISTORY_KEY:
-            self._show_view(HISTORY_KEY, force=True)
-
-    def _on_play_logged(self, _video_id: str) -> None:
-        if self._view_key == HISTORY_KEY:
-            # La tabla se rehace con la escucha nueva sin perder por dónde se iba leyendo.
-            bar = self.table.verticalScrollBar()
-            where = bar.value()
-            self._show_view(HISTORY_KEY, force=True)
-            bar.setValue(where)
-        elif self._view_key == HOME_KEY:
-            self._refresh_recent()
-
-    def _set_history_enabled(self, enabled: bool) -> None:
-        self.tracker.set_enabled(enabled)
-        if self._view_key == HISTORY_KEY:
-            self._show_view(HISTORY_KEY, force=True)
-
-    def _clear_history(self) -> None:
-        plays, _songs = self.db.play_stats()
-        if not plays or not self._confirm(
-            tr("Borrar historial"),
-            tr("Se borrarán {plural} de este equipo. Tus listas no cambian. No se puede deshacer.", plural=plural(plays, "{n} escucha", "{n} escuchas")),
-            tr("Borrar"),
-        ):
-            return
-        self.db.clear_history()
-        self._refresh_recent()
-        if self._view_key == HISTORY_KEY:
-            self._show_view(HISTORY_KEY, force=True)
-        self._notice(tr("Historial borrado."))
-
-    # ------------------------------------------------- música del disco (local)
-    def _music_folder(self) -> str:
-        return self.db.get_setting(config.LOCAL_MUSIC_DIR_KEY, "") or ""
-
-    def _fill_local(self) -> None:
-        tracks = self.db.local_tracks()
-        self.model.set_tracks(tracks)
-        folder = self._music_folder()
-        facts = [plural(len(tracks), "{n} canción", "{n} canciones")]
-        total = format_total(sum(t.duration_s or 0 for t in tracks))
-        if total:
-            facts.append(total)
-        if self._scanning:
-            facts.append(tr("Leyendo la carpeta…"))
-        cover = next((t.thumb_url for t in tracks if t.thumb_url), "")
-        self._band_art = cover
-        self.band.set_content(
-            tr("En tu equipo"), folder, facts, cover, show_sync=False, extra=(tr("Opciones"), "more"),
-        )
-        if self._scanning and not tracks:
-            self._set_empty(tr("Leyendo la carpeta…"), tr("Las canciones aparecen al terminar."), glyph="folder")
-        else:
-            self._set_empty("" if tracks else tr("No hay canciones en esta carpeta"),
-                            tr("Formatos que se leen: MP3, FLAC, M4A, AAC, OGG, Opus y WAV."), glyph="folder")
-
-    def _sync_local_actions(self) -> None:
-        has_folder = bool(self._music_folder())
-        self.rescan_action.setEnabled(has_folder and not self._scanning)
-        self.forget_folder_action.setEnabled(has_folder)
-
-    def _choose_music_folder(self) -> None:
-        start = self._music_folder() or str(Path.home() / "Music")
-        folder = QFileDialog.getExistingDirectory(self, tr("Carpeta de música"), start)
-        if not folder:
-            return
-        folder = os.path.abspath(folder)
-        self.db.set_setting(config.LOCAL_MUSIC_DIR_KEY, folder)
-        self.db.forget_local_folder(local_media.normalized_path(folder))
-        self._reload_sidebar()
-        self._scan_local(manual=True)
-        self._navigate(LOCAL_KEY)
-
-    def _forget_music_folder(self) -> None:
-        if not self._music_folder() or not self._confirm(
-            tr("Dejar de usar la carpeta"),
-            tr("Las canciones de la carpeta dejan de aparecer en la app. Los archivos no se tocan."),
-            tr("Dejar de usarla"),
-        ):
-            return
-        if self._scan_cancel is not None:
-            self._scan_cancel.set()
-        self.db.set_setting(config.LOCAL_MUSIC_DIR_KEY, "")
-        self.db.forget_local_folder()
-        if self._view_key == LOCAL_KEY:
-            self._view_key = None
-        self._reload_sidebar()
-
-    def _scan_local(self, manual: bool = False) -> None:
-        """Lee la carpeta en segundo plano: solo los archivos nuevos o cambiados."""
-        folder = self._music_folder()
-        if not folder or self._scanning:
-            return
-        if not os.path.isdir(folder):
-            if manual:
-                self._notice(tr("No se encuentra la carpeta de música: {folder}", folder=folder), "error")
-            return
-        self._scanning = True
-        cancel = self._scan_cancel = threading.Event()
-        if self._view_key == LOCAL_KEY:
-            self._fill_local()
-        run_async(lambda: local_media.scan_in_thread(self.db, folder, cancel),
-                  lambda report, error: self._on_scan_done(report, error, manual))
-
-    def _on_scan_done(self, report, error, manual: bool) -> None:
-        self._scanning = False
-        self._scan_cancel = None
-        if error is not None:
-            log.warning("no se pudo leer la carpeta de música: %s", error)
-            self._notice(tr("No se pudo leer la carpeta de música."), "error")
-        elif manual and report is not None and not report.cancelled:
-            self._notice(tr("Carpeta leída: {plural}.", plural=plural(report.total, "{n} canción", "{n} canciones")))
-        if self._view_key == LOCAL_KEY:
-            scroll = self.table.verticalScrollBar().value()
-            self._fill_local()
-            self.table.verticalScrollBar().setValue(scroll)
-            current = self.player.current_track()
-            self.model.set_current(current.video_id if current else None)
-            self._update_buttons()
 
     def _load_recommendations(self, force: bool = False) -> None:
         cached = discover.load_shelves(self.db)
@@ -2105,116 +1810,12 @@ class MainWindow(QMainWindow):
             self._recs_retry_after = time.time() + 600
             self.home.set_status(tr("Por ahora no hay recomendaciones que enseñar."), "retry")
 
-    def _play_library(self, playlist_id: str) -> None:
-        """Disco de una tarjeta de «Tus listas»: reproduce sin abrir la lista."""
-        tracks = self.db.playlist_tracks(playlist_id)
-        if not tracks:
-            self._notice(tr("Esa lista aún no tiene pistas guardadas: sincronízala primero."))
-            return
-        if self._missing_binaries_notice():
-            return
-        self.db.note_playlist_played(playlist_id)
-        self.player.play_tracks(tracks, random.randrange(len(tracks)) if self.player.shuffle else 0)
-
     # ------------------------------------------------------------ listas ajenas
     def _missing_binaries_notice(self) -> bool:
         if bootstrap.missing_binaries():
             self._notice(tr("Faltan binarios: abre Opciones (Ctrl+,) › «Mantenimiento» › «Binarios que faltan»."))
             return True
         return False
-
-    def _open_remote(self, card: PlaylistCard) -> None:
-        self._remote_cards[card.playlist_id] = card
-        self._remote_failed.discard(card.playlist_id)    # abrirla de nuevo es reintentar
-        self._navigate(REMOTE_PREFIX + card.playlist_id)
-
-    def _play_remote(self, card: PlaylistCard) -> None:
-        """Disco de una recomendación: la descarga (si hace falta) y la reproduce."""
-        if self._missing_binaries_notice():
-            return
-        self._remote_cards[card.playlist_id] = card
-
-        def play(data: Optional[RemotePlaylist]) -> None:
-            if data is None:
-                return
-            if not data.tracks:
-                self._notice(tr("«{title}» no tiene canciones que se puedan reproducir.", title=data.title))
-                return
-            for track in data.tracks:
-                self.db.upsert_track(track)
-            start = random.randrange(len(data.tracks)) if self.player.shuffle else 0
-            self.player.play_tracks(data.tracks, start)
-
-        if card.playlist_id not in self._remote:
-            self._notice(tr("Cargando «{title}»…", title=card.title))
-            self._remote_failed.discard(card.playlist_id)
-        self._fetch_remote(card.playlist_id, play)
-
-    def _fetch_remote(self, playlist_id: str, then: Optional[Callable] = None) -> None:
-        """Descarga una lista ajena una sola vez por sesión. ``then`` recibe la
-        lista (o ``None`` si falló)."""
-        data = self._remote.get(playlist_id)
-        if data is not None:
-            if then is not None:
-                then(data)
-            return
-        waiting = self._remote_waiting.get(playlist_id)
-        if waiting is not None:          # ya está en camino: solo se apunta el interesado
-            if then is not None:
-                waiting.append(then)
-            return
-        self._remote_waiting[playlist_id] = [then] if then is not None else []
-
-        def done(result, error) -> None:
-            callbacks = self._remote_waiting.pop(playlist_id, [])
-            if error is not None or result is None:
-                log.warning("no se pudo abrir la lista %s: %s", playlist_id, error)
-                self._remote_failed.add(playlist_id)
-                self._notice(tr("No se pudo abrir la lista. Comprueba la conexión."), "error")
-            else:
-                self._remote[playlist_id] = result
-            if self._view_key == REMOTE_PREFIX + playlist_id:
-                self._show_view(self._view_key, force=True)
-            for callback in callbacks:
-                callback(result if error is None else None)
-
-        run_async(lambda: discover.fetch_playlist(playlist_id), done)
-
-    def _show_remote(self, playlist_id: str) -> None:
-        data = self._remote.get(playlist_id)
-        card = self._remote_cards.get(playlist_id)
-        if data is None:
-            loading = playlist_id in self._remote_waiting
-            self.model.set_tracks([])
-            self._band_art = sized_url(card.thumb_url, 400) if card else ""
-            self.band.set_content(
-                card.title if card else tr("Lista"), "", [card.note] if card and card.note else [],
-                self._band_art, show_sync=False, show_back=True,
-            )
-            if playlist_id in self._remote_failed and not loading:
-                self._set_empty(tr("No se pudo abrir la lista"),
-                                tr("Comprueba la conexión y vuelve a abrirla desde el inicio."))
-            else:
-                self._set_empty(tr("Cargando la lista…"))
-                self._fetch_remote(playlist_id)
-            return
-        self.model.set_tracks(data.tracks)
-        description = data.description.strip()
-        if len(description) > 230:
-            description = description[:228].rstrip() + "…"
-        facts = [plural(len(data.tracks), "{n} canción", "{n} canciones")]
-        total = data.duration_s or sum(t.duration_s or 0 for t in data.tracks)
-        if format_total(total):
-            facts.append(format_total(total))
-        if data.author:
-            facts.append(tr("De {author}", author=data.author))
-        if data.year:
-            facts.append(data.year)
-        self._band_art = sized_url(data.thumb_url or (card.thumb_url if card else ""), 400)
-        self.band.set_content(data.title, description, facts, self._band_art,
-                              show_sync=False, show_back=True,
-                              extra=(tr("Guardar como lista local"), "save") if data.tracks else None)
-        self._set_empty("" if data.tracks else tr("Esta lista no tiene canciones que se puedan reproducir"))
 
     # ---------------------------------------------------------------- artistas
     def _open_artist(self, card: ArtistCard) -> None:
@@ -2353,15 +1954,19 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ reproducción
     def _play_from(self, row: int) -> None:
-        tracks = self.model.tracks()
-        if not tracks or row < 0:
+        """Reproduce desde la fila ``row`` de la tabla (la que se ve). Suena
+        lo que se ve y en el orden en que se ve: con un filtro, solo las que
+        coinciden; ordenada por una columna, en ese orden."""
+        if not (0 <= row < self.proxy.rowCount()):
             return
         if bootstrap.missing_binaries():
             self._notice(tr("Faltan binarios: abre Opciones (Ctrl+,) › «Mantenimiento» › «Binarios que faltan»."))
             return
         if self._view_key == QUEUE_KEY:
-            self.player.jump_to(row)
+            # La fila es la de la vista; la cola salta a su posición real.
+            self.player.jump_to(self.proxy.source_row(row))
             return
+        tracks = self.proxy.tracks()
         if self._view_key == SEARCH_KEY or is_remote(self._view_key) or is_artist(self._view_key):
             for track in tracks:
                 self.db.upsert_track(track)
@@ -2374,7 +1979,7 @@ class MainWindow(QMainWindow):
 
     def _on_thumb_clicked(self, row: int) -> None:
         """Clic en la carátula de una fila: reproduce, o pausa si ya es la que suena."""
-        if self.model.is_current(row) and self.player.current_track() is not None:
+        if self.proxy.is_current(row) and self.player.current_track() is not None:
             self.player.toggle_pause()
         else:
             self._play_from(row)
@@ -2384,12 +1989,12 @@ class MainWindow(QMainWindow):
             # Su mezcla de YouTube Music: mucho más que las cinco populares.
             self._play_artist_mix(shuffle=True)
             return
-        tracks = self.model.tracks()
-        if not tracks:
+        rows = self.proxy.rowCount()            # las que se ven: con un filtro, solo esas
+        if not rows:
             return
         if not self.player.shuffle:
             self.player.set_shuffle(True)
-        self._play_from(random.randrange(len(tracks)))
+        self._play_from(random.randrange(rows))
 
     def _on_current_changed(self, track: Optional[Track]) -> None:
         if track is None:
@@ -2521,47 +2126,50 @@ class MainWindow(QMainWindow):
         self._blocked_until = until
         self._on_tick()
 
-    # ------------------------------------------------------------ cola y menú
-    def _queue_contents(self) -> tuple[list[Track], list[str]]:
-        tracks, pos = self.player.queue_snapshot()
-        ahead = max(0, len(tracks) - pos - 1) if pos >= 0 else 0
-        facts = [plural(len(tracks), "{n} pista", "{n} pistas"), tr("{ahead} por delante", ahead=ahead)] if tracks else []
-        return tracks, facts
-
-    def _refresh_queue(self) -> None:
-        """La cola a la vista cuando avanza o cambia: se tocan solo las filas
-        que cambian, la marca de lo que suena y las notas de la banda. Nada se
-        reconstruye ni vuelve arriba: quien esté desplazándose por una cola
-        larga sigue donde estaba."""
-        tracks, facts = self._queue_contents()
-        current = self.player.current_track()
-        self.model.set_tracks(tracks)
-        self.model.set_current(current.video_id if current else None)
-        art = track_art_url(current.video_id, current.thumb_url, 400) if current else ""
-        if art != self._band_art:
-            self._band_art = art
-            self.band.cover.set_url(art)
-            self._apply_band_tint()
-        self.band.set_facts(facts)
-        self._set_empty("" if tracks else tr("La cola está vacía"), tr("Reproduce una lista o una búsqueda."),
-                        glyph="queue")
-        self._update_buttons()
-
-    def _on_queue_changed(self) -> None:
-        if self._view_key == QUEUE_KEY:
-            self._refresh_queue()
+    def _tracks_at(self, rows: list[int]) -> list[Track]:
+        """Las pistas de esas filas de la tabla, en el orden en que se ven."""
+        count = self.proxy.rowCount()
+        return [self.proxy.track_at(row) for row in sorted(rows) if 0 <= row < count]
 
     def _on_table_menu(self, point) -> None:
         index = self.table.indexAt(point)
-        tracks = self.model.tracks()
-        if not index.isValid() or not (0 <= index.row() < len(tracks)):
+        if not index.isValid() or not (0 <= index.row() < self.proxy.rowCount()):
             return
-        row, track = index.row(), tracks[index.row()]
-        self._track_menu(track, row).exec(self.table.viewport().mapToGlobal(point))
+        row = index.row()
+        track = self.proxy.track_at(row)
+        rows = self.table.selected_rows()
+        global_pos = self.table.viewport().mapToGlobal(point)
+        if row in rows and len(rows) > 1:
+            # Clic derecho sobre una selección de varias: el menú es para todas.
+            self._tracks_menu(self._tracks_at(rows)).exec(global_pos)
+        else:
+            self._track_menu(track, row).exec(global_pos)
+
+    def _tracks_menu(self, tracks: list[Track]) -> QMenu:
+        """Menú de varias pistas seleccionadas, en el orden de la tabla."""
+        menu = rounded_menu(QMenu(self))
+        menu_section(menu, plural(len(tracks), "{n} canción", "{n} canciones"), first=True)
+        menu.addAction(tr("Reproducir a continuación"), lambda: self._queue_tracks(tracks, next_up=True))
+        menu.addAction(tr("Añadir a la cola"), lambda: self._queue_tracks(tracks, next_up=False))
+        menu.addSeparator()
+        add_menu = rounded_menu(menu.addMenu(tr("Añadir a una lista")))
+        locals_ = [p for p in self.db.playlists() if p.local]
+        for playlist in locals_:
+            add_menu.addAction(
+                playlist.title, lambda pid=playlist.playlist_id: self._add_tracks_to_local_playlist(pid, tracks)
+            )
+        if locals_:
+            add_menu.addSeparator()
+        add_menu.addAction(tr("Nueva lista…"), lambda: self._create_local_playlist(tuple(tracks)))
+        if is_local_playlist(self._view_key):
+            view = self._view_key
+            menu.addAction(tr("Quitar de esta lista"), lambda: self._remove_tracks_from_local_playlist(view, tracks))
+        return menu
 
     def _track_menu(self, track: Track, row: Optional[int] = None) -> QMenu:
-        """Menú de una pista. ``row`` es su fila en la tabla; sin fila (música
-        parecida del panel) «Reproducir» la pone a sonar a ella sola."""
+        """Menú de una pista. ``row`` es su fila en la tabla (la que se ve,
+        no la del modelo); sin fila (música parecida del panel) «Reproducir»
+        la pone a sonar a ella sola."""
         menu = rounded_menu(QMenu(self))
         if row is not None:
             menu.addAction(tr("Reproducir"), lambda: self._play_from(row))
@@ -2582,6 +2190,12 @@ class MainWindow(QMainWindow):
         if row is not None and is_local_playlist(self._view_key):
             view = self._view_key
             menu.addAction(tr("Quitar de esta lista"), lambda: self._remove_from_local_playlist(view, track))
+        if row is not None and self._view_key == QUEUE_KEY:
+            # La fila de la tabla puede no ser la posición en la cola (filtro, orden).
+            queue_pos = self.proxy.source_row(row)
+            # La que suena no se quita de la cola: se pasa a la siguiente.
+            if queue_pos != self.player.queue_snapshot()[1]:
+                menu.addAction(tr("Quitar de la cola"), lambda: self._remove_from_queue(queue_pos, track))
         self._add_account_actions(menu, track, row)
         menu.addSeparator()
         if not is_local_track(track.video_id):
@@ -2684,31 +2298,6 @@ class MainWindow(QMainWindow):
                                playlist.title, tr("Crear"))
         if title:
             self.account.create_playlist(title, tracks)
-
-    def _play_single(self, track: Track) -> None:
-        if self._missing_binaries_notice():
-            return
-        self.db.upsert_track(track)
-        self.player.play_tracks([track], 0)
-
-    def _queue_track(self, track: Track, next_up: bool) -> None:
-        if bootstrap.missing_binaries():
-            self._notice(tr("Faltan binarios: abre Opciones (Ctrl+,) › «Mantenimiento» › «Binarios que faltan»."))
-            return
-        self.db.upsert_track(track)
-        if next_up:
-            self.player.play_next(track)
-        else:
-            self.player.enqueue(track)
-        self._notice(tr("«{title}» añadida a la cola.", title=track.title))
-
-    def _start_radio(self, track: Track) -> None:
-        if bootstrap.missing_binaries():
-            self._notice(tr("Faltan binarios: abre Opciones (Ctrl+,) › «Mantenimiento» › «Binarios que faltan»."))
-            return
-        self.db.upsert_track(track)
-        self.player.start_radio(track)
-        self._notice(tr("Cargando radio…"))
 
     # ------------------------------------------------------------------ letras
     def _toggle_lyrics(self, visible: bool) -> None:
@@ -3136,211 +2725,6 @@ class MainWindow(QMainWindow):
 
         run_async(self.extractor.diagnostics, show)
 
-    # ---------------------------------------------------------------- búsqueda
-    def _on_search_text(self, text: str) -> None:
-        """Búsqueda en vivo: sugerencias tras una pausa corta y resultados tras
-        una algo más larga. Intro sigue buscando en el acto."""
-        query = text.strip()
-        if query:
-            self._suggest_timer.start()
-            if len(query) >= config.SEARCH_LIVE_MIN_CHARS:
-                self._live_timer.start()
-            else:
-                self._live_timer.stop()
-            return
-        # Campo vacío: se descarta lo que venga de camino y vuelve el punto de partida.
-        self._suggest_timer.stop()
-        self._live_timer.stop()
-        self._suggest_seq += 1
-        self._search_seq += 1
-        self._searched_query = ""
-        self._search_tracks = []
-        self._search_note = SEARCH_IDLE_NOTE
-        self._extras = SearchExtras()
-        self._extras_state = "idle"
-        self._top_artist = None
-        self._show_recent_searches()
-        if self._view_key == SEARCH_KEY:
-            self.model.set_tracks([])
-            self._refresh_search_band()
-            self._render_search_cards()
-            self._sync_search_empty()
-            self._update_buttons()
-
-    def _show_recent_searches(self) -> None:
-        self.suggestions.set_items(
-            discover.recent_searches(self.db), lead=tr("Recientes"), glyph="history", strong=False
-        )
-
-    def _fetch_suggestions(self) -> None:
-        query = self.search_edit.text().strip()
-        if not query:
-            return
-        self._suggest_seq += 1
-        seq = self._suggest_seq
-
-        def done(texts, error) -> None:
-            # Si falla no se avisa: las sugerencias son una ayuda, no la tarea.
-            if seq == self._suggest_seq and error is None:
-                self.suggestions.set_items(texts or [], typed=query)
-
-        run_async(lambda: discover.search_suggestions(query), done)
-
-    def _on_suggestion_picked(self, text: str) -> None:
-        self.search_edit.setText(text)
-        self.search_edit.setFocus()
-        self._suggest_timer.stop()
-        self._fetch_suggestions()
-        self._do_search(commit=True)
-
-    def _sync_search_empty(self) -> None:
-        query = self.search_edit.text().strip()
-        searched = bool(self._searched_query) and self._searched_query == query
-        idle = (tr("Busca música nueva"),
-                tr("Empieza a escribir: las sugerencias y los resultados aparecen solos. "
-                "No hace falta iniciar sesión."))
-        self._sync_artist_strip(searched)
-        if self._search_scope == SONGS:
-            if self.model.rowCount():
-                self._set_empty("")
-            elif searched and self._search_note != tr("Buscando «{query}»…", query=query):
-                self._set_empty(tr("Sin resultados para «{query}»", query=query),
-                                tr("Prueba con otro título o artista, o con una de las sugerencias de arriba."),
-                                glyph="search")
-            else:
-                self._set_empty(*idle, glyph="search")
-            return
-        items = self._extras.playlists if self._search_scope == PLAYLISTS else self._extras.artists
-        what = tr("listas de la comunidad") if self._search_scope == PLAYLISTS else tr("artistas")
-        if items:
-            self._set_empty("")
-        elif not searched:
-            self._set_empty(*idle, glyph="search")
-        elif self._extras_state == "loading":
-            self._set_empty(tr("Buscando {what}…", what=what), glyph="search")
-        elif self._extras_state == "failed":
-            self._set_empty(tr("No se pudieron buscar {what}", what=what), tr("Comprueba la conexión y pulsa Intro para reintentar."),
-                            glyph="search")
-        else:
-            self._set_empty(tr("Sin {what} para «{query}»", what=what, query=query), tr("Prueba con otro nombre o con menos palabras."),
-                            glyph="search")
-
-    def _sync_artist_strip(self, searched: bool) -> None:
-        """La fila del artista va sobre las canciones si YouTube Music dio a un
-        artista como resultado principal: la búsqueda iba de él."""
-        show = (self._view_key == SEARCH_KEY and self._search_scope == SONGS and searched
-                and self._top_artist is not None)
-        if show:
-            self.artist_strip.set_card(self._top_artist)
-        self.artist_strip.setVisible(show)
-
-    def _scope_note(self) -> str:
-        """La nota de la banda habla de lo que se está viendo."""
-        query = self._searched_query
-        if self._search_scope == SONGS or not query:
-            return self._search_note
-        if self._extras_state == "loading":
-            return tr("Buscando «{query}»…", query=query)
-        if self._extras_state == "failed":
-            return tr("La búsqueda falló. Pulsa Intro para reintentar.")
-        if self._search_scope == PLAYLISTS:
-            count = plural(len(self._extras.playlists), "{n} lista de la comunidad", "{n} listas de la comunidad")
-        else:
-            count = plural(len(self._extras.artists), "{n} artista", "{n} artistas")
-        return tr("{count} para «{query}»", count=count, query=query)
-
-    def _set_search_scope(self, scope: str) -> None:
-        """Canciones, listas de la comunidad o artistas. Sin animación: se cambia
-        a menudo y la búsqueda ya está hecha (las tres llegan a la vez)."""
-        self.scope_bar.set_scope(scope)
-        if scope == self._search_scope:
-            return
-        self._search_scope = scope
-        if self._view_key == SEARCH_KEY:
-            self._refresh_search_band()
-            self._render_search_cards()
-            self._sync_search_empty()
-            self._update_buttons()
-
-    def _render_search_cards(self) -> None:
-        if self._search_scope == PLAYLISTS:
-            self.search_cards.show_playlists(self._extras.playlists)
-        elif self._search_scope == ARTISTS:
-            self.search_cards.show_artists(self._extras.artists)
-
-    def _fetch_extras(self, query: str, seq: int) -> None:
-        """Listas de la comunidad y artistas: aparte de las canciones, para que
-        estas no esperen a la petición más lenta."""
-        self._extras = SearchExtras()
-        self._extras_state = "loading"
-        self._refresh_extras_view()
-
-        def done(extras, error) -> None:
-            if seq != self._search_seq:
-                return
-            if error is not None:
-                log.warning("listas y artistas de «%s»: %s", query, error)
-                self._extras_state = "failed"
-            else:
-                self._extras = extras or SearchExtras()
-                self._extras_state = "done"
-            self._refresh_extras_view()
-
-        run_async(lambda: discover.search_extras(query), done)
-
-    def _refresh_extras_view(self) -> None:
-        if self._view_key == SEARCH_KEY and self._search_scope != SONGS:
-            self._refresh_search_band()
-            self._render_search_cards()
-            self._sync_search_empty()
-            self._update_buttons()
-
-    def _do_search(self, commit: bool = False) -> None:
-        """``commit``: la búsqueda se pidió a propósito (Intro o una sugerencia),
-        no por una pausa al escribir: se recuerda y sus errores se avisan."""
-        query = self.search_edit.text().strip()
-        self._live_timer.stop()
-        if not query:
-            return
-        if commit:
-            discover.remember_search(self.db, query)
-        if query == self._searched_query:
-            if self._extras_state == "failed":
-                self._fetch_extras(query, self._search_seq)     # Intro reintenta lo que falló
-            return                        # ya está en pantalla o de camino
-        self._searched_query = query
-        self._search_seq += 1
-        seq = self._search_seq
-        self._top_artist = None
-        self._set_search_note(tr("Buscando «{query}»…", query=query))
-        top: dict = {}
-
-        def done(tracks, error) -> None:
-            if seq != self._search_seq:
-                return                    # se siguió escribiendo: esta respuesta ya no vale
-            if error is not None:
-                self._searched_query = ""          # Intro lo reintenta
-                self._set_search_note(tr("La búsqueda falló. Pulsa Intro para reintentar."))
-                if commit:
-                    self._notice(tr("Error de búsqueda: {error}", error=error), "error")
-                return
-            self._top_artist = discover.artist_card_from_item(top.get("artist"))
-            self._search_tracks = list(tracks or [])
-            self._set_search_note(
-                tr("{plural} para «{query}»", plural=plural(len(self._search_tracks), "{n} resultado", "{n} resultados"), query=query)
-            )
-            if self._view_key != SEARCH_KEY:
-                return                    # se verán al volver a la búsqueda
-            self.model.set_tracks(self._search_tracks)
-            self._sync_search_empty()
-            current = self.player.current_track()
-            self.model.set_current(current.video_id if current else None)
-            self.table.scrollToTop()
-            self._update_buttons()
-
-        run_async(lambda: search_tracks(query, limit=config.SEARCH_RESULTS, top=top), done)
-        self._fetch_extras(query, seq)
-
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 - API de Qt
         kind = event.type()
         if kind == QEvent.Type.KeyPress and obj is self.sidebar:
@@ -3493,6 +2877,8 @@ class MainWindow(QMainWindow):
         self.thumbbar = ThumbBar(self)
         self.thumbbar.clicked.connect(self._on_thumb_button)
         self.mpv.set_normalization("loudnorm" if self.equalize_action.isChecked() else None)
+        self._apply_audio_preferences()
+        self.mpv.device_lost.connect(self._on_audio_device_lost)
 
     def tray_ready(self) -> bool:
         """¿Hay icono en la bandeja? (Sin él, ocultar la ventana la perdería.)"""
@@ -3567,6 +2953,57 @@ class MainWindow(QMainWindow):
     def _set_equalize(self, enabled: bool) -> None:
         self.db.set_setting("equalize_volume", "1" if enabled else "0")
         self.mpv.set_normalization("loudnorm" if enabled else None)
+
+    # -- salida, ecualizador y transición (Opciones › Reproducción) ----------
+    def audio_devices(self) -> list[tuple[str, str]]:
+        """Las salidas de audio que hay ahora (nombre, descripción), sin la
+        predeterminada de Windows."""
+        return self.mpv.audio_devices()
+
+    def audio_device(self) -> tuple[str, str]:
+        """La salida elegida (nombre, descripción), aunque ahora no esté conectada."""
+        return (self.db.get_setting(AUDIO_DEVICE_KEY, AUTO_DEVICE) or AUTO_DEVICE,
+                self.db.get_setting(AUDIO_DEVICE_NAME_KEY, "") or "")
+
+    def set_audio_device(self, name: str) -> None:
+        name = name or AUTO_DEVICE
+        description = dict(self.mpv.audio_devices()).get(name, "") if name != AUTO_DEVICE else ""
+        if name == self.audio_device()[0] and not description:
+            description = self.audio_device()[1]     # elegida otra vez estando desconectada
+        self.db.set_setting(AUDIO_DEVICE_KEY, name)
+        self.db.set_setting(AUDIO_DEVICE_NAME_KEY, description or None)
+        self.mpv.set_audio_device(name, description)
+
+    def _on_audio_device_lost(self, name: str) -> None:
+        self._notice(tr("Se desconectó «{name}»: la música sigue por la salida predeterminada de Windows.",
+                        name=name))
+
+    def equalizer_preset(self) -> str:
+        preset = self.db.get_setting(EQUALIZER_KEY, EQ_FLAT) or EQ_FLAT
+        return preset if preset in EQ_PRESETS else EQ_FLAT
+
+    def set_equalizer_preset(self, preset: str) -> None:
+        preset = preset if preset in EQ_PRESETS else EQ_FLAT
+        self.db.set_setting(EQUALIZER_KEY, preset)
+        self.mpv.set_equalizer(preset)
+
+    def transition_mode(self) -> str:
+        return self.player.transition
+
+    def set_transition_mode(self, mode: str) -> None:
+        self.player.set_transition(mode)
+
+    def crossfade_seconds(self) -> int:
+        return self.player.crossfade_s
+
+    def set_crossfade_seconds(self, seconds: int) -> None:
+        self.player.set_crossfade_seconds(seconds)
+
+    def _apply_audio_preferences(self) -> None:
+        """Salida y ecualizador guardados (al arrancar y al importar una copia)."""
+        name, description = self.audio_device()
+        self.mpv.set_audio_device(name, description)
+        self.mpv.set_equalizer(self.equalizer_preset())
 
     # -- Discord ------------------------------------------------------------
     def _set_discord(self, enabled: bool) -> None:
@@ -3869,6 +3306,9 @@ class MainWindow(QMainWindow):
         self.autoplay_action.setChecked(db.get_bool("autoplay_radio", False))
         self.resume_action.setChecked(db.get_bool(play_session.ENABLED_KEY, True))
         self.equalize_action.setChecked(db.get_bool("equalize_volume", False))
+        self._apply_audio_preferences()
+        self.player.set_transition(db.get_setting(TRANSITION_KEY, TRANSITION_GAPLESS) or TRANSITION_GAPLESS)
+        self.player.set_crossfade_seconds(db.get_int(CROSSFADE_KEY, CROSSFADE_DEFAULT_S))
         self.collapse_action.setChecked(db.get_bool("sidebar_collapsed"))
         self.close_to_tray_action.setChecked(db.get_bool("tray_close_to_tray", True))
         self.minimize_to_tray_action.setChecked(db.get_bool("tray_minimize_to_tray", False))

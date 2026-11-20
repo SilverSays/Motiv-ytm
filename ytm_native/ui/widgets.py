@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import threading
 import time
+import unicodedata
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QObject, QSortFilterProxyModel, Qt, Signal, Slot,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -116,6 +120,45 @@ class TrackModel(QAbstractTableModel):
         self._current_id: Optional[str] = None
         self._notes: Optional[dict[str, str]] = None
         self._note_header = ""
+        self._reorderable = False
+
+    # Formato de lo que se arrastra al reordenar: los números de fila.
+    ROWS_MIME = "application/x-ytmn-rows"
+
+    def set_reorderable(self, enabled: bool) -> None:
+        """Filas que se pueden arrastrar entre otras (la vista "Cola")."""
+        self._reorderable = bool(enabled)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        flags = super().flags(index)
+        if self._reorderable:
+            # Se arrastra una fila y se suelta entre dos, nunca encima de otra.
+            flags |= Qt.ItemFlag.ItemIsDragEnabled if index.isValid() else Qt.ItemFlag.ItemIsDropEnabled
+        return flags
+
+    def supportedDropActions(self) -> Qt.DropAction:  # noqa: N802 - API de Qt
+        return Qt.DropAction.MoveAction if self._reorderable else super().supportedDropActions()
+
+    def mimeTypes(self) -> list[str]:  # noqa: N802
+        return [self.ROWS_MIME]
+
+    def mimeData(self, indexes) -> QMimeData:  # noqa: N802
+        rows = sorted({index.row() for index in indexes if index.isValid()})
+        mime = QMimeData()
+        mime.setData(self.ROWS_MIME, QByteArray(",".join(map(str, rows)).encode("ascii")))
+        return mime
+
+    @classmethod
+    def dragged_rows(cls, mime: Optional[QMimeData]) -> list[int]:
+        if mime is None or not mime.hasFormat(cls.ROWS_MIME):
+            return []
+        raw = bytes(mime.data(cls.ROWS_MIME)).decode("ascii", "ignore")
+        return [int(part) for part in raw.split(",") if part.isdigit()]
+
+    def dropMimeData(self, data, action, row, column, parent) -> bool:  # noqa: N802
+        # El modelo es un reflejo de la cola: la tabla avisa del movimiento
+        # (``TrackTable.row_moved``) y la cola, al cambiar, vuelve a llenarlo.
+        return False
 
     # Pasado este número de filas distintas, cambiar la lista por partes deja
     # de compensar frente a empezar de cero (otra lista, no la misma retocada).
@@ -250,6 +293,97 @@ class TrackModel(QAbstractTableModel):
             if col == 0:
                 return f"{track.title}\n{track.artists}" if track.artists else track.title
         return None
+
+
+@lru_cache(maxsize=16384)
+def fold(text: str) -> str:
+    """Texto para comparar: sin mayúsculas ni tildes («Canción» = «cancion»)."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+class TrackFilterProxyModel(QSortFilterProxyModel):
+    """Lo que enseña la tabla: las pistas de ``TrackModel`` filtradas por un
+    texto y, si se pide, ordenadas por una columna. El modelo de debajo no
+    cambia: quitar el filtro y el orden devuelve la lista tal cual era.
+
+    Las filas de la tabla son las de aquí; ``source_row`` las traduce a las
+    del modelo (la posición real en la cola o en la lista)."""
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._words: tuple[str, ...] = ()
+
+    # -- filtro ---------------------------------------------------------------
+    def set_filter_text(self, text: str) -> None:
+        """Cada palabra tiene que estar en el título, el artista o el álbum."""
+        words = tuple(fold(text).split())
+        if words == self._words:
+            return
+        self.beginFilterChange()
+        self._words = words
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
+
+    def filter_text_active(self) -> bool:
+        return bool(self._words)
+
+    def is_natural(self) -> bool:
+        """Sin filtro ni orden: cada fila es la misma que la del modelo."""
+        return not self._words and self.sortColumn() < 0
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
+        if not self._words:
+            return True
+        track = self.sourceModel().track_at(source_row)
+        haystack = " ".join((fold(track.title), fold(track.artists), fold(track.album)))
+        return all(word in haystack for word in self._words)
+
+    # -- orden ----------------------------------------------------------------
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # noqa: N802
+        source = self.sourceModel()
+        a, b = source.track_at(left.row()), source.track_at(right.row())
+        column = left.column()
+        if column == 2:
+            # Por segundos: como texto, "10:00" iría antes que "2:00".
+            return (a.duration_s or 0) < (b.duration_s or 0)
+        if column == 1:
+            # El álbum, o la nota que la vista ponga en su lugar (el historial).
+            role = Qt.ItemDataRole.DisplayRole
+            return fold(source.data(left, role) or "") < fold(source.data(right, role) or "")
+        return fold(a.title) < fold(b.title)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        value = super().headerData(section, orientation, role)
+        if (role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal
+                and section == self.sortColumn() and value):
+            # La flecha va pegada al rótulo: la de Qt quedaba en el centro de
+            # la columna, lejos del texto en una tan ancha como la del título.
+            return f"{value} {'↑' if self.sortOrder() == Qt.SortOrder.AscendingOrder else '↓'}"
+        return value
+
+    # -- lo que la tabla y su delegado piden por fila -------------------------
+    def source_row(self, row: int) -> int:
+        return self.mapToSource(self.index(row, 0)).row()
+
+    def view_row(self, source_row: int) -> int:
+        return self.mapFromSource(self.sourceModel().index(source_row, 0)).row()
+
+    def track_at(self, row: int) -> Track:
+        return self.sourceModel().track_at(self.source_row(row))
+
+    def is_current(self, row: int) -> bool:
+        return self.sourceModel().is_current(self.source_row(row))
+
+    def tracks(self) -> list[Track]:
+        """Las pistas que se ven, en el orden en que se ven."""
+        return [self.track_at(row) for row in range(self.rowCount())]
+
+    def set_reorderable(self, enabled: bool) -> None:
+        self.sourceModel().set_reorderable(enabled)
+
+    @staticmethod
+    def dragged_rows(mime) -> list[int]:
+        return TrackModel.dragged_rows(mime)
 
 
 # ---------------------------------------------------------------------------

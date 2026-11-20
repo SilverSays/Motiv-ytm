@@ -12,17 +12,18 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
-from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QButtonGroup, QFrame, QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 
 from ytm_native.services.discover import ArtistCard, PlaylistCard
-from . import theme
-from .art import ArtLoader, placeholder_pixmap, sized_url
-from .components import PillButton, _alpha, _draw_glyph, _Pressable
-from .home import CardGrid
-from .motion import mix
+from .art import ArtLoader, sized_url
+# ``ArtistStrip`` vive en ``cards`` desde la Tarea 10.6; se sigue pudiendo
+# importar de aquí.
+from .cards import ArtistStrip, CardGrid  # noqa: F401 - ArtistStrip se reexporta
+from .components import PillButton
 from ytm_native.core.i18n import tr
+
+__all__ = ["ARTISTS", "PLAYLISTS", "SONGS", "ArtistStrip", "CardsPage", "ScopeBar"]
 
 SONGS, PLAYLISTS, ARTISTS = "canciones", "listas", "artistas"
 
@@ -58,81 +59,6 @@ class ScopeBar(QWidget):
 
     def set_scope(self, key: str) -> None:
         self.buttons[key].setChecked(True)
-
-
-class ArtistStrip(_Pressable):
-    """El artista que coincide con lo buscado, sobre las canciones."""
-
-    PRESS_SCALE = 0.985
-    HEIGHT = 64
-    AVATAR = 48
-
-    opened = Signal(object)
-
-    def __init__(self, loader: ArtLoader, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._loader = loader
-        self.card: Optional[ArtistCard] = None
-        self._url = ""
-        self._name_font = theme.ui_font(15, QFont.Weight.DemiBold)
-        self._note_font = theme.ui_font(12)
-        self.setFixedHeight(self.HEIGHT)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.clicked.connect(lambda: self.card is not None and self.opened.emit(self.card))
-        loader.loaded.connect(lambda url: url == self._url and self.update())
-
-    def set_card(self, card: Optional[ArtistCard]) -> None:
-        self.card = card
-        self._url = sized_url(card.thumb_url, 120) if card else ""
-        if card is not None:
-            self.setAccessibleName(tr("{name}. Abrir la página del artista", name=card.name))
-            self.setToolTip(tr("Abrir la página del artista"))
-        self.update()
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self.click()
-            return
-        super().keyPressEvent(event)
-
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        if self.card is None:
-            return
-        painter = QPainter(self)
-        self._start(painter)
-        hover = float(self._hover.value)
-        rect = QRectF(self.rect()).adjusted(0, 2, 0, -2)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(mix(QColor(theme.RELIEVE), QColor(theme.RELIEVE_2), hover))
-        painter.drawRoundedRect(rect, theme.R_CONTROL, theme.R_CONTROL)
-        if self._ring():
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(theme.PAPEL), 2))
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), theme.R_CONTROL, theme.R_CONTROL)
-        dpr = self.devicePixelRatioF()
-        x, y = 10, (self.height() - self.AVATAR) // 2
-        radius = self.AVATAR / 2
-        pixmap = self._loader.pixmap(self._url, self.AVATAR, radius, dpr) if self._url else None
-        painter.drawPixmap(x, y, pixmap or placeholder_pixmap(self.AVATAR, radius, dpr))
-        left = x + self.AVATAR + 14
-        right = 36
-        width = max(10, self.width() - left - right)
-        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        painter.setFont(self._name_font)
-        painter.setPen(QColor(theme.PAPEL))
-        painter.drawText(QRectF(left, 12, width, 22), flags,
-                         QFontMetrics(self._name_font).elidedText(self.card.name, Qt.TextElideMode.ElideRight, width))
-        painter.setFont(self._note_font)
-        painter.setPen(QColor(theme.HUMO))
-        note = tr("Artista") if self.card.note in ("", "Artista", tr("Artista")) else tr("Artista con {note}", note=self.card.note)
-        painter.drawText(QRectF(left, 33, width, 18), flags, note)
-        # Una flecha discreta dice que esto lleva a otra parte.
-        arrow = _alpha(theme.PAPEL, 0.55 + 0.45 * hover)
-        painter.save()
-        painter.translate(self.width() - 22, self.height() / 2)
-        painter.rotate(180)
-        _draw_glyph(painter, QRectF(-7, -self.height() / 2, 14, self.height()), "back", 13, arrow)
-        painter.restore()
 
 
 class CardsPage(QScrollArea):

@@ -137,7 +137,7 @@ def build(app: QApplication) -> MainWindow:
     app.aboutToQuit.connect(controls.close)
     # La ventana ya los cierra al cerrarse; esto cubre las salidas que no pasan
     # por ella (un ``quit`` de Qt, un error) y, al final, la salida de Python.
-    stop = _child_stopper(mpv, extractor)
+    stop = _child_stopper(mpv, extractor, db)
     # Salir sin pasar por la ventana (cerrar sesión en Windows con la app en
     # la bandeja) también guarda la sesión y cierra lo demás en orden.
     app.aboutToQuit.connect(window.shutdown)
@@ -155,9 +155,11 @@ def _media_art_url(track) -> str:
     return "" if url.startswith("file:") else url
 
 
-def _child_stopper(mpv: MpvPlayer, extractor: ExtractorManager):
+def _child_stopper(mpv: MpvPlayer, extractor: ExtractorManager, db: Database):
     def stop() -> None:
-        for name, step in (("mpv", mpv.shutdown), ("yt-dlp", extractor.shutdown)):
+        # La base, la última: lo que guardan los demás al cerrarse queda dentro
+        # y el WAL se vuelca al archivo principal.
+        for name, step in (("mpv", mpv.shutdown), ("yt-dlp", extractor.shutdown), ("la base de datos", db.close)):
             try:
                 step()
             except Exception:  # noqa: BLE001 - se intenta cerrar todo lo demás

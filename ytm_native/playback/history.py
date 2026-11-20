@@ -144,8 +144,9 @@ class PlayTracker(QObject):
         if not self.enabled or self._listened < needed_seconds(duration):
             return
         try:
-            self.db.upsert_track(track)      # el historial enseña la pista aunque no esté en ninguna lista
-            self.db.log_play(track.video_id)
+            # Con la pista: se registra (el historial la enseña aunque no esté
+            # en ninguna lista) y se anota la escucha en una sola transacción.
+            self.db.log_play(track)
         except Exception:  # noqa: BLE001 - un fallo al anotar no debe parar la música
             # Sin marcarla como contada: el siguiente aviso de posición lo
             # vuelve a intentar (la base pudo estar ocupada un momento).

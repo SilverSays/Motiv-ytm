@@ -12,6 +12,8 @@
 * Cada ``loadfile`` lleva una ficha de quien lo pide; la respuesta de mpv
   (``load_acked``) la devuelve con el ``playlist_entry_id`` que le asignó, para
   que los eventos de una carga anterior no se confundan con los de esta.
+* Sin pausas: ``append`` deja la pista siguiente en la lista de mpv, que la
+  empieza en cuanto acaba la actual sin cerrar la salida de audio.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.mpv")
 
-_OBS_TIME, _OBS_DURATION, _OBS_PAUSE = 1, 2, 3
+_OBS_TIME, _OBS_DURATION, _OBS_PAUSE, _OBS_DEVICES = 1, 2, 3, 4
 
 # Volumen igualado entre canciones. ``loudnorm`` sigue la norma EBU R128 (el
 # mismo nivel de sonoridad para todo); ``dynaudnorm`` es más suave y adapta la
@@ -40,6 +42,38 @@ _OBS_TIME, _OBS_DURATION, _OBS_PAUSE = 1, 2, 3
 LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
 DYNAUDNORM = "dynaudnorm=f=150:g=15"
 NORMALIZERS = {"loudnorm": LOUDNORM, "dynaudnorm": DYNAUDNORM}
+
+# Salida de audio: "auto" es la que Windows tenga como predeterminada.
+AUTO_DEVICE = "auto"
+
+# Ecualizador: seis bandas de pico (Hz) y, por preajuste, su ganancia en dB.
+# Va antes de la normalización: ``loudnorm`` nivela ya con el color aplicado.
+EQ_BANDS = (60, 230, 910, 3600, 8000, 14000)
+EQ_FLAT = "flat"
+EQ_PRESETS = {
+    EQ_FLAT: (0, 0, 0, 0, 0, 0),
+    "bass": (6, 4, 1, 0, 0, 0),
+    "vocal": (-2, -1, 2, 4, 2, 0),
+    "rock": (4, 2, -2, 1, 3, 3),
+    "pop": (-1, 2, 4, 2, -1, -1),
+    "electronic": (5, 3, 0, 1, 3, 4),
+    "acoustic": (3, 1, 1, 2, 2, 1),
+}
+# Etiqueta del grafo del ecualizador en ``af``: con ella se le cambian las
+# ganancias en marcha (``af-command``) sin rehacer la cadena de filtros.
+EQ_LABEL = "ytmn-eq"
+
+
+def eq_preamp(gains) -> float:
+    """Atenuación previa (lineal) para que lo que el preajuste realza no sature."""
+    return 10 ** (-max(0, max(gains)) / 20)
+
+
+def equalizer_graph(gains) -> str:
+    """El ecualizador como filtro de ``af``: una atenuación y una banda por
+    frecuencia, en un solo grafo de libavfilter con etiqueta."""
+    bands = ",".join(f"equalizer=f={f}:t=q:w=1:g={g}" for f, g in zip(EQ_BANDS, gains))
+    return f"@{EQ_LABEL}:lavfi=[volume=volume={eq_preamp(gains):.6f},{bands}]"
 
 
 def make_pipe_name(counter: int) -> str:
@@ -56,6 +90,8 @@ class MpvPlayer(QObject):
     position_changed = Signal(float)
     duration_changed = Signal(float)
     pause_changed = Signal(bool)
+    devices_changed = Signal()            # la lista de salidas de audio cambió
+    device_lost = Signal(str)             # la salida elegida desapareció (su nombre): suena por la de Windows
     file_started = Signal(int)            # playlist_entry_id
     # Respuesta a ``load``: ficha que se pasó, playlist_entry_id que asignó mpv
     # (0 si es una versión que no lo dice) y si aceptó la orden.
@@ -76,8 +112,24 @@ class MpvPlayer(QObject):
         self._mpv_path = Path(mpv_path) if mpv_path else paths.mpv_exe()
         self._pre_args = list(pre_args or [])   # solo para pruebas (mpv simulado)
         self._volume = volume
-        self._audio_filter = ""           # filtro de audio vigente ("" = ninguno)
+        self._audio_filter = ""           # lo último enviado a ``af`` ("" = ninguno)
         self._filter_request = -1
+        # ``af`` se compone de dos partes independientes: cambiar una nunca
+        # quita la otra (un preajuste no apaga la normalización ni al revés).
+        self._normalization_filter = ""
+        self._eq_preset = EQ_FLAT
+        self._eq_gains = EQ_PRESETS[EQ_FLAT]
+        self._eq_in_graph = False         # el grafo del ecualizador está en el ``af`` de mpv
+        self._af_stale = False            # ``af`` aún dice las ganancias de antes de un af-command
+        self._eq_requests: set[int] = set()
+        # Atenuación del fundido entre canciones: multiplica el volumen elegido.
+        self._fade = 1.0
+        # Salida de audio: la elegida, la que mpv usa ahora y las que hay.
+        self._device = AUTO_DEVICE
+        self._device_name = ""
+        self._device_applied = AUTO_DEVICE
+        self._devices: list[tuple[str, str]] = []
+        self._devices_known = False
         self._media_controls = True       # mpv publica su propia sesión multimedia en Windows
         self._proc: Optional[QProcess] = None
         self._sock: Optional[QLocalSocket] = None
@@ -136,6 +188,12 @@ class MpvPlayer(QObject):
             "--load-auto-profiles=no",
             "--input-default-bindings=no",
             "--network-timeout=20",
+            # Sin pausas entre pistas: la salida de audio sigue abierta de una
+            # a otra, y la siguiente de la lista de mpv (la que encadena el
+            # reproductor con ``append``) se abre antes de que acabe la actual,
+            # para que abrir su URL no deje un hueco.
+            "--gapless-audio=yes",
+            "--prefetch-playlist=yes",
             f"--volume={self._volume}",
             f"--input-ipc-server={self._pipe}",
         ]
@@ -264,6 +322,9 @@ class MpvPlayer(QObject):
     def _on_connected(self) -> None:
         self.last_time_pos = 0.0
         self.duration = 0.0
+        self._fade = 1.0                  # arranca con ``--volume``, sin atenuar
+        self._device_applied = AUTO_DEVICE
+        self._devices_known = False
         self._setup_session()
         self.ready.emit()
 
@@ -273,9 +334,14 @@ class MpvPlayer(QObject):
         self.command("observe_property", _OBS_TIME, "time-pos")
         self.command("observe_property", _OBS_DURATION, "duration")
         self.command("observe_property", _OBS_PAUSE, "pause")
+        # Las salidas de audio: mpv manda la lista enseguida y otra vez cada
+        # vez que se conecta o desconecta algo (unos auriculares).
+        self.command("observe_property", _OBS_DEVICES, "audio-device-list")
         if not self._media_controls:
             self._apply_media_controls()      # también tras relanzarse
-        if self._audio_filter:
+        self._apply_device()
+        self._eq_in_graph = self._eq_gains != EQ_PRESETS[EQ_FLAT]
+        if self._compose_filter():
             self._apply_audio_filter()        # un mpv relanzado arranca sin filtros
         # mpv registra los controles multimedia de Windows (--media-controls).
         # Con los atajos por defecto desactivados hay que enlazar sus teclas:
@@ -340,7 +406,17 @@ class MpvPlayer(QObject):
 
     def _on_reply(self, msg: dict) -> None:
         ok = msg.get("error") == "success"
-        if msg.get("request_id") == self._filter_request:
+        request = msg.get("request_id")
+        if request in self._eq_requests:
+            self._eq_requests.discard(request)
+            if not ok and self._eq_in_graph:
+                # Un mpv que no atiende ``af-command``: se rehace la cadena con
+                # las ganancias nuevas (una vez, aunque fallen varias bandas).
+                log.info("mpv no cambió el ecualizador en marcha (%s): se rehace el filtro", msg.get("error"))
+                self._eq_requests.clear()
+                self._apply_audio_filter()
+            return
+        if request == self._filter_request:
             self._filter_request = -1
             if not ok:
                 log.warning("mpv rechazó el filtro de audio «%s»: %s", self._audio_filter, msg.get("error"))
@@ -363,6 +439,15 @@ class MpvPlayer(QObject):
         elif event == "start-file":
             self.last_time_pos = 0.0
             self._last_emitted_pos = -1.0
+            # Una pista encadenada empieza sin ``load``: la duración de la
+            # anterior no vale para ella (ni para detectar un final prematuro).
+            self.duration = 0.0
+            if self._af_stale:
+                # La cadena se monta de nuevo para esta pista: es el momento de
+                # dejar en ``af`` las ganancias que se cambiaron en marcha.
+                self._af_stale = False
+                self._eq_in_graph = self._eq_gains != EQ_PRESETS[EQ_FLAT]
+                self._apply_audio_filter()
             self.file_started.emit(int(msg.get("playlist_entry_id") or 0))
         elif event == "file-loaded":
             self.file_loaded.emit()
@@ -395,6 +480,9 @@ class MpvPlayer(QObject):
         elif obs_id == _OBS_PAUSE:
             if isinstance(data, bool):
                 self.pause_changed.emit(data)
+        elif obs_id == _OBS_DEVICES:
+            if isinstance(data, list):
+                self._on_devices(data)
 
     # -- órdenes de alto nivel ---------------------------------------------
     def load(self, url: str, user_agent: str = "", token: int = 0) -> int:
@@ -407,6 +495,23 @@ class MpvPlayer(QObject):
         if request > 0:
             self._pending_loads[request] = token
         return request
+
+    def append(self, url: str, user_agent: str = "", token: int = 0) -> int:
+        """Añade ``url`` tras la que suena, sin cortarla: mpv pasa a ella sola
+        al terminar la actual. La respuesta llega por ``load_acked`` con
+        ``token`` y el ``playlist_entry_id`` de la entrada nueva. Devuelve el
+        ``request_id`` (-1 si no hay conexión)."""
+        if user_agent:
+            # Se aplica al abrir el archivo: la que suena ya está abierta.
+            self.command("set_property", "user-agent", user_agent)
+        request = self.command("loadfile", url, "append")
+        if request > 0:
+            self._pending_loads[request] = token
+        return request
+
+    def playlist_clear(self) -> None:
+        """Quita de la lista de mpv todo menos lo que suena (lo encadenado)."""
+        self.command("playlist-clear")
 
     def set_media_controls(self, enabled: bool) -> None:
         """``False`` cuando la app publica su propia sesión multimedia (con
@@ -440,7 +545,84 @@ class MpvPlayer(QObject):
 
     def set_volume(self, volume: int) -> None:
         self._volume = max(0, min(100, int(volume)))
-        self.command("set_property", "volume", self._volume)
+        self._send_volume()
+
+    def set_fade(self, factor: float) -> None:
+        """Atenuación del fundido entre canciones (1 = el volumen elegido, 0 =
+        silencio). Va aparte del volumen: el usuario (o el temporizador) puede
+        moverlo durante un fundido y el fundido sigue sobre lo nuevo."""
+        factor = max(0.0, min(1.0, float(factor)))
+        if abs(factor - self._fade) < 0.01 and not (factor in (0.0, 1.0) and factor != self._fade):
+            return
+        self._fade = factor
+        self._send_volume()
+
+    @property
+    def fade(self) -> float:
+        return self._fade
+
+    def _send_volume(self) -> None:
+        level = self._volume if self._fade >= 1.0 else round(self._volume * self._fade, 2)
+        self.command("set_property", "volume", level)
+
+    # -- salida de audio ----------------------------------------------------
+    def audio_devices(self) -> list[tuple[str, str]]:
+        """Las salidas que mpv ve ahora (nombre, descripción), sin "auto"."""
+        return list(self._devices)
+
+    @property
+    def audio_device(self) -> str:
+        """La salida elegida (aunque ahora no esté conectada)."""
+        return self._device
+
+    @property
+    def audio_device_in_use(self) -> str:
+        return self._device_applied
+
+    def set_audio_device(self, name: str, description: str = "") -> None:
+        """Cambia la salida en marcha (mpv reabre el audio; la pista sigue
+        donde iba). Si la elegida no está conectada suena por la de Windows
+        hasta que vuelva."""
+        self._device = name or AUTO_DEVICE
+        self._device_name = description if self._device != AUTO_DEVICE else ""
+        self._apply_device(announce=False)
+
+    def _on_devices(self, data: list) -> None:
+        devices = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name, description = item.get("name"), item.get("description")
+            if isinstance(name, str) and name and name != AUTO_DEVICE:
+                devices.append((name, description if isinstance(description, str) and description else name))
+        self._devices = devices
+        self._devices_known = True
+        for name, description in devices:
+            if name == self._device:
+                self._device_name = description
+        self._apply_device()
+        self.devices_changed.emit()
+
+    def _apply_device(self, announce: bool = True) -> None:
+        if not self._connected:
+            return                        # se aplica al conectar (``_setup_session``)
+        wanted = self._device
+        if wanted != AUTO_DEVICE and not self._devices_known:
+            # Hasta saber qué salidas hay, no se le pide a mpv una que quizá ya
+            # no exista: la lista llega enseguida (``observe_property``).
+            return
+        missing = (wanted != AUTO_DEVICE and self._devices_known
+                   and wanted not in {name for name, _ in self._devices})
+        target = AUTO_DEVICE if missing else wanted
+        if target == self._device_applied:
+            return
+        if missing and announce and self._device_applied == wanted:
+            # Se desconectó mientras sonaba por ella: la música sigue, por la
+            # salida predeterminada de Windows, sin relanzar mpv ni cortar la cola.
+            log.info("la salida de audio %s ya no está: se usa la de Windows", wanted)
+            self.device_lost.emit(self._device_name or wanted)
+        self._device_applied = target
+        self.command("set_property", "audio-device", target)
 
     @property
     def audio_filter(self) -> str:
@@ -449,13 +631,57 @@ class MpvPlayer(QObject):
     def set_normalization(self, mode: Optional[str]) -> None:
         """Iguala el volumen entre canciones (``"loudnorm"`` o ``"dynaudnorm"``)
         o lo deja como viene (``None``). Se aplica en marcha, sin relanzar mpv
-        ni cortar la pista; si mpv aún no está conectado, al conectar."""
+        ni cortar la pista; si mpv aún no está conectado, al conectar. El
+        ecualizador que haya sigue puesto."""
         wanted = NORMALIZERS.get(mode or "", "")
-        if wanted == self._audio_filter:
+        if wanted == self._normalization_filter:
             return
-        self._audio_filter = wanted
+        self._normalization_filter = wanted
+        # La cadena se rehace igualmente: el ecualizador plano ya no hace falta en ella.
+        self._eq_in_graph = self._eq_gains != EQ_PRESETS[EQ_FLAT]
+        self._af_stale = False
         self._apply_audio_filter()
 
+    @property
+    def equalizer(self) -> str:
+        return self._eq_preset
+
+    def set_equalizer(self, preset: str) -> None:
+        """Pone un preajuste del ecualizador (``EQ_PRESETS``; "flat" lo quita).
+
+        Si el ecualizador ya está en la cadena, solo cambian sus ganancias en
+        marcha (``af-command``): ni corte ni una normalización que vuelve a
+        medir desde cero. La primera vez se añade a la cadena."""
+        preset = preset if preset in EQ_PRESETS else EQ_FLAT
+        gains = EQ_PRESETS[preset]
+        self._eq_preset = preset
+        if gains == self._eq_gains:
+            return
+        self._eq_gains = gains
+        if not self._connected:
+            # Se aplica al conectar (``_setup_session``); ``audio_filter`` ya lo dice.
+            self._eq_in_graph = gains != EQ_PRESETS[EQ_FLAT]
+            self._audio_filter = self._compose_filter()
+            return
+        if self._eq_in_graph:
+            requests = [self.command("af-command", EQ_LABEL, "volume", f"{eq_preamp(gains):.6f}", "Parsed_volume_0")]
+            for i, gain in enumerate(gains, start=1):
+                requests.append(self.command("af-command", EQ_LABEL, "gain", str(gain), f"Parsed_equalizer_{i}"))
+            self._eq_requests.update(r for r in requests if r > 0)
+            self._af_stale = True         # ``af`` se pone al día al empezar la siguiente pista
+        elif gains != EQ_PRESETS[EQ_FLAT]:
+            self._eq_in_graph = True
+            self._apply_audio_filter()
+
+    def _compose_filter(self) -> str:
+        parts = []
+        if self._eq_in_graph:
+            parts.append(equalizer_graph(self._eq_gains))
+        if self._normalization_filter:
+            parts.append(self._normalization_filter)
+        return ",".join(parts)
+
     def _apply_audio_filter(self) -> None:
+        self._audio_filter = self._compose_filter()
         if self._connected:
             self._filter_request = self.command("set_property", "af", self._audio_filter)
