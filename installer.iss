@@ -1,8 +1,8 @@
-ï»¿; Instalador de Motiv para Windows (Inno Setup 6.3 o posterior).
+; Instalador de Motiv para Windows (Inno Setup 6.3 o posterior).
 ;
 ; Empaqueta la carpeta que genera PyInstaller (ytm_native.spec): el equipo de
 ; destino no necesita Python. Lo normal es compilarlo con
-; construir_instalador.bat, que le pasa la versiÃ³n y las rutas:
+; construir_instalador.bat, que le pasa la versión y las rutas:
 ;
 ;   ISCC /DAppVersion=0.1.0 /DAppSource=<carpeta YTMusicNativo> ^
 ;        /DOutputDir=<salida> /DIconFile=<YTMusicNativo.ico> installer.iss
@@ -13,7 +13,7 @@
 ; %LOCALAPPDATA%\YTMusicNativo: al desinstalar se pregunta si borrarlos.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "1.0.0"
 #endif
 #ifndef AppSource
   #define AppSource "dist\YTMusicNativo"
@@ -25,7 +25,7 @@
 #define AppName "Motiv"
 #define AppExe "YTMusicNativo.exe"
 #define AppURL "https://github.com/SilverSays/Proyecto-YT-Music-Nativo"
-; Misma clave que usa la app para Â«Iniciar con WindowsÂ» (ui/tray.py).
+; Misma clave que usa la app para «Iniciar con Windows» (ui/tray.py).
 #define RunValue "YTMusicNativo"
 
 [Setup]
@@ -58,7 +58,7 @@ VersionInfoProductName={#AppName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Si la app estÃ¡ abierta (tambiÃ©n en la bandeja), se cierra antes de copiar.
+; Si la app está abierta (también en la bandeja), se cierra antes de copiar.
 CloseApplications=yes
 RestartApplications=no
 
@@ -72,7 +72,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#AppSource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
-; Una versiÃ³n anterior pudo dejar mÃ³dulos que esta ya no trae.
+; Una versión anterior pudo dejar módulos que esta ya no trae.
 Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
@@ -89,15 +89,15 @@ var
 begin
   if CurUninstallStep <> usPostUninstall then
     exit;
-  { Â«Iniciar con WindowsÂ» apuntaba a este ejecutable: ya no existe. }
+  { «Iniciar con Windows» apuntaba a este ejecutable: ya no existe. }
   RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#RunValue}');
   DataDir := ExpandConstant('{localappdata}\YTMusicNativo');
   if UninstallSilent or not DirExists(DataDir) then
     exit;
-  if MsgBox('Â¿Borrar tambiÃ©n tus datos de Motiv?' + #13#10 + #13#10 +
+  if MsgBox('¿Borrar también tus datos de Motiv?' + #13#10 + #13#10 +
             'Biblioteca, listas locales, historial, credenciales y los programas ' +
             'descargados (yt-dlp, deno, mpv), en:' + #13#10 + DataDir + #13#10 + #13#10 +
-            'Si vas a volver a instalar la app, elige Â«NoÂ» para conservarlos.',
+            'Si vas a volver a instalar la app, elige «No» para conservarlos.',
             mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     DelTree(DataDir, True, True, True);
 end;
