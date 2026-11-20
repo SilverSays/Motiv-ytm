@@ -2,7 +2,7 @@
 
 # Motiv
 
-*(full name Leitmotiv — Motiv for everyday use)*
+*(full name Leitmotiv - Motiv for everyday use)*
 
 A native desktop client for YouTube Music on Windows, built with Qt6 and `mpv`
 instead of a bundled Chromium or Electron shell. It starts fast, stays around
