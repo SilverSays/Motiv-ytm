@@ -26,7 +26,7 @@ from ytm_native.core.i18n import tr
 MAGIC = b"YTMN_DPAPI\x01"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 # Descripción que Windows guarda junto al blob (no es secreta).
-_DESCRIPTION = "YT Music Nativo"
+_DESCRIPTION = "Motiv"
 
 
 class CryptoError(Exception):

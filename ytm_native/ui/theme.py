@@ -10,11 +10,11 @@ El color de la música sigue mandando: la cabecera de cada lista es una banda
 pastel del tono de su carátula y la "tinta" de la pista (ese mismo tono, hondo)
 tiñe el progreso, la fila actual y la letra.
 
-Tipografía: Bahnschrift, la DIN variable de Windows. Su corte ligero y
-semicondensado hace de titular; el regular y el seminegro, de texto. Una sola
-familia con anchos distintos: la personalidad la da el ancho, no una segunda
-fuente. Los valores de este archivo son los únicos que deben usar los
-componentes: nada de colores sueltos en cada pantalla.
+Tipografía: Space Grotesk (ligero) para titulares, IBM Plex Sans (regular,
+medio y semi negro) para el resto. Ninguna de las dos viene instalada en
+Windows: se empaquetan en ``ui/fonts/`` y ``load_fonts()`` las registra al
+arrancar (ver ``app.main``). Los valores de este archivo son los únicos que
+deben usar los componentes: nada de colores sueltos en cada pantalla.
 
 Variante nocturna: la misma disciplina sobre pizarra y carbón fríos. La
 tinta pasa a ser clara, la aguamarina sigue siendo lo sólido, el oro sigue
@@ -31,6 +31,7 @@ al que llama la ventana (ver ``MainWindow._apply_theme``).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 
@@ -255,10 +256,43 @@ def contrast_ratio(fg: "str | QColor", bg: "str | QColor") -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-UI_FAMILIES = ["Bahnschrift", "Segoe UI Variable Text", "Segoe UI"]
-DISPLAY_FAMILIES = ["Bahnschrift Light SemiCondensed", "Bahnschrift", "Segoe UI Variable Display"]
-UI_FONT = '"Bahnschrift", "Segoe UI Variable Text", "Segoe UI", sans-serif'
-DISPLAY_FONT = '"Bahnschrift Light SemiCondensed", "Bahnschrift", sans-serif'
+# "Space Grotesk Light" es el nombre de familia real que el propio archivo
+# declara (no un apodo nuestro): Google lo exporta así para el peso ligero,
+# distinto de "Space Grotesk" a secas. Cargar solo ese peso mantiene la
+# familia sin ambigüedad para los titulares.
+UI_FAMILIES = ["IBM Plex Sans", "Segoe UI Variable Text", "Segoe UI"]
+DISPLAY_FAMILIES = ["Space Grotesk Light", "Segoe UI Variable Display"]
+UI_FONT = '"IBM Plex Sans", "Segoe UI Variable Text", "Segoe UI", sans-serif'
+DISPLAY_FONT = '"Space Grotesk Light", sans-serif'
+
+_FONTS_LOADED = False
+
+
+def load_fonts() -> None:
+    """Registra Space Grotesk e IBM Plex Sans desde ``ui/fonts/`` para que
+    ``QFont`` las encuentre por nombre. Se llama una vez al arrancar (ver
+    ``app.main``); si ya se llamó, no hace nada. Sin esto la interfaz cae a
+    la fuente del sistema (``Segoe UI``): no hay excepción, solo se ve
+    distinta, así que un olvido pasa desapercibido si no se revisa a ojo."""
+    global _FONTS_LOADED
+    if _FONTS_LOADED:
+        return
+    _FONTS_LOADED = True
+    fonts_dir = _fonts_dir()
+    for name in (
+        "SpaceGrotesk-Light.ttf",
+        "IBMPlexSans-Regular.ttf",
+        "IBMPlexSans-Medium.ttf",
+        "IBMPlexSans-SemiBold.ttf",
+    ):
+        QFontDatabase.addApplicationFont(str(fonts_dir / name))
+
+
+def _fonts_dir() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "ytm_native" / "ui" / "fonts"
+    return Path(__file__).resolve().parent / "fonts"
 
 
 def ui_font(px: int, weight: QFont.Weight = QFont.Weight.Normal, tabular: bool = False) -> QFont:
@@ -280,6 +314,7 @@ def display_font(px: int) -> QFont:
     font = QFont()
     font.setFamilies(DISPLAY_FAMILIES)
     font.setPixelSize(px)
+    font.setWeight(QFont.Weight.Light)
     return font
 
 
@@ -327,7 +362,7 @@ QMenu#appMenu::separator {{ margin: 7px 10px; }}
 #sidebar::item:disabled {{ color: {TENUE}; font-size: 12px; padding: 18px 8px 4px 8px; background: transparent; }}
 #sidebarFooter {{ border-top: 1px solid {LINEA}; }}
 
-#bandTitle {{ font-family: {DISPLAY_FONT}; font-size: 46px; font-weight: 400; color: {PAPEL}; }}
+#bandTitle {{ font-family: {DISPLAY_FONT}; font-size: 46px; font-weight: 300; color: {PAPEL}; }}
 #bandTitle[compact="true"] {{ font-size: 32px; }}
 #bandText {{ color: rgba({ink}, 0.80); font-size: 14px; }}
 #bandFact {{ color: rgba({ink}, 0.88); font-size: 13px; }}
@@ -335,7 +370,7 @@ QLineEdit#bandSearch {{ background: {BANDA_CAMPO}; border: 1px solid rgba({ink},
 QLineEdit#bandSearch:hover {{ border-color: rgba({ink}, 0.38); }}
 QLineEdit#bandSearch:focus {{ border: 2px solid {PAPEL}; padding: 8px 11px; }}
 
-#homeTitle {{ font-family: {DISPLAY_FONT}; font-size: 46px; font-weight: 400; color: {PAPEL}; }}
+#homeTitle {{ font-family: {DISPLAY_FONT}; font-size: 46px; font-weight: 300; color: {PAPEL}; }}
 #homeFact {{ color: {HUMO}; font-size: 13px; }}
 #shelfTitle {{ font-size: 17px; font-weight: 600; color: {PAPEL}; }}
 #shelfNote {{ color: {HUMO}; font-size: 13px; }}

@@ -1,5 +1,5 @@
 @echo off
-rem Construye YT Music Nativo como programa autonomo (PyInstaller) y su
+rem Construye Motiv como programa autonomo (PyInstaller) y su
 rem instalador (Inno Setup). El resultado no necesita Python en el equipo
 rem donde se instale.
 rem
@@ -49,7 +49,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 if errorlevel 1 goto :fallo_inno
 
 echo.
-echo Listo: "%OUT%\YTMusicNativo-%VERSION%-instalador.exe"
+echo Listo: "%OUT%\Motiv-%VERSION%-instalador.exe"
 echo Version portable: "%DIST%\YTMusicNativo"
 endlocal
 exit /b 0

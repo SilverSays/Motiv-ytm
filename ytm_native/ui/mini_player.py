@@ -202,7 +202,7 @@ class MiniPlayer(QWidget):
         self._drag_from: Optional[QPoint] = None
         self._placing = False
         self._quiet = False
-        self.setWindowTitle("YT Music Nativo")
+        self.setWindowTitle("Motiv")
         self.setWindowIcon(app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         # Cerrarla no cierra la app: con la principal oculta, la devuelve.
@@ -285,7 +285,7 @@ class MiniPlayer(QWidget):
             self.title.set_color(theme.PAPEL)
             self.artist.setText(track.artists)
             self.cover.set_url(track_art_url(track.video_id, track.thumb_url, ART_PX))
-            self.setWindowTitle(f"{track.title} — YT Music Nativo")
+            self.setWindowTitle(f"{track.title} — Motiv")
         self._on_state(self.player.state)
 
     def _on_state(self, state: str) -> None:

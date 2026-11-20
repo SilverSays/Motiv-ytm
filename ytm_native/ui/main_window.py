@@ -283,7 +283,7 @@ class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QM
         self._theme_mode = theme.normalize_mode(db.get_setting(config.THEME_KEY, "system"))
         self._apply_theme(rebuild=False)
 
-        self.setWindowTitle("YT Music Nativo")
+        self.setWindowTitle("Motiv")
         self.resize(1180, 760)
         # Lo justo para que quepan los tres paneles a su mínimo: si la ventana
         # pudiera ser más estrecha que la suma, el divisor los sacaría por los
@@ -2007,7 +2007,7 @@ class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QM
             self._apply_ink()
             if self.now_panel.isVisible():
                 self._load_now(None)
-            self.setWindowTitle("YT Music Nativo")
+            self.setWindowTitle("Motiv")
             self._sync_tray_track()
             self._sync_like_button()
             return
@@ -2021,7 +2021,7 @@ class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QM
         self.now_cover.set_url(self._now_art)
         self._apply_ink()
         self.model.set_current(track.video_id)
-        self.setWindowTitle(f"{track.title} — YT Music Nativo")
+        self.setWindowTitle(f"{track.title} — Motiv")
         self._sync_tray_track()
         if self._view_key == QUEUE_KEY:
             self._refresh_queue()
@@ -2900,7 +2900,7 @@ class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QM
             self.db.set_setting("tray_hint_shown", "1")
             self.tray.notify(
                 tr("La música sigue sonando"),
-                tr("YT Music Nativo queda en la bandeja. Para cerrarlo del todo, "
+                tr("Motiv queda en la bandeja. Para cerrarlo del todo, "
                 "usa «Salir definitivamente» en el menú de este icono."),
             )
 
@@ -3218,7 +3218,7 @@ class MainWindow(QueueView, SearchView, HistoryView, LocalView, PlaylistView, QM
         return str(documents if documents.is_dir() else Path.home())
 
     def export_backup(self) -> None:
-        suggested = Path(self._backup_folder()) / f"YT Music Nativo {time.strftime('%Y-%m-%d')}.json"
+        suggested = Path(self._backup_folder()) / f"Motiv {time.strftime('%Y-%m-%d')}.json"
         path, _ = QFileDialog.getSaveFileName(
             self, tr("Exportar copia de seguridad"), str(suggested), tr("Copia de seguridad (*.json)"))
         if not path:

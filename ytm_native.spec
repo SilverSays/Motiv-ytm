@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Especificación de PyInstaller: YT Music Nativo como programa autónomo.
+"""Especificación de PyInstaller: Motiv como programa autónomo.
 
 Genera una carpeta ``YTMusicNativo`` con ``YTMusicNativo.exe`` y todo lo que
 necesita (Python, PySide6, ytmusicapi, requests y los paquetes WinRT de los
@@ -89,11 +89,11 @@ def version_info() -> VSVersionInfo:
         ffi=FixedFileInfo(filevers=numbers, prodvers=numbers),
         kids=[
             StringFileInfo([StringTable("0C0A04B0", [
-                StringStruct("FileDescription", "YT Music Nativo"),
+                StringStruct("FileDescription", "Motiv"),
                 StringStruct("FileVersion", text),
                 StringStruct("InternalName", APP_NAME),
                 StringStruct("OriginalFilename", f"{APP_NAME}.exe"),
-                StringStruct("ProductName", "YT Music Nativo"),
+                StringStruct("ProductName", "Motiv"),
                 StringStruct("ProductVersion", __version__),
                 StringStruct("LegalCopyright", "GPL-3.0"),
             ])]),
@@ -107,8 +107,12 @@ icon = build_icon(WORK / f"{APP_NAME}.ico")
 
 # ytmusicapi lleva sus traducciones como datos; los paquetes WinRT (traen su
 # propio gancho de PyInstaller) se recogen enteros por si un módulo solo se
-# importa de forma perezosa.
-datas = collect_data_files("ytmusicapi") + [(str(ROOT / "LICENSE"), ".")]
+# importa de forma perezosa. Space Grotesk e IBM Plex Sans (ui/fonts/) van
+# empaquetadas porque ninguna de las dos viene instalada en Windows.
+datas = collect_data_files("ytmusicapi") + [
+    (str(ROOT / "LICENSE"), "."),
+    (str(ROOT / "ytm_native" / "ui" / "fonts"), "ytm_native/ui/fonts"),
+]
 hiddenimports = collect_submodules("winrt") + collect_submodules("ytmusicapi")
 
 a = Analysis(  # noqa: F821

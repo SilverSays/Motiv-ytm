@@ -246,7 +246,7 @@ def parse_backup(data) -> Backup:
     Nada se escribe con una copia a medias: cualquier error sale aquí, con un
     mensaje que dice dónde."""
     if not isinstance(data, dict) or data.get("format") != FORMAT:
-        raise BackupError(tr("El archivo no es una copia de seguridad de YT Music Nativo."))
+        raise BackupError(tr("El archivo no es una copia de seguridad de Motiv."))
     version = data.get("version")
     if not isinstance(version, int) or isinstance(version, bool):
         raise BackupError(tr("La copia no dice su versión."))

@@ -212,7 +212,7 @@ def cookie_header(cookies: list[BrowserCookie]) -> str:
 
 def netscape_cookies(cookies: list[BrowserCookie]) -> str:
     """Las cookies en formato Netscape, el que lee yt-dlp."""
-    lines = ["# Netscape HTTP Cookie File", "# Generado por YT Music Nativo", ""]
+    lines = ["# Netscape HTTP Cookie File", "# Generado por Motiv", ""]
     for c in cookies:
         host = c.host if not c.http_only else f"#HttpOnly_{c.host}"
         sub = "TRUE" if c.host.startswith(".") else "FALSE"

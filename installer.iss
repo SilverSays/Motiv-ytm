@@ -1,4 +1,4 @@
-﻿; Instalador de YT Music Nativo para Windows (Inno Setup 6.3 o posterior).
+﻿; Instalador de Motiv para Windows (Inno Setup 6.3 o posterior).
 ;
 ; Empaqueta la carpeta que genera PyInstaller (ytm_native.spec): el equipo de
 ; destino no necesita Python. Lo normal es compilarlo con
@@ -22,7 +22,7 @@
   #define OutputDir "dist"
 #endif
 
-#define AppName "YT Music Nativo"
+#define AppName "Motiv"
 #define AppExe "YTMusicNativo.exe"
 #define AppURL "https://github.com/SilverSays/Proyecto-YT-Music-Nativo"
 ; Misma clave que usa la app para «Iniciar con Windows» (ui/tray.py).
@@ -47,7 +47,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 LicenseFile=LICENSE
 OutputDir={#OutputDir}
-OutputBaseFilename=YTMusicNativo-{#AppVersion}-instalador
+OutputBaseFilename=Motiv-{#AppVersion}-instalador
 #ifdef IconFile
 SetupIconFile={#IconFile}
 #endif
@@ -94,7 +94,7 @@ begin
   DataDir := ExpandConstant('{localappdata}\YTMusicNativo');
   if UninstallSilent or not DirExists(DataDir) then
     exit;
-  if MsgBox('¿Borrar también tus datos de YT Music Nativo?' + #13#10 + #13#10 +
+  if MsgBox('¿Borrar también tus datos de Motiv?' + #13#10 + #13#10 +
             'Biblioteca, listas locales, historial, credenciales y los programas ' +
             'descargados (yt-dlp, deno, mpv), en:' + #13#10 + DataDir + #13#10 + #13#10 +
             'Si vas a volver a instalar la app, elige «No» para conservarlos.',

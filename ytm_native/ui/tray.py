@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
@@ -36,14 +36,16 @@ TIP_LIMIT = 120          # Windows corta la descripción emergente de la bandeja
 # Icono de la aplicación
 # ---------------------------------------------------------------------------
 def _icon_pixmap(px: int) -> QPixmap:
-    """Una funda sólida con la nota. Desde 24 px la nota va dentro de un aro
-    fino con un arco del oro de los aros de la cabecera; más pequeño, el aro
-    sería ruido y la nota ocupa todo el sitio."""
+    """Una funda sólida con el motivo: puntos en diagonal, del más denso al
+    más claro, unidos por un trazo fino -- el motivo que se repite y da
+    nombre a la app ("Motiv"). Desde 24 px son tres puntos dentro de un aro
+    fino con un arco del oro de los aros de la cabecera; más pequeño, el
+    aro sería ruido y el motivo se reduce a dos puntos con trazo más grueso
+    para seguir leyéndose."""
     out = QPixmap(px, px)
     out.fill(Qt.GlobalColor.transparent)
     painter = QPainter(out)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
     inset = max(0.5, px / 32)
     rect = QRectF(inset, inset, px - 2 * inset, px - 2 * inset)
     radius = px * 0.22
@@ -62,12 +64,27 @@ def _icon_pixmap(px: int) -> QPixmap:
         arc.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(arc)
         painter.drawArc(ring, 35 * 16, 120 * 16)
-    font = theme.icon_font(round(px * (0.38 if ringed else 0.72)))
-    if font is None:
-        font = theme.ui_font(round(px * (0.42 if ringed else 0.75)))
-    painter.setFont(font)
-    painter.setPen(QColor(theme.SOBRE_SOLIDO))
-    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, theme.glyph("music"))
+
+    cx, cy = rect.center().x(), rect.center().y()
+    span = rect.width() * (0.30 if ringed else 0.24)
+    points = [QPointF(cx - span, cy - span), QPointF(cx, cy), QPointF(cx + span, cy + span)]
+    if not ringed:
+        points = [points[0], points[2]]
+
+    faint_line = QColor(theme.SOBRE_SOLIDO)
+    faint_line.setAlphaF(0.4 if ringed else 0.55)
+    line = QPen(faint_line, max(1.0, px * (0.045 if ringed else 0.09)))
+    line.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(line)
+    for a, b in zip(points, points[1:]):
+        painter.drawLine(a, b)
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    sizes = [px * 0.1, px * 0.075, px * 0.06] if ringed else [px * 0.15, px * 0.15]
+    colors = [theme.SOBRE_SOLIDO, theme.SOBRE_SOLIDO, theme.ORO] if ringed else [theme.SOBRE_SOLIDO, theme.ORO]
+    for point, size, color_name in zip(points, sizes, colors):
+        painter.setBrush(QColor(color_name))
+        painter.drawEllipse(point, size / 2, size / 2)
     painter.end()
     return out
 
@@ -193,7 +210,7 @@ class TrayIcon(QObject):
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self._tray = QSystemTrayIcon(app_icon(), self)
-        self._tray.setToolTip("YT Music Nativo")
+        self._tray.setToolTip("Motiv")
         self._tray.activated.connect(self._on_activated)
         self._playing = False
         # El menú no cuelga de la ventana: con ella oculta debe seguir abriéndose.
@@ -244,7 +261,7 @@ class TrayIcon(QObject):
             self.track_action.setText(tr("Nada en reproducción"))
             self.track_action.setIcon(QIcon())
             self.track_action.setEnabled(False)
-            self._tray.setToolTip("YT Music Nativo")
+            self._tray.setToolTip("Motiv")
         else:
             label = f"{track.title} — {track.artists}" if track.artists else track.title
             self.track_action.setText(label)

@@ -24,7 +24,7 @@ from ytm_native.playback.media_controls import MediaControls
 from ytm_native.playback.mpv_ipc import MpvPlayer
 from ytm_native.playback.player import PlaybackController, saved_volume
 from ytm_native.services.sync import LibrarySync
-from ytm_native.ui import chrome
+from ytm_native.ui import chrome, theme
 from ytm_native.ui.art import track_art_url
 from ytm_native.ui.main_window import Bridge, MainWindow
 from ytm_native.ui.tray import MINIMIZED_ARG
@@ -33,7 +33,7 @@ from ytm_native.core.i18n import tr
 
 log = logging.getLogger("ytmn.app")
 
-_CRASH_TITLE = "YT Music Nativo"
+_CRASH_TITLE = "Motiv"
 _crash_dialogs = 0
 
 
@@ -218,7 +218,8 @@ def main() -> int:
     # ningún hilo de trabajo: así nadie lo decide a medias en paralelo.
     log.info("idioma de la interfaz: %s", i18n.active())
     app = QApplication(sys.argv)
-    app.setApplicationName("YT Music Nativo")
+    app.setApplicationName("Motiv")
+    theme.load_fonts()
     instance = SingleInstance()
     if not instance.acquire():
         log.info("la app ya estaba abierta: se le pasa el foco y esta sale")

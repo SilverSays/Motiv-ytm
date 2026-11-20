@@ -229,7 +229,7 @@ CATALOG = {
     "{where}: se esperaba texto.": "{where}: text was expected.",
     "{where}: se esperaba un número.": "{where}: a number was expected.",
     "{where}: identificador de canción no válido.": "{where}: invalid song id.",
-    "El archivo no es una copia de seguridad de YT Music Nativo.": "The file isn't a YT Music Nativo backup.",
+    "El archivo no es una copia de seguridad de Motiv.": "The file isn't a Motiv backup.",
     "La copia no dice su versión.": "The backup doesn't state its version.",
     "La copia es de una versión más nueva de la app: actualízala para importarla.":
         "The backup is from a newer version of the app: update the app to import it.",
@@ -795,9 +795,9 @@ CATALOG = {
     "{n} resultado": "{n} result",
     "{n} resultados": "{n} results",
     "La música sigue sonando": "The music keeps playing",
-    "YT Music Nativo queda en la bandeja. Para cerrarlo del todo, usa «Salir definitivamente» en el menú de este "
+    "Motiv queda en la bandeja. Para cerrarlo del todo, usa «Salir definitivamente» en el menú de este "
     "icono.":
-        "YT Music Nativo stays in the tray. To close it completely, use “Quit for good” in this icon's menu.",
+        "Motiv stays in the tray. To close it completely, use “Quit for good” in this icon's menu.",
     "No se pudo cambiar el inicio con Windows.": "Couldn't change starting with Windows.",
     "Mostrar en Discord": "Show on Discord",
     "Discord necesita el id de una aplicación registrada en\ndiscord.com/developers/applications (su nombre es lo "
